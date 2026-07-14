@@ -2,12 +2,25 @@
 #include <chrono>
 #include "camera.h"
 #include "hittable.h"
+#include "bvh.h"
 #include "sphere.h"
 #include "material.h"
 #include "color.h"
 #include "ray.h"
 #include "vec3.h"
 #include "cuda_helper.h"
+
+// Compile-time knobs, overridable for tests, e.g.:
+//   nvcc main.cu -DUSE_BVH=0 -DRT_SEED=42 -DRT_IMAGE_WIDTH=200 -DRT_SAMPLES=16 ...
+#ifndef USE_BVH
+#define USE_BVH 1          // 1: render through the flattened BVH; 0: flat hittable_list
+#endif
+#ifndef RT_IMAGE_WIDTH
+#define RT_IMAGE_WIDTH 1200
+#endif
+#ifndef RT_SAMPLES
+#define RT_SAMPLES 512
+#endif
 
 void scene() {
     auto start = std::chrono::system_clock::now();
@@ -77,15 +90,31 @@ void scene() {
 
     world->add(diffuse_light_sphere_hittable);
 
+    // bvh over the same objects (see docs/plans/flattened-bvh.md)
+    bvh_scene* bvh;
+    checkCudaErrors(cudaMallocManaged((void**)&bvh, sizeof(bvh_scene)));
+    new(bvh) bvh_scene();
+    for (int i = 0; i < world->size; i++)
+        bvh->add(*world->objects[i]);
+    bvh->build();
+
+    hittable* bvh_hittable;
+    checkCudaErrors(cudaMallocManaged((void**)&bvh_hittable, sizeof(hittable)));
+    bvh_hittable->type = BVH;
+    bvh_hittable->object = bvh;
+
     // camera
     camera* cam;
     checkCudaErrors(cudaMallocManaged((void**)&cam, sizeof(camera)));
     new(cam) camera();
 
     cam->aspect_ratio      = 16.0 / 9.0;
-    cam->image_width       = 1200;
-    cam->samples_per_pixel = 512;
+    cam->image_width       = RT_IMAGE_WIDTH;
+    cam->samples_per_pixel = RT_SAMPLES;
     cam->max_depth         = 10;
+#ifdef RT_SEED
+    cam->seed = RT_SEED;
+#endif
 
     cam->vfov     = 20;
     cam->lookfrom = point3(13, 10, 20);
@@ -98,7 +127,11 @@ void scene() {
     std::clog << "Rendering.\n" << std::flush;
 
     auto render_start = std::chrono::system_clock::now();
+#if USE_BVH
+    cam->render(*bvh_hittable);
+#else
     cam->render(*world_hittable);
+#endif
 
     auto end = std::chrono::system_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
@@ -117,6 +150,9 @@ void scene() {
     cudaFree(diffuse_light_material);
     cudaFree(diffuse_light_sphere);
     cudaFree(diffuse_light_sphere_hittable);
+    bvh->~bvh_scene();   // frees its nodes/prim_index/prims buffers
+    cudaFree(bvh);
+    cudaFree(bvh_hittable);
     cudaFree(world);
     cudaFree(world_hittable);
     cudaFree(cam);

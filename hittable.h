@@ -13,8 +13,22 @@ struct material;
 
 enum HittableType {
   HITTABLE_LIST,
-  SPHERE
+  SPHERE,
+  BVH
 };
+
+// hittable_list and bvh_scene live in hittable_list.h / bvh.h (included at the
+// bottom of this file, after hittable is fully defined — both reference
+// hittable, so they can't be included up top like sphere.h). These shims let
+// the dispatch switches below route to them while they are still incomplete
+// types.
+struct hittable_list;
+__device__ bool hittable_list_hit(const hittable_list* list, const ray& r, interval ray_t, hit_record& rec);
+__host__ __device__ aabb hittable_list_bounding_box(const hittable_list* list);
+
+struct bvh_scene;
+__device__ bool bvh_scene_hit(const bvh_scene* bvh, const ray& r, interval ray_t, hit_record& rec);
+__host__ __device__ aabb bvh_scene_bounding_box(const bvh_scene* bvh);
 
 struct hittable {
   HittableType type;
@@ -25,44 +39,14 @@ struct hittable {
   __host__ __device__ aabb bounding_box() const;
 };
 
-struct hittable_list {
-    aabb bbox;
-    hittable** objects;
-    int size;
-    int capacity;
-
-    hittable_list() {
-        size = 0;
-        capacity = 16;
-        bbox = aabb();
-        checkCudaErrors(cudaMallocManaged((void**)&objects, capacity * sizeof(hittable*)));
-    }
-
-    hittable_list(hittable* object) {
-        size = 0;
-        capacity = 16;
-        bbox = aabb();
-        checkCudaErrors(cudaMallocManaged((void**)&objects, capacity * sizeof(hittable*)));
-        add(object);
-    }
-
-    ~hittable_list() {
-        cudaFree(objects);
-    }
-
-    __host__ void add(hittable* object);
-
-    __host__ __device__ aabb bounding_box() const {return bbox;}
-
-    __device__ bool hit(const ray& r, interval ray_t, hit_record& rec) const;
-};
-
 __device__ bool hittable::hit(const ray& r, interval ray_t, hit_record& rec) const {
     switch (type) {
         case HITTABLE_LIST:
-        return static_cast<hittable_list*>(object)->hit(r, ray_t, rec);
+        return hittable_list_hit(static_cast<hittable_list*>(object), r, ray_t, rec);
         case SPHERE:
         return static_cast<sphere*>(object)->hit(r, ray_t, rec);
+        case BVH:
+        return bvh_scene_hit(static_cast<bvh_scene*>(object), r, ray_t, rec);
         default:
         return false;
     }
@@ -71,49 +55,21 @@ __device__ bool hittable::hit(const ray& r, interval ray_t, hit_record& rec) con
 __host__ __device__ aabb hittable::bounding_box() const {
     switch (type) {
         case HITTABLE_LIST:
-        return static_cast<hittable_list*>(object)->bounding_box();
+        return hittable_list_bounding_box(static_cast<hittable_list*>(object));
         case SPHERE:
         return static_cast<sphere*>(object)->bounding_box();
+        case BVH:
+        return bvh_scene_bounding_box(static_cast<bvh_scene*>(object));
         default:
         return aabb();
     }
 }
 
-__host__ void hittable_list::add(hittable* object) {
-    if (size >= capacity) {
-        capacity *= 2;
-        hittable** new_objects;
-        checkCudaErrors(cudaMallocManaged((void**)&new_objects, capacity * sizeof(hittable*)));
-        for (int i = 0; i < size; i++) {
-            new_objects[i] = objects[i];
-        }
-        cudaFree(objects);
-        objects = new_objects;
-    }
-    objects[size] = object;
-    size++;
-    bbox = aabb(bbox, object->bounding_box());
-}
-
-__device__ bool hittable_list::hit(const ray& r, interval ray_t, hit_record& rec) const {
-    if (!bbox.hit(r, ray_t)) return false;
-
-    hit_record temp_rec;
-    auto hit_anything = false;
-    auto closest_so_far = ray_t.max;
-
-    // Add bounds checking to prevent corruption issues
-    // if (size < 0 || size > capacity || objects == nullptr) return false;
-
-    for (int i = 0; i < size; i++) {
-        if (objects[i]->hit(r, interval(ray_t.min, closest_so_far), temp_rec)) {
-            hit_anything = true;
-            closest_so_far = temp_rec.t;
-            rec = temp_rec;
-        }
-    }
-
-    return hit_anything;
-}
+// Define hittable_list / bvh_scene and the shims declared above. Included last
+// so that including hittable.h alone is enough to compile the switch cases
+// (the include guards make any include order — hittable.h first or either
+// concrete header first — resolve correctly).
+#include "hittable_list.h"
+#include "bvh.h"
 
 #endif

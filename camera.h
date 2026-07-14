@@ -30,13 +30,16 @@ class camera {
         double defocus_angle = 0;  // Variation angle of rays through each pixel
         double focus_dist = 10;    // Distance from camera lookfrom point to plane of perfect focus
 
+        long long seed = -1;       // RNG seed; negative → seed from time(0). Fix it for reproducible renders (tests).
+
         __host__ void render(const hittable& world) {
             initialize();
 
             // initialize random states
             curandState* rand_states;
             checkCudaErrors(cudaMallocManaged(&rand_states, image_width * image_height * sizeof(curandState)));
-            initialize_rand<<<(image_width * image_height + 255) / 256, 256>>>(*this, rand_states, time(0));
+            unsigned long rng_seed = (seed < 0) ? (unsigned long)time(0) : (unsigned long)seed;
+            initialize_rand<<<(image_width * image_height + 255) / 256, 256>>>(*this, rand_states, rng_seed);
             
             checkCudaErrors(cudaDeviceSynchronize());
             
