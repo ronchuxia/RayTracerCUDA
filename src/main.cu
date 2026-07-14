@@ -2,8 +2,8 @@
 #include <chrono>
 #include "camera.h"
 #include "hittable.h"
-#include "bvh.h"
-#include "sphere.h"
+#include "hittables/bvh.h"
+#include "hittables/sphere.h"
 #include "material.h"
 #include "color.h"
 #include "ray.h"

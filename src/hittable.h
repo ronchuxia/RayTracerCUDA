@@ -6,7 +6,7 @@
 #include "hit_record.h"
 #include "interval.h"
 #include "ray.h"
-#include "sphere.h"
+#include "hittables/sphere.h"
 #include "vec3.h"
 
 struct material;
@@ -17,11 +17,11 @@ enum HittableType {
   BVH
 };
 
-// hittable_list and bvh_scene live in hittable_list.h / bvh.h (included at the
-// bottom of this file, after hittable is fully defined — both reference
-// hittable, so they can't be included up top like sphere.h). These shims let
-// the dispatch switches below route to them while they are still incomplete
-// types.
+// hittable_list and bvh_scene live in hittables/hittable_list.h / bvh.h
+// (included at the bottom of this file, after hittable is fully defined — both
+// reference hittable, so they can't be included up top like sphere.h). These
+// shims let the dispatch switches below route to them while they are still
+// incomplete types.
 struct hittable_list;
 __device__ bool hittable_list_hit(const hittable_list* list, const ray& r, interval ray_t, hit_record& rec);
 __host__ __device__ aabb hittable_list_bounding_box(const hittable_list* list);
@@ -69,7 +69,7 @@ __host__ __device__ aabb hittable::bounding_box() const {
 // so that including hittable.h alone is enough to compile the switch cases
 // (the include guards make any include order — hittable.h first or either
 // concrete header first — resolve correctly).
-#include "hittable_list.h"
-#include "bvh.h"
+#include "hittables/hittable_list.h"
+#include "hittables/bvh.h"
 
 #endif
