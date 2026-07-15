@@ -1,8 +1,7 @@
 #ifndef INTERVAL_H
 #define INTERVAL_H
 
-class interval {
-  public:
+struct interval {
     double min, max;
 
     __host__ __device__ interval() : min(+1.0/0.0), max(-1.0/0.0) {} // Default interval is empty

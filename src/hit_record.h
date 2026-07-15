@@ -6,8 +6,7 @@
 
 struct material;
 
-class hit_record {
-  public:
+struct hit_record {
     point3 p;
     vec3 normal;
     material* mat;

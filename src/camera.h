@@ -10,12 +10,11 @@
 #include "hittable.h"
 #include "material.h"
 
-class camera;
+struct camera;
 __global__ void initialize_rand(const camera& cam, curandState* state, unsigned long seed);
 __global__ void render_pixel(const camera& cam, int max_depth, const hittable& world, color* pixel_colors, curandState* rand_states);
 
-class camera {
-    public:
+struct camera {
         double aspect_ratio      = 1.0;  // Ratio of image width over height
         int    image_width       = 100;  // Rendered image width in pixel count
         int    image_height;             // Rendered image height in pixel count

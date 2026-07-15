@@ -9,8 +9,7 @@
 using std::sqrt;
 using std::fabs;
 
-class vec3 {
-  public:
+struct vec3 {
     double e[3];
 
     __host__ __device__ vec3() : e{0,0,0} {}

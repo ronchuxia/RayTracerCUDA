@@ -5,8 +5,7 @@
 #include "ray.h"
 #include "vec3.h"
 
-class aabb {
-  public:
+struct aabb {
     interval x, y, z;
 
     __host__ __device__ aabb() {} // The default AABB is empty, since intervals are empty by default.
