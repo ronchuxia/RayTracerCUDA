@@ -103,11 +103,29 @@ inline void add_triangle(hittable_list* world, const point3& v0, const point3& v
     allocs.push_back(h);
 }
 
-// Appends the six quads of the axis-aligned box spanning opposite vertices
-// a & b. The quads are added individually (not as a nested sub-list) so the
-// BVH can split them and device traversal stays recursion-free.
-inline void box(const point3& a, const point3& b, material* mat,
-                hittable_list* world, std::vector<void*>& allocs) {
+// --- composites & transforms -------------------------------------------------
+
+// Builds the six-quad axis-aligned box spanning opposite vertices a & b as a
+// hittable_list wrapped in a hittable, so it can be wrapped in transforms
+// (new_rotate_y / new_translate) or added to the world as a unit. The inner
+// list is also recorded in `sublists`: its destructor must run at teardown
+// (it frees the list's internal objects array), before the allocs free loop.
+inline hittable* new_box(const point3& a, const point3& b, material* mat,
+                         std::vector<void*>& allocs,
+                         std::vector<hittable_list*>& sublists) {
+    hittable_list* sides;
+    checkCudaErrors(cudaMallocManaged((void**)&sides, sizeof(hittable_list)));
+    new(sides) hittable_list();
+
+    hittable* h;
+    checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
+    h->type = HITTABLE_LIST;
+    h->object = sides;
+
+    allocs.push_back(sides);
+    allocs.push_back(h);
+    sublists.push_back(sides);
+
     auto min = point3(fmin(a.x(), b.x()), fmin(a.y(), b.y()), fmin(a.z(), b.z()));
     auto max = point3(fmax(a.x(), b.x()), fmax(a.y(), b.y()), fmax(a.z(), b.z()));
 
@@ -115,12 +133,66 @@ inline void box(const point3& a, const point3& b, material* mat,
     auto dy = vec3(0, max.y() - min.y(), 0);
     auto dz = vec3(0, 0, max.z() - min.z());
 
-    add_quad(world, point3(min.x(), min.y(), max.z()),  dx,  dy, mat, allocs);  // front
-    add_quad(world, point3(max.x(), min.y(), max.z()), -dz,  dy, mat, allocs);  // right
-    add_quad(world, point3(max.x(), min.y(), min.z()), -dx,  dy, mat, allocs);  // back
-    add_quad(world, point3(min.x(), min.y(), min.z()),  dz,  dy, mat, allocs);  // left
-    add_quad(world, point3(min.x(), max.y(), max.z()),  dx, -dz, mat, allocs);  // top
-    add_quad(world, point3(min.x(), min.y(), min.z()),  dx,  dz, mat, allocs);  // bottom
+    add_quad(sides, point3(min.x(), min.y(), max.z()),  dx,  dy, mat, allocs);  // front
+    add_quad(sides, point3(max.x(), min.y(), max.z()), -dz,  dy, mat, allocs);  // right
+    add_quad(sides, point3(max.x(), min.y(), min.z()), -dx,  dy, mat, allocs);  // back
+    add_quad(sides, point3(min.x(), min.y(), min.z()),  dz,  dy, mat, allocs);  // left
+    add_quad(sides, point3(min.x(), max.y(), max.z()),  dx, -dz, mat, allocs);  // top
+    add_quad(sides, point3(min.x(), min.y(), min.z()),  dx,  dz, mat, allocs);  // bottom
+
+    return h;
+}
+
+// Instance-transform wrappers. Each wraps a child hittable* and returns the
+// wrapper hittable*, so they chain: scale first, then rotate, then translate,
+// e.g. new_translate(new_rotate_y(new_box(...), 15), vec3(265,0,295), ...).
+
+inline hittable* new_translate(hittable* child, const vec3& offset,
+                               std::vector<void*>& allocs) {
+    translate* t;
+    checkCudaErrors(cudaMallocManaged((void**)&t, sizeof(translate)));
+    new(t) translate(child, offset);
+
+    hittable* h;
+    checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
+    h->type = TRANSLATE;
+    h->object = t;
+
+    allocs.push_back(t);
+    allocs.push_back(h);
+    return h;
+}
+
+inline hittable* new_rotate_y(hittable* child, double angle_degrees,
+                              std::vector<void*>& allocs) {
+    rotate_y* rot;
+    checkCudaErrors(cudaMallocManaged((void**)&rot, sizeof(rotate_y)));
+    new(rot) rotate_y(child, angle_degrees);
+
+    hittable* h;
+    checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
+    h->type = ROTATE_Y;
+    h->object = rot;
+
+    allocs.push_back(rot);
+    allocs.push_back(h);
+    return h;
+}
+
+inline hittable* new_uniform_scale(hittable* child, double scale,
+                                   std::vector<void*>& allocs) {
+    uniform_scale* s;
+    checkCudaErrors(cudaMallocManaged((void**)&s, sizeof(uniform_scale)));
+    new(s) uniform_scale(child, scale);
+
+    hittable* h;
+    checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
+    h->type = UNIFORM_SCALE;
+    h->object = s;
+
+    allocs.push_back(s);
+    allocs.push_back(h);
+    return h;
 }
 
 #endif // SCENE_UTILS_H

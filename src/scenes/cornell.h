@@ -8,15 +8,17 @@
 #include "camera.h"
 #include "scenes/scene_utils.h"
 
-// Cornell box (Phase 2 validation for quads, triangle, and the box() helper):
-// colored walls, a ceiling area light, two axis-aligned boxes, and a triangle
-// on the back wall. Compile-time knobs come from main.cu, included first.
+// Cornell box: colored walls, a ceiling area light, two boxes placed with
+// instance transforms (Phase 3), and a triangle on the back wall. Compile-time
+// knobs come from main.cu, included first.
 inline void cornell_box() {
     auto start = std::chrono::system_clock::now();
     std::clog << "Creating Scene.\n" << std::flush;
 
-    // Increase CUDA stack size to prevent stack overflow
-    checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
+    // Increase CUDA stack size to prevent stack overflow. Transform chains
+    // deepen the dispatch recursion (translate → rotate → list → quad), so
+    // this scene uses a larger margin than the sphere scene's 2048.
+    checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 4096));
 
     // world
     hittable_list* world;
@@ -29,6 +31,7 @@ inline void cornell_box() {
     world_hittable->object = world;
 
     std::vector<void*> allocs;
+    std::vector<hittable_list*> sublists;   // inner box lists; dtors run at teardown
 
     material* red   = new_lambertian(color(.65, .05, .05), allocs);
     material* white = new_lambertian(color(.73, .73, .73), allocs);
@@ -44,9 +47,21 @@ inline void cornell_box() {
     add_quad(world, point3(555,555,555), vec3(-555,0,0), vec3(0,0,-555), white, allocs);
     add_quad(world, point3(0,0,555),     vec3(555,0,0),  vec3(0,555,0),  white, allocs);
 
-    // two boxes (axis-aligned until Phase 3 adds rotation)
-    box(point3(265,0,295), point3(430,330,460), white, world, allocs);  // tall
-    box(point3(130,0,65),  point3(295,165,230), white, world, allocs);  // short
+    // two boxes, placed with instance transforms (reference cornell_box values):
+    // built at the origin, then rotated about Y, then translated into place.
+    hittable* box1 = new_box(point3(0,0,0), point3(165,330,165), white, allocs, sublists);
+    box1 = new_rotate_y(box1, 15, allocs);
+    box1 = new_translate(box1, vec3(265,0,295), allocs);
+    world->add(box1);
+
+    // The short box is built double-size and uniform-scaled by 0.5 — the net
+    // geometry is identical to the reference's 165^3 box, but the chain
+    // exercises all three transforms (scale, then rotate, then translate).
+    hittable* box2 = new_box(point3(0,0,0), point3(330,330,330), white, allocs, sublists);
+    box2 = new_uniform_scale(box2, 0.5, allocs);
+    box2 = new_rotate_y(box2, -18, allocs);
+    box2 = new_translate(box2, vec3(130,0,65), allocs);
+    world->add(box2);
 
     // a triangle on the back wall, exercising the TRIANGLE dispatch path
     add_triangle(world, point3(160,340,554), point3(395,340,554), point3(277.5,470,554),
@@ -103,6 +118,8 @@ inline void cornell_box() {
     std::clog << "Render time: " << render_duration.count() << "ms.\n" << std::flush;
 
     // clean up
+    for (hittable_list* l : sublists)
+        l->~hittable_list();   // frees each inner box list's objects array
     for (void* p : allocs)
         cudaFree(p);
     bvh->~bvh_scene();         // frees its nodes/prim_index/prims buffers

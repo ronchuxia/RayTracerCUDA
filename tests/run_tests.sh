@@ -30,7 +30,7 @@ cmp build/flat.ppm build/bvh.ppm
 nonblack build/flat.ppm
 echo "PASS: flat and BVH renders are byte-identical"
 
-echo "== [3/3] Cornell scene (quads/triangle/box): byte-identical render, flat vs BVH =="
+echo "== [3/3] Cornell scene (quads/triangle/box/transforms): byte-identical render, flat vs BVH =="
 nvcc src/main.cu -o build/rt_flat_cornell $NVCC_FLAGS -DRT_SCENE=1 -DUSE_BVH=0 -DRT_SEED=42 -DRT_IMAGE_WIDTH=200 -DRT_SAMPLES=16
 nvcc src/main.cu -o build/rt_bvh_cornell  $NVCC_FLAGS -DRT_SCENE=1 -DUSE_BVH=1 -DRT_SEED=42 -DRT_IMAGE_WIDTH=200 -DRT_SAMPLES=16
 ./build/rt_flat_cornell > build/flat_cornell.ppm 2>/dev/null
