@@ -8,7 +8,7 @@
 #define USE_BVH 1          // 1: render through the flattened BVH; 0: flat hittable_list
 #endif
 #ifndef RT_SCENE
-#define RT_SCENE 0         // 0: sphere scene; 1: Cornell box (quads + triangle + boxes)
+#define RT_SCENE 0         // 0: sphere scene; 1: Cornell box; 2: badge (STL mesh)
 #endif
 #ifndef RT_IMAGE_WIDTH
 #if RT_SCENE == 1
@@ -20,13 +20,19 @@
 #ifndef RT_SAMPLES
 #define RT_SAMPLES 512
 #endif
+#ifndef RT_MAX_DEPTH
+#define RT_MAX_DEPTH 10    // path-trace bounce cap (the fork's badge render used 100)
+#endif
 
 #include "scenes/spheres.h"
 #include "scenes/cornell.h"
+#include "scenes/badge.h"
 
 int main() {
 #if RT_SCENE == 1
     cornell_box();
+#elif RT_SCENE == 2
+    badge();
 #else
     spheres();
 #endif

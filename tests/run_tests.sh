@@ -17,11 +17,11 @@ nonblack() {  # fail if a PPM has no nonzero sample (catches all-black renders)
     awk 'NR>3 { for (i=1;i<=NF;i++) if ($i+0 > 0) { found=1; exit } } END { exit !found }' "$1"
 }
 
-echo "== [1/3] unit tests: flat vs BVH hit equivalence, invariants, refit =="
+echo "== [1/4] unit tests: flat vs BVH hit equivalence, invariants, refit =="
 nvcc tests/test_bvh.cu -o build/test_bvh $NVCC_FLAGS
 ./build/test_bvh
 
-echo "== [2/3] end-to-end: byte-identical render, flat vs BVH, fixed seed =="
+echo "== [2/4] end-to-end: byte-identical render, flat vs BVH, fixed seed =="
 nvcc src/main.cu -o build/rt_flat $NVCC_FLAGS -DUSE_BVH=0 -DRT_SEED=42 -DRT_IMAGE_WIDTH=200 -DRT_SAMPLES=16
 nvcc src/main.cu -o build/rt_bvh  $NVCC_FLAGS -DUSE_BVH=1 -DRT_SEED=42 -DRT_IMAGE_WIDTH=200 -DRT_SAMPLES=16
 ./build/rt_flat > build/flat.ppm 2>/dev/null
@@ -30,7 +30,7 @@ cmp build/flat.ppm build/bvh.ppm
 nonblack build/flat.ppm
 echo "PASS: flat and BVH renders are byte-identical"
 
-echo "== [3/3] Cornell scene (quads/triangle/box/transforms): byte-identical render, flat vs BVH =="
+echo "== [3/4] Cornell scene (quads/triangle/box/transforms): byte-identical render, flat vs BVH =="
 nvcc src/main.cu -o build/rt_flat_cornell $NVCC_FLAGS -DRT_SCENE=1 -DUSE_BVH=0 -DRT_SEED=42 -DRT_IMAGE_WIDTH=200 -DRT_SAMPLES=16
 nvcc src/main.cu -o build/rt_bvh_cornell  $NVCC_FLAGS -DRT_SCENE=1 -DUSE_BVH=1 -DRT_SEED=42 -DRT_IMAGE_WIDTH=200 -DRT_SAMPLES=16
 ./build/rt_flat_cornell > build/flat_cornell.ppm 2>/dev/null
@@ -38,5 +38,16 @@ nvcc src/main.cu -o build/rt_bvh_cornell  $NVCC_FLAGS -DRT_SCENE=1 -DUSE_BVH=1 -
 cmp build/flat_cornell.ppm build/bvh_cornell.ppm
 nonblack build/flat_cornell.ppm
 echo "PASS: Cornell flat and BVH renders are byte-identical"
+
+echo "== [4/4] badge scene (STL mesh, nested BVH + transforms): byte-identical render, flat vs BVH =="
+# RT_BADGE_FIELD=0 skips the 3.8k-sphere field so the flat-list path stays fast;
+# the mesh's own BVH is present in BOTH paths (USE_BVH only toggles the world level).
+nvcc src/main.cu -o build/rt_flat_badge $NVCC_FLAGS -DRT_SCENE=2 -DRT_BADGE_FIELD=0 -DUSE_BVH=0 -DRT_SEED=42 -DRT_IMAGE_WIDTH=200 -DRT_SAMPLES=16
+nvcc src/main.cu -o build/rt_bvh_badge  $NVCC_FLAGS -DRT_SCENE=2 -DRT_BADGE_FIELD=0 -DUSE_BVH=1 -DRT_SEED=42 -DRT_IMAGE_WIDTH=200 -DRT_SAMPLES=16
+./build/rt_flat_badge > build/flat_badge.ppm 2>/dev/null
+./build/rt_bvh_badge  > build/bvh_badge.ppm  2>/dev/null
+cmp build/flat_badge.ppm build/bvh_badge.ppm
+nonblack build/flat_badge.ppm
+echo "PASS: badge flat and BVH renders are byte-identical"
 
 echo "ALL TESTS PASSED"

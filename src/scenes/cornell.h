@@ -88,7 +88,7 @@ inline void cornell_box() {
     cam->aspect_ratio      = 1.0;
     cam->image_width       = RT_IMAGE_WIDTH;
     cam->samples_per_pixel = RT_SAMPLES;
-    cam->max_depth         = 10;
+    cam->max_depth         = RT_MAX_DEPTH;
 #ifdef RT_SEED
     cam->seed = RT_SEED;
 #endif
