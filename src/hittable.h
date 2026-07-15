@@ -7,6 +7,8 @@
 #include "interval.h"
 #include "ray.h"
 #include "hittables/sphere.h"
+#include "hittables/quad.h"
+#include "hittables/triangle.h"
 #include "vec3.h"
 
 struct material;
@@ -14,6 +16,8 @@ struct material;
 enum HittableType {
   HITTABLE_LIST,
   SPHERE,
+  QUAD,
+  TRIANGLE,
   BVH
 };
 
@@ -45,6 +49,10 @@ __device__ bool hittable::hit(const ray& r, interval ray_t, hit_record& rec) con
         return hittable_list_hit(static_cast<hittable_list*>(object), r, ray_t, rec);
         case SPHERE:
         return static_cast<sphere*>(object)->hit(r, ray_t, rec);
+        case QUAD:
+        return static_cast<quad*>(object)->hit(r, ray_t, rec);
+        case TRIANGLE:
+        return static_cast<triangle*>(object)->hit(r, ray_t, rec);
         case BVH:
         return bvh_scene_hit(static_cast<bvh_scene*>(object), r, ray_t, rec);
         default:
@@ -58,6 +66,10 @@ __host__ __device__ aabb hittable::bounding_box() const {
         return hittable_list_bounding_box(static_cast<hittable_list*>(object));
         case SPHERE:
         return static_cast<sphere*>(object)->bounding_box();
+        case QUAD:
+        return static_cast<quad*>(object)->bounding_box();
+        case TRIANGLE:
+        return static_cast<triangle*>(object)->bounding_box();
         case BVH:
         return bvh_scene_bounding_box(static_cast<bvh_scene*>(object));
         default:
