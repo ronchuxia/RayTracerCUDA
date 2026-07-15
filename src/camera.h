@@ -10,6 +10,14 @@
 #include "hittable.h"
 #include "material.h"
 
+// Background on ray miss: 0 (default) = black, so scenes are lit only by
+// diffuse_light objects; 1 = the book's sky gradient (the variant the fork
+// later commented out, including its 0.7 dimming factor) — build with
+// -DRT_SKY=1 to reproduce the fork's older sky-lit renders.
+#ifndef RT_SKY
+#define RT_SKY 0
+#endif
+
 struct camera;
 __global__ void initialize_rand(const camera& cam, curandState* state, unsigned long seed);
 __global__ void render_pixel(const camera& cam, int max_depth, const hittable& world, color* pixel_colors, curandState* rand_states);
@@ -105,7 +113,14 @@ struct camera {
                 }
                 else {
                     // If no hit, add background color and terminate
-                    current_color += throughput * color(0,0,0);
+#if RT_SKY
+                    vec3 unit_direction = unit_vector(current_ray.direction());
+                    auto a = 0.5 * (unit_direction.y() + 1.0);
+                    color background = ((1.0-a)*color(1.0, 1.0, 1.0) + a*color(0.5, 0.7, 1.0)) * 0.7;
+#else
+                    color background = color(0,0,0);
+#endif
+                    current_color += throughput * background;
                     break;
                 }
             }

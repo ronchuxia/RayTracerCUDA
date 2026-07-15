@@ -23,6 +23,8 @@
 #ifndef RT_MAX_DEPTH
 #define RT_MAX_DEPTH 10    // path-trace bounce cap (the fork's badge render used 100)
 #endif
+// RT_SKY=1 (default 0, defined in camera.h) swaps the black miss-background
+// for the book's sky gradient — see camera.h.
 
 #include "scenes/spheres.h"
 #include "scenes/cornell.h"
