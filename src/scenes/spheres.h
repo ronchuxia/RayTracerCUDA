@@ -7,11 +7,16 @@
 
 #include "camera.h"
 #include "scenes/scene_utils.h"
+#include "loaders/image_loader.h"
 
-// Default scene: a ground plane, one diffuse sphere, and an emissive sphere
-// lighting it. The original hand-unrolled port of this scene; now built with
-// the shared scene_utils helpers. Compile-time knobs (RT_IMAGE_WIDTH,
-// RT_SAMPLES, RT_SEED, USE_BVH) come from main.cu, included before this header.
+// Default scene: a checkered ground, one diffuse sphere, an earth-textured
+// sphere (A1 texture validation), and an emissive sphere lighting them.
+// Compile-time knobs (RT_IMAGE_WIDTH, RT_SAMPLES, RT_SEED, USE_BVH) come from
+// main.cu, included before this header.
+
+#ifndef RT_EARTH_IMG
+#define RT_EARTH_IMG "references/RayTracing/images/earthmap.jpg"   // root-relative
+#endif
 inline void spheres() {
     auto start = std::chrono::system_clock::now();
     std::clog << "Creating Scene.\n" << std::flush;
@@ -31,12 +36,15 @@ inline void spheres() {
 
     std::vector<void*> allocs;
 
-    material* ground = new_lambertian(color(0.5, 0.5, 0.5), allocs);
+    material* ground = new_lambertian(
+        make_checker(0.32, color(.2, .3, .1), color(.9, .9, .9)), allocs);
     material* red    = new_lambertian(color(0.7, 0.3, 0.3), allocs);
+    material* earth  = new_lambertian(load_image_texture(RT_EARTH_IMG, allocs), allocs);
     material* light  = new_diffuse_light(color(10, 10, 10), allocs);
 
     add_sphere(world, point3(0, -1000, 0), 1000, ground, allocs);
     add_sphere(world, point3(0, 1, 0),     1.0,  red,    allocs);
+    add_sphere(world, point3(-2.5, 1, 1),  1.0,  earth,  allocs);
     add_sphere(world, point3(0, 30, -30),  10.0, light,  allocs);
 
     // bvh over the same objects

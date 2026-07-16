@@ -5,6 +5,7 @@
 #include "vec3.h"
 #include "ray.h"
 #include "color.h"
+#include "texture.h"
 #include "curand_kernel.h"
 
 enum MaterialType {
@@ -15,9 +16,10 @@ enum MaterialType {
 };
 
 struct lambertian {
-  color albedo;
+  texture albedo;   // solid / checker / image — plain colors convert implicitly
 
   lambertian(const color& a) : albedo(a) {}
+  lambertian(const texture& t) : albedo(t) {}
 
   __device__ bool scatter(const ray& r_in, const hit_record& rec, color& attenuation, ray& scattered, curandState* state) const {
     auto scatter_direction = rec.normal + random_unit_vector(state);
@@ -27,7 +29,7 @@ struct lambertian {
         scatter_direction = rec.normal;
 
     scattered = ray(rec.p, scatter_direction);
-    attenuation = albedo;
+    attenuation = albedo.value(rec.u, rec.v, rec.p);
     return true;
   }
 };

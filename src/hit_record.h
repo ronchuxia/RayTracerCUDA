@@ -11,6 +11,7 @@ struct hit_record {
     vec3 normal;
     material* mat;
     double t;
+    double u, v;   // surface coordinates of the hit, set by each primitive's hit()
     bool front_face;
 
     __host__ __device__ void set_face_normal(const ray& r, const vec3& outward_normal) {

@@ -53,6 +53,8 @@ struct triangle {
 
     rec.t = t;
     rec.p = r.at(rec.t);
+    rec.u = b1;   // barycentric coordinates double as the triangle's UV
+    rec.v = b2;
     rec.set_face_normal(r, n);
     rec.mat = mat;
 

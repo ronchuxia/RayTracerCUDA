@@ -51,6 +51,8 @@ struct quad {
 
     rec.t = t;
     rec.p = intersection;
+    rec.u = alpha;   // planar coordinates double as the quad's UV
+    rec.v = beta;
     rec.mat = mat;
     rec.set_face_normal(r, normal);
 

@@ -25,6 +25,15 @@ inline material* new_lambertian(const color& albedo, std::vector<void*>& allocs)
     return m;
 }
 
+inline material* new_lambertian(const texture& tex, std::vector<void*>& allocs) {
+    material* m;
+    checkCudaErrors(cudaMallocManaged((void**)&m, sizeof(material)));
+    m->type = LAMBERTIAN;
+    m->lam = lambertian(tex);
+    allocs.push_back(m);
+    return m;
+}
+
 inline material* new_metal(const color& albedo, double fuzz, std::vector<void*>& allocs) {
     material* m;
     checkCudaErrors(cudaMallocManaged((void**)&m, sizeof(material)));
