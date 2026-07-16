@@ -50,12 +50,26 @@ struct metal{
 };
 
 struct dielectric {
-  double ir; // Index of Refraction
+  double ir;          // Index of Refraction
+  color  absorption;  // Beer-Lambert coefficient per RGB channel; (0,0,0) = clear glass
 
-  dielectric(double index_of_refraction) : ir(index_of_refraction) {}
+  dielectric(double index_of_refraction)
+    : ir(index_of_refraction), absorption(0, 0, 0) {}
+  dielectric(double index_of_refraction, const color& absorb)
+    : ir(index_of_refraction), absorption(absorb) {}
 
   __device__ bool scatter(const ray& r_in, const hit_record& rec, color& attenuation, ray& scattered, curandState* state) const {
-    attenuation = color(1.0, 1.0, 1.0);
+    // Beer-Lambert tint: only the leg *inside* the glass absorbs. We reach an
+    // interior surface with front_face == false, having traveled rec.t through
+    // the glass since the last hit — and because the refracted ray is unit-length,
+    // rec.t is a true distance. Clear glass (absorption 0) => exp(0) = white,
+    // byte-identical to the original clear dielectric.
+    if (!rec.front_face)
+        attenuation = color(exp(-absorption.x() * rec.t),
+                            exp(-absorption.y() * rec.t),
+                            exp(-absorption.z() * rec.t));
+    else
+        attenuation = color(1.0, 1.0, 1.0);
     double refraction_ratio = rec.front_face ? (1.0/ir) : ir;
 
     vec3 unit_direction = unit_vector(r_in.direction());

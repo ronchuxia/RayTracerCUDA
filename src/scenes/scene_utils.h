@@ -52,6 +52,18 @@ inline material* new_dielectric(double ir, std::vector<void*>& allocs) {
     return m;
 }
 
+// Tinted glass: a dielectric that absorbs light per Beer-Lambert as it travels
+// through the glass. `absorption` is the per-channel coefficient of what's
+// *removed*, so the visible tint is its complement (green glass absorbs red+blue).
+inline material* new_tinted_glass(double ir, const color& absorption, std::vector<void*>& allocs) {
+    material* m;
+    checkCudaErrors(cudaMallocManaged((void**)&m, sizeof(material)));
+    m->type = DIELECTRIC;
+    m->die = dielectric(ir, absorption);
+    allocs.push_back(m);
+    return m;
+}
+
 inline material* new_diffuse_light(const color& emit, std::vector<void*>& allocs) {
     material* m;
     checkCudaErrors(cudaMallocManaged((void**)&m, sizeof(material)));
