@@ -41,7 +41,7 @@ struct hittable_list {
 
     __host__ __device__ aabb bounding_box() const {return bbox;}
 
-    __device__ bool hit(const ray& r, interval ray_t, hit_record& rec) const;
+    __device__ bool hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const;
 };
 
 __host__ void hittable_list::add(hittable* object) {
@@ -60,7 +60,7 @@ __host__ void hittable_list::add(hittable* object) {
     bbox = aabb(bbox, object->bounding_box());
 }
 
-__device__ bool hittable_list::hit(const ray& r, interval ray_t, hit_record& rec) const {
+__device__ bool hittable_list::hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const {
     if (!bbox.hit(r, ray_t)) return false;
 
     hit_record temp_rec;
@@ -71,7 +71,7 @@ __device__ bool hittable_list::hit(const ray& r, interval ray_t, hit_record& rec
     // if (size < 0 || size > capacity || objects == nullptr) return false;
 
     for (int i = 0; i < size; i++) {
-        if (objects[i]->hit(r, interval(ray_t.min, closest_so_far), temp_rec)) {
+        if (objects[i]->hit(r, interval(ray_t.min, closest_so_far), temp_rec, state)) {
             hit_anything = true;
             closest_so_far = temp_rec.t;
             rec = temp_rec;
@@ -83,8 +83,8 @@ __device__ bool hittable_list::hit(const ray& r, interval ray_t, hit_record& rec
 
 // Dispatch shims declared in hittable.h (before hittable_list is complete) and
 // defined here, so hittable's switches can route to the list.
-__device__ bool hittable_list_hit(const hittable_list* list, const ray& r, interval ray_t, hit_record& rec) {
-    return list->hit(r, ray_t, rec);
+__device__ bool hittable_list_hit(const hittable_list* list, const ray& r, interval ray_t, hit_record& rec, curandState* state) {
+    return list->hit(r, ray_t, rec, state);
 }
 
 __host__ __device__ aabb hittable_list_bounding_box(const hittable_list* list) {

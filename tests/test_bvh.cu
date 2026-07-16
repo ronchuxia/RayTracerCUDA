@@ -168,7 +168,7 @@ __global__ void hit_kernel(const hittable* root, const ray* rays, int n, hit_res
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     hit_record rec;
-    bool h = root->hit(rays[idx], interval(0.001, 1.0/0.0), rec);
+    bool h = root->hit(rays[idx], interval(0.001, 1.0/0.0), rec, nullptr);
     out[idx].hit = h ? 1 : 0;
     out[idx].t = h ? rec.t : 0.0;
     out[idx].p = h ? rec.p : point3(0,0,0);

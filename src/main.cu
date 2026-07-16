@@ -8,11 +8,11 @@
 #define USE_BVH 1          // 1: render through the flattened BVH; 0: flat hittable_list
 #endif
 #ifndef RT_SCENE
-#define RT_SCENE 0         // 0: sphere scene; 1: Cornell box; 2: badge (STL mesh)
+#define RT_SCENE 0         // 0: sphere scene; 1: Cornell box; 2: badge (STL mesh); 3: Cornell smoke
 #endif
 #ifndef RT_IMAGE_WIDTH
-#if RT_SCENE == 1
-#define RT_IMAGE_WIDTH 600   // the Cornell box renders square
+#if RT_SCENE == 1 || RT_SCENE == 3
+#define RT_IMAGE_WIDTH 600   // the Cornell scenes render square
 #else
 #define RT_IMAGE_WIDTH 1200
 #endif
@@ -29,12 +29,15 @@
 #include "scenes/spheres.h"
 #include "scenes/cornell.h"
 #include "scenes/badge.h"
+#include "scenes/cornell_smoke.h"
 
 int main() {
 #if RT_SCENE == 1
     cornell_box();
 #elif RT_SCENE == 2
     badge();
+#elif RT_SCENE == 3
+    cornell_smoke();
 #else
     spheres();
 #endif

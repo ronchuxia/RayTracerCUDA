@@ -94,7 +94,7 @@ struct camera {
             hit_record rec;
 
             for (int i = 0; i < max_depth; i++) {
-                if (world.hit(current_ray, interval(0.001, 1.0/0.0), rec)) {
+                if (world.hit(current_ray, interval(0.001, 1.0/0.0), rec, state)) {
                     ray scattered;
                     color attenuation;
                     color emit = rec.mat->emitted();

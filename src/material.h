@@ -12,7 +12,8 @@ enum MaterialType {
     LAMBERTIAN,
     METAL,
     DIELECTRIC,
-    DIFFUSE_LIGHT
+    DIFFUSE_LIGHT,
+    ISOTROPIC
 };
 
 struct lambertian {
@@ -96,6 +97,21 @@ struct diffuse_light {
   }
 };
 
+// Phase function of a constant_medium volume: scatters uniformly in all
+// directions (no dependence on the incoming ray), tinted by the albedo.
+struct isotropic {
+  texture albedo;   // solid / checker / image — plain colors convert implicitly
+
+  isotropic(const color& a) : albedo(a) {}
+  isotropic(const texture& t) : albedo(t) {}
+
+  __device__ bool scatter(const ray& r_in, const hit_record& rec, color& attenuation, ray& scattered, curandState* state) const {
+    scattered = ray(rec.p, random_unit_vector(state));
+    attenuation = albedo.value(rec.u, rec.v, rec.p);
+    return true;
+  }
+};
+
 struct material {
     MaterialType type;
     union {
@@ -103,6 +119,7 @@ struct material {
       metal met;
       dielectric die;
       diffuse_light light;
+      isotropic iso;
     };
 
     __device__ bool scatter(const ray& r_in, const hit_record& rec, color& attenuation, ray& scattered, curandState* state) const {
@@ -115,6 +132,8 @@ struct material {
               return die.scatter(r_in, rec, attenuation, scattered, state);
           case DIFFUSE_LIGHT:
               return light.scatter(r_in, rec, attenuation, scattered, state);
+          case ISOTROPIC:
+              return iso.scatter(r_in, rec, attenuation, scattered, state);
           default:
               return false;
       }

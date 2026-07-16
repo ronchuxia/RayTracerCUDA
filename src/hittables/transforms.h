@@ -31,12 +31,12 @@ struct translate {
 
   __host__ __device__ aabb bounding_box() const {return bbox;}
 
-  __device__ bool hit(const ray& r, interval ray_t, hit_record& rec) const {
+  __device__ bool hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const {
     // Move the ray backwards by the offset
     ray offset_r(r.origin() - offset, r.direction());
 
     // Determine whether an intersection exists along the offset ray (and if so, where)
-    if (!child->hit(offset_r, ray_t, rec))
+    if (!child->hit(offset_r, ray_t, rec, state))
         return false;
 
     // Move the intersection point forwards by the offset
@@ -88,7 +88,7 @@ struct rotate_y {
 
   __host__ __device__ aabb bounding_box() const {return bbox;}
 
-  __device__ bool hit(const ray& r, interval ray_t, hit_record& rec) const {
+  __device__ bool hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const {
     // Change the ray from world space to object space
     auto origin = r.origin();
     auto direction = r.direction();
@@ -102,7 +102,7 @@ struct rotate_y {
     ray rotated_r(origin, direction);
 
     // Determine whether an intersection exists in object space (and if so, where)
-    if (!child->hit(rotated_r, ray_t, rec))
+    if (!child->hit(rotated_r, ray_t, rec, state))
         return false;
 
     // Change the intersection point from object space to world space
@@ -135,13 +135,13 @@ struct uniform_scale {
 
   __host__ __device__ aabb bounding_box() const {return bbox;}
 
-  __device__ bool hit(const ray& r, interval ray_t, hit_record& rec) const {
+  __device__ bool hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const {
     // Scale the ray into object space. Origin AND direction are both scaled,
     // so the hit parameter t carries over to world space unchanged; the
     // normal's direction is preserved by a uniform scale.
     ray scaled_r(r.origin() * (1/scale), r.direction() * (1/scale));
 
-    if (!child->hit(scaled_r, ray_t, rec))
+    if (!child->hit(scaled_r, ray_t, rec, state))
         return false;
 
     // Scale the intersection point back to world space
@@ -153,24 +153,24 @@ struct uniform_scale {
 
 // Dispatch shims declared in hittable.h (before the transforms are complete)
 // and defined here, so hittable's switches can route to them.
-__device__ bool translate_hit(const translate* t, const ray& r, interval ray_t, hit_record& rec) {
-    return t->hit(r, ray_t, rec);
+__device__ bool translate_hit(const translate* t, const ray& r, interval ray_t, hit_record& rec, curandState* state) {
+    return t->hit(r, ray_t, rec, state);
 }
 
 __host__ __device__ aabb translate_bounding_box(const translate* t) {
     return t->bounding_box();
 }
 
-__device__ bool rotate_y_hit(const rotate_y* rot, const ray& r, interval ray_t, hit_record& rec) {
-    return rot->hit(r, ray_t, rec);
+__device__ bool rotate_y_hit(const rotate_y* rot, const ray& r, interval ray_t, hit_record& rec, curandState* state) {
+    return rot->hit(r, ray_t, rec, state);
 }
 
 __host__ __device__ aabb rotate_y_bounding_box(const rotate_y* rot) {
     return rot->bounding_box();
 }
 
-__device__ bool uniform_scale_hit(const uniform_scale* s, const ray& r, interval ray_t, hit_record& rec) {
-    return s->hit(r, ray_t, rec);
+__device__ bool uniform_scale_hit(const uniform_scale* s, const ray& r, interval ray_t, hit_record& rec, curandState* state) {
+    return s->hit(r, ray_t, rec, state);
 }
 
 __host__ __device__ aabb uniform_scale_bounding_box(const uniform_scale* s) {

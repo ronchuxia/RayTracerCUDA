@@ -29,7 +29,7 @@ struct quad {
 
   __host__ __device__ aabb bounding_box() const {return bbox;}
 
-  __device__ bool hit(const ray& r, interval ray_t, hit_record& rec) const {
+  __device__ bool hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const {
     if (!bbox.hit(r, ray_t)) return false;
 
     auto denom = dot(normal, r.direction());

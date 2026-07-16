@@ -61,6 +61,15 @@ inline material* new_diffuse_light(const color& emit, std::vector<void*>& allocs
     return m;
 }
 
+inline material* new_isotropic(const texture& albedo, std::vector<void*>& allocs) {
+    material* m;
+    checkCudaErrors(cudaMallocManaged((void**)&m, sizeof(material)));
+    m->type = ISOTROPIC;
+    m->iso = isotropic(albedo);
+    allocs.push_back(m);
+    return m;
+}
+
 // --- shapes ----------------------------------------------------------------
 
 inline void add_sphere(hittable_list* world, const point3& center, double radius,
@@ -149,6 +158,27 @@ inline hittable* new_box(const point3& a, const point3& b, material* mat,
     add_quad(sides, point3(min.x(), max.y(), max.z()),  dx, -dz, mat, allocs);  // top
     add_quad(sides, point3(min.x(), min.y(), min.z()),  dx,  dz, mat, allocs);  // bottom
 
+    return h;
+}
+
+// Volume wrapper: turns a boundary hittable (a box, sphere, or transform
+// chain) into a constant-density medium with an isotropic phase function.
+inline hittable* new_constant_medium(hittable* boundary, double density,
+                                     const texture& albedo,
+                                     std::vector<void*>& allocs) {
+    material* phase = new_isotropic(albedo, allocs);
+
+    constant_medium* m;
+    checkCudaErrors(cudaMallocManaged((void**)&m, sizeof(constant_medium)));
+    new(m) constant_medium(boundary, density, phase);
+
+    hittable* h;
+    checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
+    h->type = CONSTANT_MEDIUM;
+    h->object = m;
+
+    allocs.push_back(m);
+    allocs.push_back(h);
     return h;
 }
 

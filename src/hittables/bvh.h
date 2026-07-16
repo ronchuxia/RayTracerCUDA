@@ -138,7 +138,7 @@ struct bvh_scene {
 
     // Iterative closest-hit traversal (no device recursion). stack[64] bounds
     // tree depth; the median build keeps depth ~log2(N), so 64 is ample.
-    __device__ bool hit(const ray& r, interval ray_t, hit_record& rec) const {
+    __device__ bool hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const {
         if (node_count == 0) return false;
 
         int stack[64];
@@ -161,7 +161,7 @@ struct bvh_scene {
                     // Writing rec directly is safe: prims[pi].hit only fills
                     // rec when the hit is inside [ray_t.min, closest_so_far),
                     // i.e. strictly closer than the best so far.
-                    if (prims[pi].hit(r, interval(ray_t.min, closest_so_far), rec)) {
+                    if (prims[pi].hit(r, interval(ray_t.min, closest_so_far), rec, state)) {
                         hit_anything = true;
                         closest_so_far = rec.t;
                     }
@@ -227,8 +227,8 @@ struct bvh_scene {
 
 // Dispatch shims declared in hittable.h (before bvh_scene is complete) and
 // defined here, so hittable's switches can route to the BVH.
-__device__ bool bvh_scene_hit(const bvh_scene* bvh, const ray& r, interval ray_t, hit_record& rec) {
-    return bvh->hit(r, ray_t, rec);
+__device__ bool bvh_scene_hit(const bvh_scene* bvh, const ray& r, interval ray_t, hit_record& rec, curandState* state) {
+    return bvh->hit(r, ray_t, rec, state);
 }
 
 __host__ __device__ aabb bvh_scene_bounding_box(const bvh_scene* bvh) {
