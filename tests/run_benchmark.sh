@@ -7,7 +7,9 @@ cd "$(dirname "$0")/.."
 mkdir -p build
 
 if [ -z "${ARCH:-}" ]; then
-    CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '. ')
+    # Query GPU 0 explicitly (one line, so no `head` — avoids a SIGPIPE race
+    # under pipefail); `|| true` tolerates nvidia-smi being absent.
+    CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 2>/dev/null | tr -d '. ' || true)
     ARCH="sm_${CC:-86}"
 fi
 echo "using -arch=$ARCH"

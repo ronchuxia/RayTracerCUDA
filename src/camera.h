@@ -66,13 +66,52 @@ struct camera {
             // output the pixel colors
             for (int j = 0; j < image_height; ++j) {
                 for (int i = 0; i < image_width; ++i) {
-                    write_color(std::cout, pixel_colors[j * image_width + i], samples_per_pixel);
+                    write_pixel(std::cout, pixel_colors[j * image_width + i], samples_per_pixel);
                 }
             }
 
             // clean up
             checkCudaErrors(cudaFree(rand_states));
             checkCudaErrors(cudaFree(pixel_colors));
+        }
+
+        // Compute derived camera state — image_height + the u/v/w frame — from the
+        // public config fields. render() calls this itself; it is public so an
+        // external driver (the interactive viewer) can size its window/buffers from
+        // image_height and launch initialize_rand / render_pixel on its own.
+        __host__ void initialize() {
+            image_height = static_cast<int>(image_width / aspect_ratio);
+            image_height = (image_height < 1) ? 1 : image_height;
+
+            center = lookfrom;
+
+            // Determine viewport dimensions.
+            auto theta = degrees_to_radians(vfov);
+            auto h = tan(theta/2);
+            auto viewport_height = 2 * h * focus_dist;
+            auto viewport_width = viewport_height * (static_cast<double>(image_width)/image_height);
+
+            // Calculate the u,v,w unit basis vectors for the camera coordinate frame.
+            w = unit_vector(lookfrom - lookat);
+            u = unit_vector(cross(vup, w));
+            v = cross(w, u);
+
+            // Calculate the vectors across the horizontal and down the vertical viewport edges.
+            vec3 viewport_u = viewport_width * u;    // Vector across viewport horizontal edge
+            vec3 viewport_v = viewport_height * -v;  // Vector down viewport vertical edge
+
+            // Calculate the horizontal and vertical delta vectors to the next pixel.
+            pixel_delta_u = viewport_u / image_width;
+            pixel_delta_v = viewport_v / image_height;
+
+            // Calculate the location of the upper left pixel.
+            auto viewport_upper_left = center - (focus_dist * w) - viewport_u/2 - viewport_v/2;
+            pixel00_loc = viewport_upper_left + 0.5 * (pixel_delta_u + pixel_delta_v);
+
+            // Calculate the camera defocus disk basis vectors.
+            auto defocus_radius = focus_dist * tan(degrees_to_radians(defocus_angle / 2));
+            defocus_disk_u = u * defocus_radius;
+            defocus_disk_v = v * defocus_radius;
         }
 
         __device__ ray get_ray(int i, int j, curandState* rand_state) const {
@@ -135,41 +174,6 @@ struct camera {
         vec3   u, v, w;         // Camera frame basis vectors
         vec3   defocus_disk_u;  // Defocus disk horizontal radius
         vec3   defocus_disk_v;  // Defocus disk vertical radius
-
-        __host__ void initialize() {
-            image_height = static_cast<int>(image_width / aspect_ratio);
-            image_height = (image_height < 1) ? 1 : image_height;
-
-            center = lookfrom;
-
-            // Determine viewport dimensions.
-            auto theta = degrees_to_radians(vfov);
-            auto h = tan(theta/2);
-            auto viewport_height = 2 * h * focus_dist;
-            auto viewport_width = viewport_height * (static_cast<double>(image_width)/image_height);
-
-            // Calculate the u,v,w unit basis vectors for the camera coordinate frame.
-            w = unit_vector(lookfrom - lookat);
-            u = unit_vector(cross(vup, w));
-            v = cross(w, u);
-
-            // Calculate the vectors across the horizontal and down the vertical viewport edges.
-            vec3 viewport_u = viewport_width * u;    // Vector across viewport horizontal edge
-            vec3 viewport_v = viewport_height * -v;  // Vector down viewport vertical edge
-
-            // Calculate the horizontal and vertical delta vectors to the next pixel.
-            pixel_delta_u = viewport_u / image_width;
-            pixel_delta_v = viewport_v / image_height;
-
-            // Calculate the location of the upper left pixel.
-            auto viewport_upper_left = center - (focus_dist * w) - viewport_u/2 - viewport_v/2;
-            pixel00_loc = viewport_upper_left + 0.5 * (pixel_delta_u + pixel_delta_v);
-
-            // Calculate the camera defocus disk basis vectors.
-            auto defocus_radius = focus_dist * tan(degrees_to_radians(defocus_angle / 2));
-            defocus_disk_u = u * defocus_radius;
-            defocus_disk_v = v * defocus_radius;
-        }
 
         __device__ vec3 pixel_sample_square(curandState* state) const {
             // Returns a random point in the square surrounding a pixel at the origin.
