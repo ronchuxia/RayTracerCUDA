@@ -1,4 +1,4 @@
-// viewer.cu — interactive real-time viewer (roadmap workstreams B1 + B2).
+// viewer.cu — interactive real-time viewer (roadmap workstreams B1–B3).
 //
 // A separate executable/translation unit from the offline renderer (main.cu):
 // it opens a window, builds a persistent scene, renders it on the GPU, and
@@ -22,13 +22,17 @@
 // B1 was the display + render loop; B2 adds progressive accumulation: each
 // loop iteration adds a few samples per pixel into a persistent accumulator
 // and presents the running average, so the image refines over time while the
-// app stays responsive. R resets the accumulation (the same reset B3 camera
-// motion will trigger); past RT_TARGET_SAMPLES the viewer stops adding and
-// just presents. Because each pixel's cuRAND state persists across launches,
-// K frames of M spp consume the same RNG stream — and add in the same order —
-// as one K*M-spp render, so the accumulated image is byte-identical to the
-// single-shot one (tests/run_tests.sh stage [7/7] checks exactly this).
-// The camera is still static (camera control is B3).
+// app stays responsive. R resets the accumulation; past RT_TARGET_SAMPLES the
+// viewer stops adding and just presents. Because each pixel's cuRAND state
+// persists across launches, K frames of M spp consume the same RNG stream —
+// and add in the same order — as one K*M-spp render, so the accumulated image
+// is byte-identical to the single-shot one (tests/run_tests.sh stage [7/7]).
+//
+// B3 makes the camera interactive: an orbit/arcball model around a target
+// point — left-drag orbits (azimuth/elevation), scroll wheel zooms (radius),
+// shift-left-drag pans the target. Any camera change re-runs camera::initialize()
+// and resets the accumulation (reusing B2's reset), so the view re-converges
+// from the new angle. Headless mode uses the default camera (no input).
 //
 // Needs a display (local, VNC, or X-forward) plus SDL2 + GLEW + OpenGL dev libs.
 // Build (match -arch to your GPU; see scripts/build_viewer.sh):
@@ -204,7 +208,7 @@ int main(int argc, char** argv) {
     GLuint tex = 0;
     if (!headless) {
         win = SDL_CreateWindow(
-            "RayTracingCUDA — viewer (B2)",
+            "RayTracingCUDA — viewer (B3)",
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H, SDL_WINDOW_OPENGL);
         if (!win) { fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError()); return 1; }
         gl = SDL_GL_CreateContext(win);
@@ -295,8 +299,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "viewer: %dx%d, %d spp/frame (target %d), depth %d — present: %s\n",
             W, H, spp_per_frame, RT_TARGET_SAMPLES, cam->max_depth,
             headless    ? "headless PPM dump"
-          : use_interop ? "CUDA-GL interop — ESC or close the window to quit, R to restart accumulation"
-                        : "CPU readback — ESC or close the window to quit, R to restart accumulation");
+          : use_interop ? "CUDA-GL interop — drag orbit, scroll zoom, shift-left-drag pan, R reset, ESC quit"
+                        : "CPU readback — drag orbit, scroll zoom, shift-left-drag pan, R reset, ESC quit");
 
     // ---- headless: accumulate `frames` passes, tonemap, write PPM, exit ----
     if (headless) {
@@ -329,20 +333,62 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // ---- B3: orbit-camera state (spherical coords around a target point) ----
+    // offset = lookfrom - target = radius * (cosφ cosθ, sinφ, cosφ sinθ).
+    point3 target    = cam->lookat;
+    vec3   offset    = cam->lookfrom - target;
+    double radius    = offset.length();
+    double azimuth   = atan2(offset.z(), offset.x());
+    double elevation = asin(offset.y() / radius);
+    const vec3 world_up = cam->vup;
+
+    // Rebuild the camera from the orbit state and reset accumulation. Called
+    // whenever the view changes (drag / scroll / pan / R).
+    auto rebuild_camera = [&]() {
+        double ce = cos(elevation), se = sin(elevation);
+        double ca = cos(azimuth),   sa = sin(azimuth);
+        cam->lookfrom = target + radius * vec3(ce * ca, se, ce * sa);
+        cam->lookat   = target;
+        cam->initialize();
+        checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
+        total_samples = 0;
+    };
+
     // ---- present loop: accumulate a few spp, then present the running average ----
     bool running = true;
     while (running) {
+        bool camera_dirty = false;
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
-            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_r) {
-                // Restart accumulation from scratch (B3 camera motion will
-                // trigger this same reset). RNG states keep advancing.
-                checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
-                total_samples = 0;
+            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_r) camera_dirty = true;
+            else if (e.type == SDL_MOUSEWHEEL) {
+                radius *= pow(0.9, e.wheel.y);          // wheel up = zoom in
+                if (radius < 0.1) radius = 0.1;
+                camera_dirty = true;
+            }
+            else if (e.type == SDL_MOUSEMOTION && (e.motion.state & SDL_BUTTON_LMASK)
+                     && !(SDL_GetModState() & KMOD_SHIFT)) {
+                azimuth   += e.motion.xrel * 0.005;
+                elevation += e.motion.yrel * 0.005;
+                const double lim = 1.55;                // ~89°, avoid the poles
+                if (elevation >  lim) elevation =  lim;
+                if (elevation < -lim) elevation = -lim;
+                camera_dirty = true;
+            }
+            else if (e.type == SDL_MOUSEMOTION
+                     && (e.motion.state & SDL_BUTTON_LMASK) && (SDL_GetModState() & KMOD_SHIFT)) {
+                // pan: slide the target in the camera's screen plane
+                vec3 fwd   = unit_vector(cam->lookat - cam->lookfrom);
+                vec3 right = unit_vector(cross(fwd, world_up));
+                vec3 up    = cross(right, fwd);
+                double k = radius * 0.002;
+                target = target + (-e.motion.xrel * right + e.motion.yrel * up) * k;
+                camera_dirty = true;
             }
         }
+        if (camera_dirty) rebuild_camera();   // recompute view + reset accumulation
 
         // B2: add spp_per_frame fresh samples per pixel until the target is
         // reached; after that just keep presenting the converged image.
@@ -351,7 +397,7 @@ int main(int argc, char** argv) {
             total_samples += spp_per_frame;
 
             char title[96];
-            snprintf(title, sizeof(title), "RayTracingCUDA — viewer (B2) — %lld spp", total_samples);
+            snprintf(title, sizeof(title), "RayTracingCUDA — viewer (B3) — %lld spp", total_samples);
             SDL_SetWindowTitle(win, title);
         }
 
