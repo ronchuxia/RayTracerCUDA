@@ -86,6 +86,14 @@ if pkg-config --exists sdl2 glew gl 2>/dev/null; then
     ./build/viewer --headless
     nonblack build/viewer_headless.ppm
     echo "PASS: viewer headless render is valid non-black output"
+    # B2 progressive accumulation: per-pixel cuRAND state persists across
+    # launches and samples add in the same order, so 16 frames x 4 spp must
+    # produce the same accumulator — byte-identical — as one 64-spp render.
+    ./build/viewer --headless --frames 1 --spp 64
+    mv build/viewer_headless.ppm build/viewer_single.ppm
+    ./build/viewer --headless --frames 16 --spp 4
+    cmp build/viewer_single.ppm build/viewer_headless.ppm
+    echo "PASS: accumulation (16 x 4 spp) is byte-identical to a single 64-spp render"
 else
     echo "SKIP: SDL2/GLEW/GL dev libraries not found — viewer stage not run"
 fi

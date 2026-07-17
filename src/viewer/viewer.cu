@@ -1,4 +1,4 @@
-// viewer.cu — interactive real-time viewer (roadmap workstream B1).
+// viewer.cu — interactive real-time viewer (roadmap workstreams B1 + B2).
 //
 // A separate executable/translation unit from the offline renderer (main.cu):
 // it opens a window, builds a persistent scene, renders it on the GPU, and
@@ -12,15 +12,23 @@
 // The path is chosen at startup: interop is attempted and, if registration
 // fails (e.g. software GL over VNC), the viewer falls back to readback.
 //
-// `./build/viewer --headless` skips SDL/GL entirely: it renders the same frame
-// through the readback pipeline and writes build/viewer_headless.ppm, so the
-// full CUDA path can run (and be verified) on a box with no display at all.
+// `./build/viewer --headless` skips SDL/GL entirely: it accumulates the same
+// image through the readback pipeline and writes build/viewer_headless.ppm, so
+// the full CUDA path can run (and be verified) on a box with no display at all.
+// Runtime flags: --spp N (samples added per frame, default RT_SAMPLES) and
+// --frames N (headless: frames to accumulate, default RT_FRAMES).
 // The offline path and tests are untouched.
 //
-// This is B1 only: display + render loop. The camera is static (camera control
-// is B3) and the frame is rendered once and re-presented (progressive
-// accumulation is B2). It reuses camera.h's render kernels verbatim, so image
-// correctness is inherited from the already-tested offline renderer.
+// B1 was the display + render loop; B2 adds progressive accumulation: each
+// loop iteration adds a few samples per pixel into a persistent accumulator
+// and presents the running average, so the image refines over time while the
+// app stays responsive. R resets the accumulation (the same reset B3 camera
+// motion will trigger); past RT_TARGET_SAMPLES the viewer stops adding and
+// just presents. Because each pixel's cuRAND state persists across launches,
+// K frames of M spp consume the same RNG stream — and add in the same order —
+// as one K*M-spp render, so the accumulated image is byte-identical to the
+// single-shot one (tests/run_tests.sh stage [7/7] checks exactly this).
+// The camera is still static (camera control is B3).
 //
 // Needs a display (local, VNC, or X-forward) plus SDL2 + GLEW + OpenGL dev libs.
 // Build (match -arch to your GPU; see scripts/build_viewer.sh):
@@ -44,7 +52,13 @@
 #define RT_IMAGE_WIDTH 800
 #endif
 #ifndef RT_SAMPLES
-#define RT_SAMPLES 16
+#define RT_SAMPLES 2        // samples added per frame (the accumulation step)
+#endif
+#ifndef RT_FRAMES
+#define RT_FRAMES 8         // --headless: frames to accumulate (8 x 2 = 16 spp default)
+#endif
+#ifndef RT_TARGET_SAMPLES
+#define RT_TARGET_SAMPLES 8192   // windowed: stop accumulating past this many spp
 #endif
 #ifndef RT_MAX_DEPTH
 #define RT_MAX_DEPTH 12
@@ -70,6 +84,27 @@ __global__ void tonemap_frame(const color* accum, uchar4* out, int w, int h, int
     unsigned char r, g, b;
     tonemap_pixel(accum[idx], samples, r, g, b);
     out[idx] = make_uchar4(r, g, b, 255);
+}
+
+// --- B2 accumulation pass: add `spp` fresh samples per pixel -----------------
+// The same per-sample pattern as camera.h::render_pixel, but WITHOUT the
+// initial clear, so consecutive launches extend the running sum in accum.
+// Each pixel's cuRAND state advances across launches and the += order matches
+// render_pixel's, so K launches of M spp produce an accumulator byte-identical
+// to a single K*M-spp launch.
+__global__ void accumulate_frame(const camera& cam, int max_depth, const hittable& world,
+                                 color* accum, curandState* rand_states, int spp) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= cam.image_width || j >= cam.image_height) return;
+
+    int pixel_index = j * cam.image_width + i;
+    curandState* rand_state = &rand_states[pixel_index];
+
+    for (int sample = 0; sample < spp; ++sample) {
+        ray r = cam.get_ray(i, j, rand_state);
+        accum[pixel_index] += cam.ray_color(r, world, max_depth, rand_state);
+    }
 }
 
 // --- scene: checker ground + the three book spheres (glass / diffuse / metal),
@@ -114,14 +149,22 @@ static hittable* build_scene(std::vector<void*>& allocs, hittable*& bvh_hittable
 
 int main(int argc, char** argv) {
     bool headless = false;
-    for (int i = 1; i < argc; i++)
+    int frames = RT_FRAMES;          // --frames N: headless accumulation count
+    int spp_per_frame = RT_SAMPLES;  // --spp N: samples added per frame
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--headless") == 0) headless = true;
+        else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) frames = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--spp") == 0 && i + 1 < argc) spp_per_frame = atoi(argv[++i]);
+    }
+    if (frames < 1) frames = 1;
+    if (spp_per_frame < 1) spp_per_frame = 1;
 
     // ---- window + GL context (skipped entirely in --headless mode) ----
     SDL_Window* win = nullptr;
     SDL_GLContext gl = nullptr;
     if (headless) {
-        fprintf(stderr, "viewer: headless mode — rendering one frame to build/viewer_headless.ppm\n");
+        fprintf(stderr, "viewer: headless mode — accumulating %d frame(s) x %d spp to build/viewer_headless.ppm\n",
+                frames, spp_per_frame);
     } else {
         if (SDL_Init(SDL_INIT_VIDEO) != 0) {
             fprintf(stderr,
@@ -146,7 +189,7 @@ int main(int argc, char** argv) {
     new(cam) camera();
     cam->aspect_ratio      = 16.0 / 9.0;
     cam->image_width       = RT_IMAGE_WIDTH;
-    cam->samples_per_pixel = RT_SAMPLES;
+    cam->samples_per_pixel = spp_per_frame;   // per accumulation pass (B2)
     cam->max_depth         = RT_MAX_DEPTH;
     cam->seed              = RT_SEED;
     cam->vfov     = 20;
@@ -161,7 +204,7 @@ int main(int argc, char** argv) {
     GLuint tex = 0;
     if (!headless) {
         win = SDL_CreateWindow(
-            "RayTracingCUDA — viewer (B1)",
+            "RayTracingCUDA — viewer (B2)",
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H, SDL_WINDOW_OPENGL);
         if (!win) { fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError()); return 1; }
         gl = SDL_GL_CreateContext(win);
@@ -223,7 +266,7 @@ int main(int argc, char** argv) {
         checkCudaErrors(cudaMallocHost(&h_rgba, frame_bytes));
     }
 
-    // ---- build scene + render the (static) frame once into an accumulator ----
+    // ---- build scene + accumulation buffers ----
     // Raise the device stack limit like the offline scenes do: the recursive
     // hittable dispatch (world BVH → shapes) can exceed the 1 KB default.
     checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
@@ -241,20 +284,28 @@ int main(int argc, char** argv) {
     initialize_rand<<<(W * H + 255) / 256, 256>>>(*cam, rand_states, rng_seed);
     checkCudaErrors(cudaDeviceSynchronize());
 
+    // B2: the accumulator starts at zero; every accumulate_frame launch adds
+    // spp_per_frame samples per pixel on top of it.
+    checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
+    long long total_samples = 0;   // per-pixel samples accumulated so far
+
     dim3 threads(16, 16);
     dim3 blocks((W + threads.x - 1) / threads.x, (H + threads.y - 1) / threads.y);
-    render_pixel<<<blocks, threads>>>(*cam, cam->max_depth, world, accum, rand_states);
-    checkCudaErrors(cudaDeviceSynchronize());
 
-    fprintf(stderr, "viewer: %dx%d, %d spp, depth %d — present: %s\n",
-            W, H, cam->samples_per_pixel, cam->max_depth,
+    fprintf(stderr, "viewer: %dx%d, %d spp/frame (target %d), depth %d — present: %s\n",
+            W, H, spp_per_frame, RT_TARGET_SAMPLES, cam->max_depth,
             headless    ? "headless PPM dump"
-          : use_interop ? "CUDA-GL interop — ESC or close the window to quit"
-                        : "CPU readback — ESC or close the window to quit");
+          : use_interop ? "CUDA-GL interop — ESC or close the window to quit, R to restart accumulation"
+                        : "CPU readback — ESC or close the window to quit, R to restart accumulation");
 
-    // ---- headless: tonemap + read back one frame, write PPM, exit ----
+    // ---- headless: accumulate `frames` passes, tonemap, write PPM, exit ----
     if (headless) {
-        tonemap_frame<<<blocks, threads>>>(accum, d_rgba, W, H, cam->samples_per_pixel);
+        for (int f = 0; f < frames; f++)
+            accumulate_frame<<<blocks, threads>>>(*cam, cam->max_depth, world, accum, rand_states, spp_per_frame);
+        checkCudaErrors(cudaDeviceSynchronize());
+        total_samples = (long long)frames * spp_per_frame;
+
+        tonemap_frame<<<blocks, threads>>>(accum, d_rgba, W, H, (int)total_samples);
         checkCudaErrors(cudaMemcpy(h_rgba, d_rgba, frame_bytes, cudaMemcpyDeviceToHost));
 
         const char* out_path = "build/viewer_headless.ppm";
@@ -278,14 +329,33 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // ---- present loop ----
+    // ---- present loop: accumulate a few spp, then present the running average ----
     bool running = true;
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
+            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_r) {
+                // Restart accumulation from scratch (B3 camera motion will
+                // trigger this same reset). RNG states keep advancing.
+                checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
+                total_samples = 0;
+            }
         }
+
+        // B2: add spp_per_frame fresh samples per pixel until the target is
+        // reached; after that just keep presenting the converged image.
+        if (total_samples < RT_TARGET_SAMPLES) {
+            accumulate_frame<<<blocks, threads>>>(*cam, cam->max_depth, world, accum, rand_states, spp_per_frame);
+            total_samples += spp_per_frame;
+
+            char title[96];
+            snprintf(title, sizeof(title), "RayTracingCUDA — viewer (B2) — %lld spp", total_samples);
+            SDL_SetWindowTitle(win, title);
+        }
+
+        const int denom = total_samples > 0 ? (int)total_samples : 1;  // tonemap divisor
 
         if (use_interop) {
             // Fast path: CUDA writes RGBA8 straight into the mapped PBO,
@@ -294,7 +364,7 @@ int main(int argc, char** argv) {
             size_t nbytes = 0;
             checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo, 0));
             checkCudaErrors(cudaGraphicsResourceGetMappedPointer((void**)&dptr, &nbytes, cuda_pbo));
-            tonemap_frame<<<blocks, threads>>>(accum, dptr, W, H, cam->samples_per_pixel);
+            tonemap_frame<<<blocks, threads>>>(accum, dptr, W, H, denom);
             checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo, 0));
 
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
@@ -305,7 +375,7 @@ int main(int argc, char** argv) {
             // Portable path: tonemap into a device buffer, copy to pinned host
             // memory (the memcpy also synchronizes the kernel), upload from the
             // host pointer. ~1.4 MB/frame at 800x450 — negligible next to VNC.
-            tonemap_frame<<<blocks, threads>>>(accum, d_rgba, W, H, cam->samples_per_pixel);
+            tonemap_frame<<<blocks, threads>>>(accum, d_rgba, W, H, denom);
             checkCudaErrors(cudaMemcpy(h_rgba, d_rgba, frame_bytes, cudaMemcpyDeviceToHost));
 
             glBindTexture(GL_TEXTURE_2D, tex);
