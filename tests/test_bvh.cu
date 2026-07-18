@@ -59,6 +59,7 @@ hittable* wrap_sphere(sphere* s) {
     hittable* h;
     checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
     h->type = SPHERE;
+    h->id = -1;
     h->object = s;
     return h;
 }
@@ -87,6 +88,7 @@ struct test_scene {
         for (auto* w : wrappers) list->add(w);
         checkCudaErrors(cudaMallocManaged((void**)&list_root, sizeof(hittable)));
         list_root->type = HITTABLE_LIST;
+        list_root->id = -1;
         list_root->object = list;
 
         checkCudaErrors(cudaMallocManaged((void**)&bvh, sizeof(bvh_scene)));
@@ -95,6 +97,7 @@ struct test_scene {
         bvh->build();
         checkCudaErrors(cudaMallocManaged((void**)&bvh_root, sizeof(hittable)));
         bvh_root->type = BVH;
+        bvh_root->id = -1;
         bvh_root->object = bvh;
     }
 

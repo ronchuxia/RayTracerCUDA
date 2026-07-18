@@ -12,6 +12,8 @@ struct hit_record {
     material* mat;
     real t;
     real u, v;   // surface coordinates of the hit, set by each primitive's hit()
+    int id = -1; // stable id of the hit SCENE OBJECT (outermost tagged wrapper),
+                 // stamped by hittable::hit(); -1 = no tagged object hit
     bool front_face;
 
     __host__ __device__ void set_face_normal(const ray& r, const vec3& outward_normal) {

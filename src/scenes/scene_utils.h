@@ -84,8 +84,12 @@ inline material* new_isotropic(const texture& albedo, std::vector<void*>& allocs
 
 // --- shapes ----------------------------------------------------------------
 
-inline void add_sphere(hittable_list* world, const point3& center, double radius,
-                       material* mat, std::vector<void*>& allocs) {
+// make_* creators build the shape + wrapper WITHOUT adding it to a world —
+// callers either world->add() it themselves (the add_* helpers below) or
+// register it with a scene (scene.h), which assigns the wrapper's stable id.
+
+inline hittable* make_sphere(const point3& center, double radius,
+                             material* mat, std::vector<void*>& allocs) {
     sphere* s;
     checkCudaErrors(cudaMallocManaged((void**)&s, sizeof(sphere)));
     new(s) sphere(center, radius, mat);
@@ -93,15 +97,21 @@ inline void add_sphere(hittable_list* world, const point3& center, double radius
     hittable* h;
     checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
     h->type = SPHERE;
+    h->id = -1;
     h->object = s;
 
-    world->add(h);
     allocs.push_back(s);
     allocs.push_back(h);
+    return h;
 }
 
-inline void add_quad(hittable_list* world, const point3& Q, const vec3& u, const vec3& v,
-                     material* mat, std::vector<void*>& allocs) {
+inline void add_sphere(hittable_list* world, const point3& center, double radius,
+                       material* mat, std::vector<void*>& allocs) {
+    world->add(make_sphere(center, radius, mat, allocs));
+}
+
+inline hittable* make_quad(const point3& Q, const vec3& u, const vec3& v,
+                           material* mat, std::vector<void*>& allocs) {
     quad* q;
     checkCudaErrors(cudaMallocManaged((void**)&q, sizeof(quad)));
     new(q) quad(Q, u, v, mat);
@@ -109,16 +119,22 @@ inline void add_quad(hittable_list* world, const point3& Q, const vec3& u, const
     hittable* h;
     checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
     h->type = QUAD;
+    h->id = -1;
     h->object = q;
 
-    world->add(h);
     allocs.push_back(q);
     allocs.push_back(h);
+    return h;
 }
 
-inline void add_triangle(hittable_list* world, const point3& v0, const point3& v1,
-                         const point3& v2, const vec3& n, material* mat,
-                         std::vector<void*>& allocs) {
+inline void add_quad(hittable_list* world, const point3& Q, const vec3& u, const vec3& v,
+                     material* mat, std::vector<void*>& allocs) {
+    world->add(make_quad(Q, u, v, mat, allocs));
+}
+
+inline hittable* make_triangle(const point3& v0, const point3& v1,
+                               const point3& v2, const vec3& n, material* mat,
+                               std::vector<void*>& allocs) {
     triangle* t;
     checkCudaErrors(cudaMallocManaged((void**)&t, sizeof(triangle)));
     new(t) triangle(v0, v1, v2, n, mat);
@@ -126,11 +142,18 @@ inline void add_triangle(hittable_list* world, const point3& v0, const point3& v
     hittable* h;
     checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
     h->type = TRIANGLE;
+    h->id = -1;
     h->object = t;
 
-    world->add(h);
     allocs.push_back(t);
     allocs.push_back(h);
+    return h;
+}
+
+inline void add_triangle(hittable_list* world, const point3& v0, const point3& v1,
+                         const point3& v2, const vec3& n, material* mat,
+                         std::vector<void*>& allocs) {
+    world->add(make_triangle(v0, v1, v2, n, mat, allocs));
 }
 
 // --- composites & transforms -------------------------------------------------
@@ -138,11 +161,11 @@ inline void add_triangle(hittable_list* world, const point3& v0, const point3& v
 // Builds the six-quad axis-aligned box spanning opposite vertices a & b as a
 // hittable_list wrapped in a hittable, so it can be wrapped in transforms
 // (new_rotate_y / new_translate) or added to the world as a unit. The inner
-// list is also recorded in `sublists`: its destructor must run at teardown
+// list is also recorded in `list_dtors`: its destructor must run at teardown
 // (it frees the list's internal objects array), before the allocs free loop.
 inline hittable* new_box(const point3& a, const point3& b, material* mat,
                          std::vector<void*>& allocs,
-                         std::vector<hittable_list*>& sublists) {
+                         std::vector<hittable_list*>& list_dtors) {
     hittable_list* sides;
     checkCudaErrors(cudaMallocManaged((void**)&sides, sizeof(hittable_list)));
     new(sides) hittable_list();
@@ -150,11 +173,12 @@ inline hittable* new_box(const point3& a, const point3& b, material* mat,
     hittable* h;
     checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
     h->type = HITTABLE_LIST;
+    h->id = -1;
     h->object = sides;
 
     allocs.push_back(sides);
     allocs.push_back(h);
-    sublists.push_back(sides);
+    list_dtors.push_back(sides);
 
     auto min = point3(fmin(a.x(), b.x()), fmin(a.y(), b.y()), fmin(a.z(), b.z()));
     auto max = point3(fmax(a.x(), b.x()), fmax(a.y(), b.y()), fmax(a.z(), b.z()));
@@ -187,6 +211,7 @@ inline hittable* new_constant_medium(hittable* boundary, double density,
     hittable* h;
     checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
     h->type = CONSTANT_MEDIUM;
+    h->id = -1;
     h->object = m;
 
     allocs.push_back(m);
@@ -207,6 +232,7 @@ inline hittable* new_translate(hittable* child, const vec3& offset,
     hittable* h;
     checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
     h->type = TRANSLATE;
+    h->id = -1;
     h->object = t;
 
     allocs.push_back(t);
@@ -223,6 +249,7 @@ inline hittable* new_rotate_y(hittable* child, double angle_degrees,
     hittable* h;
     checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
     h->type = ROTATE_Y;
+    h->id = -1;
     h->object = rot;
 
     allocs.push_back(rot);
@@ -239,6 +266,7 @@ inline hittable* new_uniform_scale(hittable* child, double scale,
     hittable* h;
     checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
     h->type = UNIFORM_SCALE;
+    h->id = -1;
     h->object = s;
 
     allocs.push_back(s);

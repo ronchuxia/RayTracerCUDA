@@ -58,6 +58,7 @@ __host__ __device__ aabb constant_medium_bounding_box(const constant_medium* m);
 struct hittable {
   HittableType type;
   void* object;
+  int id = -1;   // stable scene-object id; -1 = untagged (containers, sub-parts)
 
   __device__ bool hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const;
 
@@ -65,28 +66,37 @@ struct hittable {
 };
 
 __device__ bool hittable::hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const {
+    bool is_hit;
     switch (type) {
         case HITTABLE_LIST:
-        return hittable_list_hit(static_cast<hittable_list*>(object), r, ray_t, rec, state);
+        is_hit = hittable_list_hit(static_cast<hittable_list*>(object), r, ray_t, rec, state); break;
         case SPHERE:
-        return static_cast<sphere*>(object)->hit(r, ray_t, rec, state);
+        is_hit = static_cast<sphere*>(object)->hit(r, ray_t, rec, state); break;
         case QUAD:
-        return static_cast<quad*>(object)->hit(r, ray_t, rec, state);
+        is_hit = static_cast<quad*>(object)->hit(r, ray_t, rec, state); break;
         case TRIANGLE:
-        return static_cast<triangle*>(object)->hit(r, ray_t, rec, state);
+        is_hit = static_cast<triangle*>(object)->hit(r, ray_t, rec, state); break;
         case TRANSLATE:
-        return translate_hit(static_cast<translate*>(object), r, ray_t, rec, state);
+        is_hit = translate_hit(static_cast<translate*>(object), r, ray_t, rec, state); break;
         case ROTATE_Y:
-        return rotate_y_hit(static_cast<rotate_y*>(object), r, ray_t, rec, state);
+        is_hit = rotate_y_hit(static_cast<rotate_y*>(object), r, ray_t, rec, state); break;
         case UNIFORM_SCALE:
-        return uniform_scale_hit(static_cast<uniform_scale*>(object), r, ray_t, rec, state);
+        is_hit = uniform_scale_hit(static_cast<uniform_scale*>(object), r, ray_t, rec, state); break;
         case CONSTANT_MEDIUM:
-        return constant_medium_hit(static_cast<constant_medium*>(object), r, ray_t, rec, state);
+        is_hit = constant_medium_hit(static_cast<constant_medium*>(object), r, ray_t, rec, state); break;
         case BVH:
-        return bvh_scene_hit(static_cast<bvh_scene*>(object), r, ray_t, rec, state);
+        is_hit = bvh_scene_hit(static_cast<bvh_scene*>(object), r, ray_t, rec, state); break;
         default:
-        return false;
+        is_hit = false;
     }
+    // Stamp the hit with this wrapper's scene-object id. Dispatch nests
+    // outside-in and returns inside-out, so the OUTERMOST tagged wrapper's
+    // stamp lands last: a hit on a box face or mesh triangle reports the id
+    // of the transform-chain wrapper registered with the scene, not the
+    // internal part. Untagged wrappers (id < 0: the world list/BVH,
+    // box-interior quads, mesh triangles) never overwrite.
+    if (is_hit && id >= 0) rec.id = id;
+    return is_hit;
 }
 
 __host__ __device__ aabb hittable::bounding_box() const {

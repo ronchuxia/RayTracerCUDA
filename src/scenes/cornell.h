@@ -28,10 +28,11 @@ inline void cornell_box() {
     hittable* world_hittable;
     checkCudaErrors(cudaMallocManaged((void**)&world_hittable, sizeof(hittable)));
     world_hittable->type = HITTABLE_LIST;
+    world_hittable->id = -1;
     world_hittable->object = world;
 
     std::vector<void*> allocs;
-    std::vector<hittable_list*> sublists;   // inner box lists; dtors run at teardown
+    std::vector<hittable_list*> list_dtors;   // inner box lists; dtors run at teardown
 
     material* red   = new_lambertian(color(.65, .05, .05), allocs);
     material* white = new_lambertian(color(.73, .73, .73), allocs);
@@ -49,7 +50,7 @@ inline void cornell_box() {
 
     // two boxes, placed with instance transforms (reference cornell_box values):
     // built at the origin, then rotated about Y, then translated into place.
-    hittable* box1 = new_box(point3(0,0,0), point3(165,330,165), white, allocs, sublists);
+    hittable* box1 = new_box(point3(0,0,0), point3(165,330,165), white, allocs, list_dtors);
     box1 = new_rotate_y(box1, 15, allocs);
     box1 = new_translate(box1, vec3(265,0,295), allocs);
     world->add(box1);
@@ -57,7 +58,7 @@ inline void cornell_box() {
     // The short box is built double-size and uniform-scaled by 0.5 — the net
     // geometry is identical to the reference's 165^3 box, but the chain
     // exercises all three transforms (scale, then rotate, then translate).
-    hittable* box2 = new_box(point3(0,0,0), point3(330,330,330), white, allocs, sublists);
+    hittable* box2 = new_box(point3(0,0,0), point3(330,330,330), white, allocs, list_dtors);
     box2 = new_uniform_scale(box2, 0.5, allocs);
     box2 = new_rotate_y(box2, -18, allocs);
     box2 = new_translate(box2, vec3(130,0,65), allocs);
@@ -78,6 +79,7 @@ inline void cornell_box() {
     hittable* bvh_hittable;
     checkCudaErrors(cudaMallocManaged((void**)&bvh_hittable, sizeof(hittable)));
     bvh_hittable->type = BVH;
+    bvh_hittable->id = -1;
     bvh_hittable->object = bvh;
 
     // camera
@@ -118,7 +120,7 @@ inline void cornell_box() {
     std::clog << "Render time: " << render_duration.count() << "ms.\n" << std::flush;
 
     // clean up
-    for (hittable_list* l : sublists)
+    for (hittable_list* l : list_dtors)
         l->~hittable_list();   // frees each inner box list's objects array
     for (void* p : allocs)
         cudaFree(p);

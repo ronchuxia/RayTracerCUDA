@@ -42,10 +42,11 @@ inline void badge() {
     hittable* world_hittable;
     checkCudaErrors(cudaMallocManaged((void**)&world_hittable, sizeof(hittable)));
     world_hittable->type = HITTABLE_LIST;
+    world_hittable->id = -1;
     world_hittable->object = world;
 
     std::vector<void*> allocs;
-    std::vector<bvh_scene*> mesh_bvhs;   // mesh BVHs; dtors run at teardown
+    std::vector<bvh_scene*> bvh_dtors;   // mesh BVHs; dtors run at teardown
 
     // ground
     material* ground = new_lambertian(color(0.5, 0.5, 0.5), allocs);
@@ -93,7 +94,7 @@ inline void badge() {
     // school-badge STL mesh: contiguous triangles + dedicated BVH, placed with
     // transforms (fork values: scale 0.033, translate(-3, 0, -5))
     material* badge_mat = new_metal(color(0.7, 0.6, 0.5), 0.5, allocs);
-    hittable* badge_mesh = load_stl(RT_BADGE_STL, badge_mat, allocs, mesh_bvhs);
+    hittable* badge_mesh = load_stl(RT_BADGE_STL, badge_mat, allocs, bvh_dtors);
     badge_mesh = new_uniform_scale(badge_mesh, 0.033, allocs);
     badge_mesh = new_translate(badge_mesh, vec3(-3, 0, -5), allocs);
     world->add(badge_mesh);
@@ -113,6 +114,7 @@ inline void badge() {
     hittable* bvh_hittable;
     checkCudaErrors(cudaMallocManaged((void**)&bvh_hittable, sizeof(hittable)));
     bvh_hittable->type = BVH;
+    bvh_hittable->id = -1;
     bvh_hittable->object = bvh;
 
     // camera (same as the fork's badge scene)
@@ -153,7 +155,7 @@ inline void badge() {
     std::clog << "Render time: " << render_duration.count() << "ms.\n" << std::flush;
 
     // clean up
-    for (bvh_scene* m : mesh_bvhs)
+    for (bvh_scene* m : bvh_dtors)
         m->~bvh_scene();       // frees each mesh BVH's internal buffers
     for (void* p : allocs)
         cudaFree(p);

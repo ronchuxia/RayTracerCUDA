@@ -13,6 +13,12 @@
 // (bvh.h) is the accelerated alternative.
 
 struct hittable_list {
+    // Union of every added child's bbox, grown incrementally in add(). It only
+    // ever GROWS — there is no recompute/refit: if an object later moves (the
+    // scene.h mutation protocol), this union goes stale and hit()'s early-out
+    // below can wrongly cull rays toward the object's new position. Mutated
+    // scenes must therefore render through the BVH (which has refit()), not
+    // the flat list.
     aabb bbox;
     hittable** objects;
     int size;

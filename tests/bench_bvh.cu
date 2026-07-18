@@ -47,6 +47,7 @@ hittable* make_sphere_hittable(point3 c, double r, material* m,
     hittable* h;
     checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
     h->type = SPHERE;
+    h->id = -1;
     h->object = s;
     allocations.push_back(s);
     allocations.push_back(h);
@@ -97,6 +98,7 @@ int main() {
     hittable* flat_root;
     checkCudaErrors(cudaMallocManaged((void**)&flat_root, sizeof(hittable)));
     flat_root->type = HITTABLE_LIST;
+    flat_root->id = -1;
     flat_root->object = world;
 
     // bvh over the same objects
@@ -114,6 +116,7 @@ int main() {
     hittable* bvh_root;
     checkCudaErrors(cudaMallocManaged((void**)&bvh_root, sizeof(hittable)));
     bvh_root->type = BVH;
+    bvh_root->id = -1;
     bvh_root->object = bvh;
 
     // camera

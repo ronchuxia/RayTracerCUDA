@@ -30,6 +30,7 @@ inline void glass() {
     hittable* world_hittable;
     checkCudaErrors(cudaMallocManaged((void**)&world_hittable, sizeof(hittable)));
     world_hittable->type = HITTABLE_LIST;
+    world_hittable->id = -1;
     world_hittable->object = world;
 
     std::vector<void*> allocs;
@@ -73,6 +74,7 @@ inline void glass() {
     hittable* bvh_hittable;
     checkCudaErrors(cudaMallocManaged((void**)&bvh_hittable, sizeof(hittable)));
     bvh_hittable->type = BVH;
+    bvh_hittable->id = -1;
     bvh_hittable->object = bvh;
 
     // camera

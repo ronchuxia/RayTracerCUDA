@@ -89,6 +89,7 @@
 #endif
 
 #include "camera.h"
+#include "scene.h"
 #include "scenes/scene_utils.h"
 
 // --- device tonemap: accumulator (sum of samples) -> RGBA8 -------------------
@@ -126,43 +127,26 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
 }
 
 // --- scene: checker ground + the three book spheres (glass / diffuse / metal),
-// sky-lit. Builds into a persistent world + BVH; records allocations in `allocs`.
-static hittable* build_scene(std::vector<void*>& allocs, hittable*& bvh_hittable_out) {
-    hittable_list* world;
-    checkCudaErrors(cudaMallocManaged((void**)&world, sizeof(hittable_list)));
-    new(world) hittable_list();
+// sky-lit. Built through the scene registry (scene.h): every sphere gets a
+// stable id (registration order), so a future pick ray can identify it via
+// hit_record.id, and the registry's get()/refit() enable live mutation later.
+static void build_viewer_scene(scene& sc) {
+    sc.init();
 
     material* ground = new_lambertian(
-        make_checker(0.32, color(.2, .3, .1), color(.9, .9, .9)), allocs);
-    material* diffuse = new_lambertian(color(0.4, 0.2, 0.1), allocs);
-    material* glass   = new_dielectric(1.5, allocs);
-    material* green   = new_tinted_glass(1.5, color(2.0, 0.2, 2.0), allocs);
-    material* metal_m = new_metal(color(0.7, 0.6, 0.5), 0.0, allocs);
+        make_checker(0.32, color(.2, .3, .1), color(.9, .9, .9)), sc.allocs);
+    material* diffuse = new_lambertian(color(0.4, 0.2, 0.1), sc.allocs);
+    material* glass   = new_dielectric(1.5, sc.allocs);
+    material* green   = new_tinted_glass(1.5, color(2.0, 0.2, 2.0), sc.allocs);
+    material* metal_m = new_metal(color(0.7, 0.6, 0.5), 0.0, sc.allocs);
 
-    add_sphere(world, point3(0, -1000, 0), 1000, ground,  allocs);
-    add_sphere(world, point3(-4, 1, 0),    1.0,  diffuse, allocs);
-    add_sphere(world, point3(-1.4, 1, 2),  1.0,  green,   allocs);
-    add_sphere(world, point3(0, 1, 0),     1.0,  glass,   allocs);
-    add_sphere(world, point3(4, 1, 0),     1.0,  metal_m, allocs);
+    sc.add(make_sphere(point3(0, -1000, 0), 1000, ground,  sc.allocs));  // id 0
+    sc.add(make_sphere(point3(-4, 1, 0),    1.0,  diffuse, sc.allocs));  // id 1
+    sc.add(make_sphere(point3(-1.4, 1, 2),  1.0,  green,   sc.allocs));  // id 2
+    sc.add(make_sphere(point3(0, 1, 0),     1.0,  glass,   sc.allocs));  // id 3
+    sc.add(make_sphere(point3(4, 1, 0),     1.0,  metal_m, sc.allocs));  // id 4
 
-    // BVH over the same objects
-    bvh_scene* bvh;
-    checkCudaErrors(cudaMallocManaged((void**)&bvh, sizeof(bvh_scene)));
-    new(bvh) bvh_scene();
-    for (int i = 0; i < world->size; i++)
-        bvh->add(*world->objects[i]);
-    bvh->build();
-    allocs.push_back(bvh);   // note: bvh_scene dtor not run here — process exits at quit
-
-    hittable* bvh_hittable;
-    checkCudaErrors(cudaMallocManaged((void**)&bvh_hittable, sizeof(hittable)));
-    bvh_hittable->type = BVH;
-    bvh_hittable->object = bvh;
-    allocs.push_back(bvh_hittable);
-    allocs.push_back(world);
-
-    bvh_hittable_out = bvh_hittable;
-    return bvh_hittable;
+    sc.build();
 }
 
 int main(int argc, char** argv) {
@@ -296,9 +280,9 @@ int main(int argc, char** argv) {
     // hittable dispatch (world BVH → shapes) can exceed the 1 KB default.
     checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
 
-    std::vector<void*> allocs;
-    hittable* bvh_hittable;
-    hittable& world = *build_scene(allocs, bvh_hittable);
+    scene sc;
+    build_viewer_scene(sc);
+    hittable& world = sc.root();
 
     curandState* rand_states;
     color* accum;
@@ -351,7 +335,7 @@ int main(int argc, char** argv) {
         cudaFree(accum);
         cudaFree(rand_states);
         cudaFree(cam);
-        for (void* p : allocs) cudaFree(p);
+        sc.release();
         return 0;
     }
 
@@ -617,7 +601,7 @@ int main(int argc, char** argv) {
     cudaFree(accum);
     cudaFree(rand_states);
     cudaFree(cam);
-    for (void* p : allocs) cudaFree(p);
+    sc.release();
     if (pbo) glDeleteBuffers(1, &pbo);
     glDeleteTextures(1, &tex);
     SDL_GL_DeleteContext(gl);

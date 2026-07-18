@@ -26,11 +26,11 @@
 // mesh BVH then becomes one leaf of the world's BVH (nested BVH).
 //
 // Allocations (tris array, bvh_scene, wrapper) are recorded in `allocs` for
-// the scene's free loop; the bvh_scene* is also recorded in `mesh_bvhs` so its
+// the scene's free loop; the bvh_scene* is also recorded in `bvh_dtors` so its
 // destructor runs at teardown (it frees the BVH's internal buffers).
 inline hittable* load_stl(const char* path, material* mat,
                           std::vector<void*>& allocs,
-                          std::vector<bvh_scene*>& mesh_bvhs) {
+                          std::vector<bvh_scene*>& bvh_dtors) {
     FILE* file = fopen(path, "rb");
     if (!file) {
         std::cerr << "load_stl: cannot open '" << path << "'\n";
@@ -55,7 +55,7 @@ inline hittable* load_stl(const char* path, material* mat,
     checkCudaErrors(cudaMallocManaged((void**)&bvh, sizeof(bvh_scene)));
     new(bvh) bvh_scene();
     allocs.push_back(bvh);
-    mesh_bvhs.push_back(bvh);
+    bvh_dtors.push_back(bvh);
 
     for (uint32_t i = 0; i < tri_count; i++) {
         float n[3];
@@ -85,6 +85,7 @@ inline hittable* load_stl(const char* path, material* mat,
 
         hittable h;             // stack temp: bvh->add copies the wrapper by value
         h.type = TRIANGLE;
+        h.id = -1;              // mesh triangles are untagged sub-parts
         h.object = &tris[i];
         bvh->add(h);
     }
@@ -95,6 +96,7 @@ inline hittable* load_stl(const char* path, material* mat,
     hittable* mesh;
     checkCudaErrors(cudaMallocManaged((void**)&mesh, sizeof(hittable)));
     mesh->type = BVH;
+    mesh->id = -1;
     mesh->object = bvh;
     allocs.push_back(mesh);
     return mesh;
