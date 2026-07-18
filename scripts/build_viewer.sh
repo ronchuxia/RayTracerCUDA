@@ -24,6 +24,14 @@ if [ -z "${ARCH:-}" ]; then
 fi
 echo "building viewer with -arch=$ARCH"
 
-nvcc src/viewer/viewer.cu -o build/viewer -std=c++14 -arch="$ARCH" -Isrc \
+# Dear ImGui (vendored in src/external/imgui, pinned v1.92.8) is plain C++ —
+# nvcc hands the .cpp files to the host compiler. Its SDL2 backend does
+# `#include <SDL.h>`, so it needs SDL2's include dir from pkg-config.
+SDL_CFLAGS=$(pkg-config --cflags sdl2)
+IMGUI=src/external/imgui
+nvcc src/viewer/viewer.cu \
+    "$IMGUI"/imgui.cpp "$IMGUI"/imgui_draw.cpp "$IMGUI"/imgui_tables.cpp \
+    "$IMGUI"/imgui_widgets.cpp "$IMGUI"/imgui_impl_sdl2.cpp "$IMGUI"/imgui_impl_opengl2.cpp \
+    -o build/viewer -std=c++14 -arch="$ARCH" -Isrc -I"$IMGUI" $SDL_CFLAGS \
     -lSDL2 -lGLEW -lGL "$@"
 echo "built build/viewer (log: $LOG)"

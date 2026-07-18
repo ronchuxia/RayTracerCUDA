@@ -34,6 +34,13 @@
 // and resets the accumulation (reusing B2's reset), so the view re-converges
 // from the new angle. Headless mode uses the default camera (no input).
 //
+// A Dear ImGui panel (vendored v1.92.8, SDL2 + fixed-function GL2 backends)
+// adds live controls on top: spp/frame and target-spp sliders (pacing only —
+// no reset), max-depth and vfov sliders (change what's rendered — restart
+// accumulation), restart/reset-camera buttons, and fps/spp/path readouts.
+// When the panel has the mouse or keyboard (io.WantCapture*), viewer input
+// (orbit/zoom/pan/hotkeys) is suppressed so the two never fight.
+//
 // Needs a display (local, VNC, or X-forward) plus SDL2 + GLEW + OpenGL dev libs.
 // Build (match -arch to your GPU; see scripts/build_viewer.sh):
 //   nvcc src/viewer/viewer.cu -o build/viewer -std=c++14 -arch=sm_86 -Isrc \
@@ -43,6 +50,13 @@
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
 #include <cuda_gl_interop.h>
+
+// Dear ImGui (vendored in src/external/imgui, pinned v1.92.8): UI panel with
+// live render controls. SDL2 + fixed-function GL2 backends — the GL2 one
+// matches the GL 2.1 compatibility context this viewer creates.
+#include "imgui.h"
+#include "imgui_impl_sdl2.h"
+#include "imgui_impl_opengl2.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -208,7 +222,7 @@ int main(int argc, char** argv) {
     GLuint tex = 0;
     if (!headless) {
         win = SDL_CreateWindow(
-            "RayTracingCUDA — viewer (B3)",
+            "RayTracingCUDA — viewer",
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H, SDL_WINDOW_OPENGL);
         if (!win) { fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError()); return 1; }
         gl = SDL_GL_CreateContext(win);
@@ -223,6 +237,13 @@ int main(int argc, char** argv) {
         // interop can't work and the readback path will be used.
         fprintf(stderr, "viewer: GL vendor: %s | renderer: %s\n",
                 (const char*)glGetString(GL_VENDOR), (const char*)glGetString(GL_RENDERER));
+
+        // ---- Dear ImGui: context + SDL2/GL2 backends ----
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGui::StyleColorsDark();
+        ImGui_ImplSDL2_InitForOpenGL(win, gl);
+        ImGui_ImplOpenGL2_Init();
 
         // ---- GL texture (both present paths upload into this) ----
         glGenTextures(1, &tex);
@@ -291,13 +312,14 @@ int main(int argc, char** argv) {
     // B2: the accumulator starts at zero; every accumulate_frame launch adds
     // spp_per_frame samples per pixel on top of it.
     checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
-    long long total_samples = 0;   // per-pixel samples accumulated so far
+    long long total_samples = 0;                 // per-pixel samples accumulated so far
+    int target_samples = RT_TARGET_SAMPLES;      // runtime-adjustable in the UI panel
 
     dim3 threads(16, 16);
     dim3 blocks((W + threads.x - 1) / threads.x, (H + threads.y - 1) / threads.y);
 
     fprintf(stderr, "viewer: %dx%d, %d spp/frame (target %d), depth %d — present: %s\n",
-            W, H, spp_per_frame, RT_TARGET_SAMPLES, cam->max_depth,
+            W, H, spp_per_frame, target_samples, cam->max_depth,
             headless    ? "headless PPM dump"
           : use_interop ? "CUDA-GL interop — drag orbit, scroll zoom, shift-left-drag pan, R reset, ESC quit"
                         : "CPU readback — drag orbit, scroll zoom, shift-left-drag pan, R reset, ESC quit");
@@ -342,6 +364,31 @@ int main(int argc, char** argv) {
     double elevation = asin(offset.y() / radius);
     const vec3 world_up = cam->vup;
 
+    // Initial view, restored by the UI panel's "Reset camera" button.
+    const point3 target0 = target;
+    const double radius0 = radius, azimuth0 = azimuth, elevation0 = elevation;
+    const double vfov0 = cam->vfov;
+
+    // Launch config, restored by the UI panel's "Reset config" button.
+    const int spp_per_frame0  = spp_per_frame;
+    const int target_samples0 = target_samples;
+    const int max_depth0      = cam->max_depth;
+
+    // Per-stage GPU timings for the UI panel. Kernel launches are async, so
+    // wall-clock timers around them would misattribute the cost to whatever
+    // syncs next; CUDA events timestamp the GPU's own timeline instead.
+    // The values shown are from the previous frame (the panel is built before
+    // this frame's kernels run).
+    cudaEvent_t ev_trace0, ev_trace1, ev_tone0, ev_tone1;
+    checkCudaErrors(cudaEventCreate(&ev_trace0));
+    checkCudaErrors(cudaEventCreate(&ev_trace1));
+    checkCudaErrors(cudaEventCreate(&ev_tone0));
+    checkCudaErrors(cudaEventCreate(&ev_tone1));
+    float ms_trace = 0.0f, ms_tonemap = 0.0f;
+
+    // Which sections of the Renderer panel are visible (toggled in View menu).
+    bool show_performance = true, show_samples = true, show_config = true, show_camera = true;
+
     // Rebuild the camera from the orbit state and reset accumulation. Called
     // whenever the view changes (drag / scroll / pan / R).
     auto rebuild_camera = [&]() {
@@ -360,7 +407,15 @@ int main(int argc, char** argv) {
         bool camera_dirty = false;
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            ImGui_ImplSDL2_ProcessEvent(&e);   // the UI sees every event first
+            ImGuiIO& io = ImGui::GetIO();
             if (e.type == SDL_QUIT) running = false;
+            else if (io.WantCaptureKeyboard && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP)) {
+                // typing in the UI — don't treat as viewer hotkeys
+            }
+            else if (io.WantCaptureMouse && e.type != SDL_KEYDOWN && e.type != SDL_KEYUP) {
+                // hovering/dragging the UI — don't orbit/zoom/pan the camera
+            }
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_r) camera_dirty = true;
             else if (e.type == SDL_MOUSEWHEEL) {
@@ -388,16 +443,106 @@ int main(int argc, char** argv) {
                 camera_dirty = true;
             }
         }
+
+        // ---- UI panel (Dear ImGui). Built every frame; widgets that change
+        // what is being rendered set camera_dirty so accumulation restarts —
+        // mixing samples taken under different settings would be wrong.
+        // spp/frame and the target only change pacing, so they don't reset.
+        ImGui_ImplOpenGL2_NewFrame();
+        ImGui_ImplSDL2_NewFrame();
+        ImGui::NewFrame();
+
+        // Top menu bar: File (quit) and View (toggle panel sections).
+        if (ImGui::BeginMainMenuBar()) {
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Quit", "Esc")) running = false;
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("View")) {
+                ImGui::MenuItem("Performance", nullptr, &show_performance);
+                ImGui::MenuItem("Samples", nullptr, &show_samples);
+                ImGui::MenuItem("Config",  nullptr, &show_config);
+                ImGui::MenuItem("Camera",  nullptr, &show_camera);
+                ImGui::EndMenu();
+            }
+            ImGui::EndMainMenuBar();
+        }
+
+        ImGui::SetNextWindowPos(ImVec2(10, 30), ImGuiCond_FirstUseEver);  // below the menu bar
+        ImGui::Begin("Renderer");
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            // Emit a separator between consecutive *visible* sections only.
+            bool any_section = false;
+            auto section_break = [&]() { if (any_section) ImGui::Separator(); any_section = true; };
+
+            if (show_performance) {
+                section_break();
+                ImGui::Text("%.0f fps", io.Framerate);
+                // Per-stage breakdown of the last frame: trace/tonemap from CUDA
+                // events; present = the rest of the frame (GL upload, quad, UI,
+                // swap, event polling), derived from the frame delta.
+                ImGui::Text("trace   %6.2f ms", ms_trace);
+                ImGui::Text("tonemap %6.2f ms", ms_tonemap);
+                ImGui::Text("present %6.2f ms",
+                            fmaxf(0.0f, io.DeltaTime * 1000.0f - ms_trace - ms_tonemap));
+            }
+
+            if (show_samples) {
+                section_break();
+                ImGui::Text("%lld spp", total_samples);
+            }
+
+            if (show_config) {
+                section_break();
+                ImGui::SliderInt("spp", &spp_per_frame, 1, 64);
+                ImGui::SliderInt("target spp", &target_samples, 16, 65536, "%d",
+                                 ImGuiSliderFlags_Logarithmic);
+                if (ImGui::SliderInt("max depth", &cam->max_depth, 1, 50)) camera_dirty = true;
+                float vfov_f = (float)cam->vfov;
+                if (ImGui::SliderFloat("vfov", &vfov_f, 5.0f, 90.0f, "%.0f deg")) {
+                    cam->vfov = vfov_f;
+                    camera_dirty = true;
+                }
+                if (ImGui::Button("Reset config")) {
+                    spp_per_frame  = spp_per_frame0;
+                    target_samples = target_samples0;
+                    // max depth / vfov change what's rendered — restart only if they moved
+                    if (cam->max_depth != max_depth0 || cam->vfov != vfov0) camera_dirty = true;
+                    cam->max_depth = max_depth0;
+                    cam->vfov      = vfov0;
+                }
+            }
+
+            if (show_camera) {
+                section_break();
+                ImGui::Text("cam    (%.2f, %.2f, %.2f)", cam->lookfrom.x(), cam->lookfrom.y(), cam->lookfrom.z());
+                ImGui::Text("target (%.2f, %.2f, %.2f)", target.x(), target.y(), target.z());
+                ImGui::Text("r      %.2f", radius);
+                if (ImGui::Button("Reset camera")) {
+                    target = target0; radius = radius0;
+                    azimuth = azimuth0; elevation = elevation0;
+                    cam->vfov = vfov0;
+                    camera_dirty = true;
+                }
+            }
+        }
+        ImGui::End();
+
         if (camera_dirty) rebuild_camera();   // recompute view + reset accumulation
 
         // B2: add spp_per_frame fresh samples per pixel until the target is
         // reached; after that just keep presenting the converged image.
-        if (total_samples < RT_TARGET_SAMPLES) {
+        bool did_accumulate = false;
+        if (total_samples < target_samples) {
+            checkCudaErrors(cudaEventRecord(ev_trace0));
             accumulate_frame<<<blocks, threads>>>(*cam, cam->max_depth, world, accum, rand_states, spp_per_frame);
+            checkCudaErrors(cudaEventRecord(ev_trace1));
+            did_accumulate = true;
             total_samples += spp_per_frame;
 
             char title[96];
-            snprintf(title, sizeof(title), "RayTracingCUDA — viewer (B3) — %lld spp", total_samples);
+            snprintf(title, sizeof(title), "RayTracingCUDA — viewer");
             SDL_SetWindowTitle(win, title);
         }
 
@@ -410,8 +555,10 @@ int main(int argc, char** argv) {
             size_t nbytes = 0;
             checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo, 0));
             checkCudaErrors(cudaGraphicsResourceGetMappedPointer((void**)&dptr, &nbytes, cuda_pbo));
+            checkCudaErrors(cudaEventRecord(ev_tone0));
             tonemap_frame<<<blocks, threads>>>(accum, dptr, W, H, denom);
-            checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo, 0));
+            checkCudaErrors(cudaEventRecord(ev_tone1));
+            checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo, 0));   // syncs the stream
 
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
             glBindTexture(GL_TEXTURE_2D, tex);
@@ -421,12 +568,21 @@ int main(int argc, char** argv) {
             // Portable path: tonemap into a device buffer, copy to pinned host
             // memory (the memcpy also synchronizes the kernel), upload from the
             // host pointer. ~1.4 MB/frame at 800x450 — negligible next to VNC.
+            checkCudaErrors(cudaEventRecord(ev_tone0));
             tonemap_frame<<<blocks, threads>>>(accum, d_rgba, W, H, denom);
             checkCudaErrors(cudaMemcpy(h_rgba, d_rgba, frame_bytes, cudaMemcpyDeviceToHost));
+            checkCudaErrors(cudaEventRecord(ev_tone1));   // after the copy: tonemap+copy together
 
             glBindTexture(GL_TEXTURE_2D, tex);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, h_rgba);
         }
+
+        // Both paths have synchronized (unmap / blocking memcpy), so the events
+        // are complete and these queries don't stall. Shown next frame.
+        if (did_accumulate) checkCudaErrors(cudaEventElapsedTime(&ms_trace, ev_trace0, ev_trace1));
+        else                ms_trace = 0.0f;
+        checkCudaErrors(cudaEventSynchronize(ev_tone1));
+        checkCudaErrors(cudaEventElapsedTime(&ms_tonemap, ev_tone0, ev_tone1));
 
         // draw a fullscreen textured quad (v flipped so image row 0 is on top)
         glClear(GL_COLOR_BUFFER_BIT);
@@ -440,10 +596,21 @@ int main(int argc, char** argv) {
         glEnd();
         glDisable(GL_TEXTURE_2D);
 
+        // UI on top of the rendered frame
+        ImGui::Render();
+        ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
+
         SDL_GL_SwapWindow(win);
     }
 
     // ---- cleanup ----
+    cudaEventDestroy(ev_trace0);
+    cudaEventDestroy(ev_trace1);
+    cudaEventDestroy(ev_tone0);
+    cudaEventDestroy(ev_tone1);
+    ImGui_ImplOpenGL2_Shutdown();
+    ImGui_ImplSDL2_Shutdown();
+    ImGui::DestroyContext();
     if (use_interop) cudaGraphicsUnregisterResource(cuda_pbo);
     if (d_rgba) cudaFree(d_rgba);
     if (h_rgba) cudaFreeHost(h_rgba);
