@@ -16,7 +16,7 @@
 #include <vector>
 
 #include "camera.h"
-#include "hittable.h"   // also pulls in hittables/bvh.h
+#include "hittable.h"   // also pulls in hittables/tree.h
 #include "hittables/sphere.h"
 #include "material.h"
 #include "cuda_helper.h"
@@ -101,15 +101,15 @@ int main() {
     flat_root->id = -1;
     flat_root->object = world;
 
-    // bvh over the same objects
-    bvh_scene* bvh;
-    checkCudaErrors(cudaMallocManaged((void**)&bvh, sizeof(bvh_scene)));
-    new(bvh) bvh_scene();
+    // tree over the same objects
+    bvh* tree;
+    checkCudaErrors(cudaMallocManaged((void**)&tree, sizeof(bvh)));
+    new(tree) bvh();
     for (int i = 0; i < world->size; i++)
-        bvh->add(*world->objects[i]);
+        tree->add(*world->objects[i]);
 
     auto build_t0 = std::chrono::steady_clock::now();
-    bvh->build();
+    tree->build();
     auto build_t1 = std::chrono::steady_clock::now();
     long build_us = (long)std::chrono::duration_cast<std::chrono::microseconds>(build_t1 - build_t0).count();
 
@@ -117,7 +117,7 @@ int main() {
     checkCudaErrors(cudaMallocManaged((void**)&bvh_root, sizeof(hittable)));
     bvh_root->type = BVH;
     bvh_root->id = -1;
-    bvh_root->object = bvh;
+    bvh_root->object = tree;
 
     // camera
     camera* cam;
@@ -139,7 +139,7 @@ int main() {
     std::fprintf(stderr, "bench: %d objects, %dx%d, %d spp, BVH nodes %d, build %ld us\n",
                  n_objects, cam->image_width,
                  (int)(cam->image_width / cam->aspect_ratio), BENCH_SPP,
-                 bvh->node_count, build_us);
+                 tree->node_count, build_us);
 
     // warm-up (context/clock ramp), then timed renders
     cam->samples_per_pixel = 1;
@@ -150,12 +150,12 @@ int main() {
     long bvh_ms  = render_ms(cam, *bvh_root);
 
     std::fprintf(stderr, "flat list: %ld ms\n", flat_ms);
-    std::fprintf(stderr, "bvh:       %ld ms\n", bvh_ms);
+    std::fprintf(stderr, "tree:       %ld ms\n", bvh_ms);
     std::fprintf(stderr, "speedup:   %.2fx\n", bvh_ms > 0 ? (double)flat_ms / bvh_ms : 0.0);
 
     // clean up
-    bvh->~bvh_scene();
-    cudaFree(bvh);
+    tree->~bvh();
+    cudaFree(tree);
     cudaFree(bvh_root);
     world->~hittable_list();
     cudaFree(world);

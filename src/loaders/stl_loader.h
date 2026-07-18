@@ -20,17 +20,17 @@
 // The triangles are constructed into ONE contiguous cudaMallocManaged array
 // (not one allocation per triangle): a 10k+-triangle mesh in scattered
 // per-object allocations would pointer-chase into cache-cold pages on every
-// leaf intersection — see roadmap workstream E1. A dedicated bvh_scene is
+// leaf intersection — see roadmap workstream E1. A dedicated bvh is
 // built over the array and returned wrapped as a hittable{BVH}, so the caller
 // can transform-wrap it (scale/rotate/translate) and add it to the world; the
 // mesh BVH then becomes one leaf of the world's BVH (nested BVH).
 //
-// Allocations (tris array, bvh_scene, wrapper) are recorded in `allocs` for
-// the scene's free loop; the bvh_scene* is also recorded in `bvh_dtors` so its
+// Allocations (tris array, bvh, wrapper) are recorded in `allocs` for
+// the scene's free loop; the bvh* is also recorded in `bvh_dtors` so its
 // destructor runs at teardown (it frees the BVH's internal buffers).
 inline hittable* load_stl(const char* path, material* mat,
                           std::vector<void*>& allocs,
-                          std::vector<bvh_scene*>& bvh_dtors) {
+                          std::vector<bvh*>& bvh_dtors) {
     FILE* file = fopen(path, "rb");
     if (!file) {
         std::cerr << "load_stl: cannot open '" << path << "'\n";
@@ -51,11 +51,11 @@ inline hittable* load_stl(const char* path, material* mat,
     allocs.push_back(tris);
 
     // Dedicated BVH over the mesh's triangles.
-    bvh_scene* bvh;
-    checkCudaErrors(cudaMallocManaged((void**)&bvh, sizeof(bvh_scene)));
-    new(bvh) bvh_scene();
-    allocs.push_back(bvh);
-    bvh_dtors.push_back(bvh);
+    bvh* mesh_bvh;
+    checkCudaErrors(cudaMallocManaged((void**)&mesh_bvh, sizeof(bvh)));
+    new(mesh_bvh) bvh();
+    allocs.push_back(mesh_bvh);
+    bvh_dtors.push_back(mesh_bvh);
 
     for (uint32_t i = 0; i < tri_count; i++) {
         float n[3];
@@ -83,23 +83,23 @@ inline hittable* load_stl(const char* path, material* mat,
 
         new(&tris[i]) triangle(v0, v1, v2, normal, mat);
 
-        hittable h;             // stack temp: bvh->add copies the wrapper by value
+        hittable h;             // stack temp: mesh_bvh->add copies the wrapper by value
         h.type = TRIANGLE;
         h.id = -1;              // mesh triangles are untagged sub-parts
         h.object = &tris[i];
-        bvh->add(h);
+        mesh_bvh->add(h);
     }
     fclose(file);
 
-    bvh->build();
+    mesh_bvh->build();
 
-    hittable* mesh;
-    checkCudaErrors(cudaMallocManaged((void**)&mesh, sizeof(hittable)));
-    mesh->type = BVH;
-    mesh->id = -1;
-    mesh->object = bvh;
-    allocs.push_back(mesh);
-    return mesh;
+    hittable* mesh_bvh_hittable;
+    checkCudaErrors(cudaMallocManaged((void**)&mesh_bvh_hittable, sizeof(hittable)));
+    mesh_bvh_hittable->type = BVH;
+    mesh_bvh_hittable->id = -1;
+    mesh_bvh_hittable->object = mesh_bvh;
+    allocs.push_back(mesh_bvh_hittable);
+    return mesh_bvh_hittable;
 }
 
 #endif // STL_LOADER_H

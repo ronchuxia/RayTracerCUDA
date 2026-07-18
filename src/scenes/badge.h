@@ -46,7 +46,7 @@ inline void badge() {
     world_hittable->object = world;
 
     std::vector<void*> allocs;
-    std::vector<bvh_scene*> bvh_dtors;   // mesh BVHs; dtors run at teardown
+    std::vector<bvh*> bvh_dtors;   // mesh BVHs; dtors run at teardown
 
     // ground
     material* ground = new_lambertian(color(0.5, 0.5, 0.5), allocs);
@@ -103,19 +103,19 @@ inline void badge() {
     material* light = new_diffuse_light(color(10, 10, 10), allocs);
     add_sphere(world, point3(0, 30, -30), 10.0, light, allocs);
 
-    // bvh over the same objects
-    bvh_scene* bvh;
-    checkCudaErrors(cudaMallocManaged((void**)&bvh, sizeof(bvh_scene)));
-    new(bvh) bvh_scene();
+    // world_bvh over the same objects
+    bvh* world_bvh;
+    checkCudaErrors(cudaMallocManaged((void**)&world_bvh, sizeof(bvh)));
+    new(world_bvh) bvh();
     for (int i = 0; i < world->size; i++)
-        bvh->add(*world->objects[i]);
-    bvh->build();
+        world_bvh->add(*world->objects[i]);
+    world_bvh->build();
 
-    hittable* bvh_hittable;
-    checkCudaErrors(cudaMallocManaged((void**)&bvh_hittable, sizeof(hittable)));
-    bvh_hittable->type = BVH;
-    bvh_hittable->id = -1;
-    bvh_hittable->object = bvh;
+    hittable* world_bvh_hittable;
+    checkCudaErrors(cudaMallocManaged((void**)&world_bvh_hittable, sizeof(hittable)));
+    world_bvh_hittable->type = BVH;
+    world_bvh_hittable->id = -1;
+    world_bvh_hittable->object = world_bvh;
 
     // camera (same as the fork's badge scene)
     camera* cam;
@@ -142,7 +142,7 @@ inline void badge() {
 
     auto render_start = std::chrono::system_clock::now();
 #if USE_BVH
-    cam->render(*bvh_hittable);
+    cam->render(*world_bvh_hittable);
 #else
     cam->render(*world_hittable);
 #endif
@@ -155,13 +155,13 @@ inline void badge() {
     std::clog << "Render time: " << render_duration.count() << "ms.\n" << std::flush;
 
     // clean up
-    for (bvh_scene* m : bvh_dtors)
-        m->~bvh_scene();       // frees each mesh BVH's internal buffers
+    for (bvh* m : bvh_dtors)
+        m->~bvh();       // frees each mesh BVH's internal buffers
     for (void* p : allocs)
         cudaFree(p);
-    bvh->~bvh_scene();         // frees its nodes/prim_index/prims buffers
-    cudaFree(bvh);
-    cudaFree(bvh_hittable);
+    world_bvh->~bvh();         // frees its nodes/prim_index/prims buffers
+    cudaFree(world_bvh);
+    cudaFree(world_bvh_hittable);
     world->~hittable_list();   // frees its objects array
     cudaFree(world);
     cudaFree(world_hittable);

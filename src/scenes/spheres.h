@@ -48,19 +48,19 @@ inline void spheres() {
     add_sphere(world, point3(-2.5, 1, 1),  1.0,  earth,  allocs);
     add_sphere(world, point3(0, 30, -30),  10.0, light,  allocs);
 
-    // bvh over the same objects
-    bvh_scene* bvh;
-    checkCudaErrors(cudaMallocManaged((void**)&bvh, sizeof(bvh_scene)));
-    new(bvh) bvh_scene();
+    // world_bvh over the same objects
+    bvh* world_bvh;
+    checkCudaErrors(cudaMallocManaged((void**)&world_bvh, sizeof(bvh)));
+    new(world_bvh) bvh();
     for (int i = 0; i < world->size; i++)
-        bvh->add(*world->objects[i]);
-    bvh->build();
+        world_bvh->add(*world->objects[i]);
+    world_bvh->build();
 
-    hittable* bvh_hittable;
-    checkCudaErrors(cudaMallocManaged((void**)&bvh_hittable, sizeof(hittable)));
-    bvh_hittable->type = BVH;
-    bvh_hittable->id = -1;
-    bvh_hittable->object = bvh;
+    hittable* world_bvh_hittable;
+    checkCudaErrors(cudaMallocManaged((void**)&world_bvh_hittable, sizeof(hittable)));
+    world_bvh_hittable->type = BVH;
+    world_bvh_hittable->id = -1;
+    world_bvh_hittable->object = world_bvh;
 
     // camera
     camera* cam;
@@ -87,7 +87,7 @@ inline void spheres() {
 
     auto render_start = std::chrono::system_clock::now();
 #if USE_BVH
-    cam->render(*bvh_hittable);
+    cam->render(*world_bvh_hittable);
 #else
     cam->render(*world_hittable);
 #endif
@@ -102,9 +102,9 @@ inline void spheres() {
     // clean up
     for (void* p : allocs)
         cudaFree(p);
-    bvh->~bvh_scene();         // frees its nodes/prim_index/prims buffers
-    cudaFree(bvh);
-    cudaFree(bvh_hittable);
+    world_bvh->~bvh();         // frees its nodes/prim_index/prims buffers
+    cudaFree(world_bvh);
+    cudaFree(world_bvh_hittable);
     world->~hittable_list();   // frees its objects array
     cudaFree(world);
     cudaFree(world_hittable);

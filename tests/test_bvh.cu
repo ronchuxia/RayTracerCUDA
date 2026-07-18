@@ -1,7 +1,7 @@
-// Unit tests for the flattened BVH (bvh.h).
+// Unit tests for the flattened BVH (tree.h).
 //
 // Strategy: build the SAME set of spheres into a flat hittable_list and a
-// bvh_scene, shoot a deterministic batch of rays through both via the
+// bvh, shoot a deterministic batch of rays through both via the
 // hittable::hit dispatch on the device, and require exactly equal results.
 // Both paths run the identical sphere::hit arithmetic on identical inputs and
 // the closest hit is unique, so t / p / normal must match bit-for-bit —
@@ -22,7 +22,7 @@
 #include <vector>
 #include <algorithm>
 
-#include "hittable.h"   // also pulls in hittables/bvh.h
+#include "hittable.h"   // also pulls in hittables/tree.h
 #include "hittables/sphere.h"
 #include "material.h"
 #include "cuda_helper.h"
@@ -72,7 +72,7 @@ struct test_scene {
 
     hittable_list* list;
     hittable* list_root;
-    bvh_scene* bvh;
+    bvh* tree;
     hittable* bvh_root;
 
     void add_sphere(point3 c, double r, material* m) {
@@ -91,14 +91,14 @@ struct test_scene {
         list_root->id = -1;
         list_root->object = list;
 
-        checkCudaErrors(cudaMallocManaged((void**)&bvh, sizeof(bvh_scene)));
-        new(bvh) bvh_scene();
-        for (auto* w : wrappers) bvh->add(*w);
-        bvh->build();
+        checkCudaErrors(cudaMallocManaged((void**)&tree, sizeof(bvh)));
+        new(tree) bvh();
+        for (auto* w : wrappers) tree->add(*w);
+        tree->build();
         checkCudaErrors(cudaMallocManaged((void**)&bvh_root, sizeof(hittable)));
         bvh_root->type = BVH;
         bvh_root->id = -1;
-        bvh_root->object = bvh;
+        bvh_root->object = tree;
     }
 
     // Rebuild ONLY the flat list (fresh bbox union) — used as ground truth
@@ -113,8 +113,8 @@ struct test_scene {
         list->~hittable_list();
         cudaFree(list);
         cudaFree(list_root);
-        bvh->~bvh_scene();
-        cudaFree(bvh);
+        tree->~bvh();
+        cudaFree(tree);
         cudaFree(bvh_root);
         for (auto* w : wrappers)  cudaFree(w);
         for (auto* s : spheres)   cudaFree(s);
@@ -212,7 +212,7 @@ int compare_hits(const test_scene& sc, const std::vector<ray>& rays, bool compar
                 && (!compare_mat || a.mat == b.mat);
         }
         if (!same && mismatches < 5)
-            std::printf("    mismatch ray %d: flat(hit=%d t=%.17g) bvh(hit=%d t=%.17g)\n",
+            std::printf("    mismatch ray %d: flat(hit=%d t=%.17g) tree(hit=%d t=%.17g)\n",
                         i, a.hit, a.t, b.hit, b.t);
         if (!same) mismatches++;
         if (a.hit) hits++;
@@ -227,7 +227,7 @@ int compare_hits(const test_scene& sc, const std::vector<ray>& rays, bool compar
 
 // ---------------------------------------------------- structural invariants --
 
-void check_invariants(const bvh_scene* b) {
+void check_invariants(const bvh* b) {
     int N = b->prim_count;
     if (N == 0) {
         CHECK(b->node_count == 0, "empty BVH should have 0 nodes, has %d", b->node_count);
@@ -279,7 +279,7 @@ void check_invariants(const bvh_scene* b) {
 void test_empty() {
     std::printf("  test_empty (N=0)\n");
     test_scene sc = make_random_scene(0, 1);
-    check_invariants(sc.bvh);
+    check_invariants(sc.tree);
     std::vector<ray> rays = make_rays(sc, 1000, 2);
     int hits = compare_hits(sc, rays);
     CHECK(hits == 0, "empty scene reported %d hits", hits);
@@ -289,9 +289,9 @@ void test_empty() {
 void test_single() {
     std::printf("  test_single (N=1)\n");
     test_scene sc = make_random_scene(1, 3);
-    check_invariants(sc.bvh);
-    CHECK(sc.bvh->node_count == 1, "single-prim BVH should be one leaf, has %d nodes", sc.bvh->node_count);
-    CHECK(sc.bvh->nodes[0].prim_count == 1, "root should be a leaf with 1 prim");
+    check_invariants(sc.tree);
+    CHECK(sc.tree->node_count == 1, "single-prim BVH should be one leaf, has %d nodes", sc.tree->node_count);
+    CHECK(sc.tree->nodes[0].prim_count == 1, "root should be a leaf with 1 prim");
     std::vector<ray> rays = make_rays(sc, 10000, 4);
     int hits = compare_hits(sc, rays);
     CHECK(hits > 0, "no rays hit the single sphere — weak test");
@@ -303,7 +303,7 @@ void test_small_counts() {
     for (int n : sizes) {
         std::printf("  test_small (N=%d)\n", n);
         test_scene sc = make_random_scene(n, 100 + n);
-        check_invariants(sc.bvh);
+        check_invariants(sc.tree);
         std::vector<ray> rays = make_rays(sc, 20000, 200 + n);
         int hits = compare_hits(sc, rays);
         CHECK(hits > 0, "no hits at N=%d — weak test", n);
@@ -314,7 +314,7 @@ void test_small_counts() {
 void test_large() {
     std::printf("  test_large (N=500, 100k rays)\n");
     test_scene sc = make_random_scene(500, 7, 40.0);
-    check_invariants(sc.bvh);
+    check_invariants(sc.tree);
     std::vector<ray> rays = make_rays(sc, 100000, 8, 40.0);
     int hits = compare_hits(sc, rays);
     CHECK(hits > 10000, "only %d/100000 rays hit — weak test", hits);
@@ -335,7 +335,7 @@ void test_duplicates() {
     for (int i = 0; i < 4; i++)
         sc.add_sphere(point3(5.0 * i, -3, 0), 0.8, sc.materials[0]);
     sc.build_structures();
-    check_invariants(sc.bvh);
+    check_invariants(sc.tree);
     std::vector<ray> rays = make_rays(sc, 20000, 9);
     compare_hits(sc, rays);
     sc.destroy();
@@ -353,9 +353,9 @@ void test_refit_after_motion() {
         new(s) sphere(c, s->radius, s->mat);  // recomputes the sphere's own bbox
     }
 
-    sc.bvh->refit();       // topology unchanged, boxes refreshed
+    sc.tree->refit();       // topology unchanged, boxes refreshed
     sc.rebuild_list();     // fresh flat list = ground truth (old bbox was stale)
-    check_invariants(sc.bvh);
+    check_invariants(sc.tree);
 
     std::vector<ray> rays = make_rays(sc, 50000, 12, 30.0);
     int hits = compare_hits(sc, rays);
@@ -375,9 +375,9 @@ void test_rebuild_after_motion() {
         new(s) sphere(c, s->radius, s->mat);
     }
 
-    sc.bvh->build();       // full rebuild reusing the same buffers
+    sc.tree->build();       // full rebuild reusing the same buffers
     sc.rebuild_list();
-    check_invariants(sc.bvh);
+    check_invariants(sc.tree);
 
     std::vector<ray> rays = make_rays(sc, 50000, 15, 30.0);
     compare_hits(sc, rays);
@@ -393,11 +393,11 @@ void test_incremental_add() {
     std::uniform_real_distribution<double> pos(-20.0, 20.0);
     for (int i = 0; i < 30; i++) {
         sc.add_sphere(point3(pos(rng), pos(rng), pos(rng)), 0.7, sc.materials[0]);
-        sc.bvh->add(*sc.wrappers.back());
+        sc.tree->add(*sc.wrappers.back());
         sc.list->add(sc.wrappers.back());
     }
-    sc.bvh->build();
-    check_invariants(sc.bvh);
+    sc.tree->build();
+    check_invariants(sc.tree);
     std::vector<ray> rays = make_rays(sc, 20000, 18);
     compare_hits(sc, rays);
     sc.destroy();

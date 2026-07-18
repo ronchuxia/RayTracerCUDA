@@ -14,7 +14,7 @@
 // Instance transforms: hittables that wrap a child hittable* and reposition it
 // without moving the geometry — hit() transforms the ray into the child's
 // object space, delegates, and transforms the hit point/normal back out.
-// Composite shapes like hittable_list/bvh_scene: hittable.h forward-declares
+// Composite shapes like hittable_list/bvh: hittable.h forward-declares
 // their dispatch shims and includes this header at the bottom. Transforms
 // compose (e.g. translate(rotate_y(box))); each level delegates through
 // hittable::hit, a device-recursive chain bounded by the construction depth.

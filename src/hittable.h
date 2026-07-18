@@ -25,7 +25,7 @@ enum HittableType {
   BVH
 };
 
-// The composite types — hittable_list, bvh_scene, and the instance transforms
+// The composite types — hittable_list, bvh, and the instance transforms
 // (translate / rotate_y / uniform_scale) — live in hittables/hittable_list.h /
 // bvh.h / transforms.h, included at the bottom of this file after hittable is
 // fully defined: they all reference hittable, so they can't be included up top
@@ -35,9 +35,9 @@ struct hittable_list;
 __device__ bool hittable_list_hit(const hittable_list* list, const ray& r, interval ray_t, hit_record& rec, curandState* state);
 __host__ __device__ aabb hittable_list_bounding_box(const hittable_list* list);
 
-struct bvh_scene;
-__device__ bool bvh_scene_hit(const bvh_scene* bvh, const ray& r, interval ray_t, hit_record& rec, curandState* state);
-__host__ __device__ aabb bvh_scene_bounding_box(const bvh_scene* bvh);
+struct bvh;
+__device__ bool bvh_hit(const bvh* b, const ray& r, interval ray_t, hit_record& rec, curandState* state);
+__host__ __device__ aabb bvh_bounding_box(const bvh* b);
 
 struct translate;
 __device__ bool translate_hit(const translate* t, const ray& r, interval ray_t, hit_record& rec, curandState* state);
@@ -85,7 +85,7 @@ __device__ bool hittable::hit(const ray& r, interval ray_t, hit_record& rec, cur
         case CONSTANT_MEDIUM:
         is_hit = constant_medium_hit(static_cast<constant_medium*>(object), r, ray_t, rec, state); break;
         case BVH:
-        is_hit = bvh_scene_hit(static_cast<bvh_scene*>(object), r, ray_t, rec, state); break;
+        is_hit = bvh_hit(static_cast<bvh*>(object), r, ray_t, rec, state); break;
         default:
         is_hit = false;
     }
@@ -118,13 +118,13 @@ __host__ __device__ aabb hittable::bounding_box() const {
         case CONSTANT_MEDIUM:
         return constant_medium_bounding_box(static_cast<constant_medium*>(object));
         case BVH:
-        return bvh_scene_bounding_box(static_cast<bvh_scene*>(object));
+        return bvh_bounding_box(static_cast<bvh*>(object));
         default:
         return aabb();
     }
 }
 
-// Define hittable_list / bvh_scene / the transforms and the shims declared
+// Define hittable_list / bvh / the transforms and the shims declared
 // above. Included last so that including hittable.h alone is enough to compile
 // the switch cases (the include guards make any include order — hittable.h
 // first or any concrete header first — resolve correctly).

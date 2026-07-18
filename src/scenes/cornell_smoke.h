@@ -60,19 +60,19 @@ inline void cornell_smoke() {
     box2 = new_translate(box2, vec3(130,0,65), allocs);
     world->add(new_constant_medium(box2, 0.01, make_solid_color(color(1,1,1)), allocs));
 
-    // bvh over the same objects
-    bvh_scene* bvh;
-    checkCudaErrors(cudaMallocManaged((void**)&bvh, sizeof(bvh_scene)));
-    new(bvh) bvh_scene();
+    // world_bvh over the same objects
+    bvh* world_bvh;
+    checkCudaErrors(cudaMallocManaged((void**)&world_bvh, sizeof(bvh)));
+    new(world_bvh) bvh();
     for (int i = 0; i < world->size; i++)
-        bvh->add(*world->objects[i]);
-    bvh->build();
+        world_bvh->add(*world->objects[i]);
+    world_bvh->build();
 
-    hittable* bvh_hittable;
-    checkCudaErrors(cudaMallocManaged((void**)&bvh_hittable, sizeof(hittable)));
-    bvh_hittable->type = BVH;
-    bvh_hittable->id = -1;
-    bvh_hittable->object = bvh;
+    hittable* world_bvh_hittable;
+    checkCudaErrors(cudaMallocManaged((void**)&world_bvh_hittable, sizeof(hittable)));
+    world_bvh_hittable->type = BVH;
+    world_bvh_hittable->id = -1;
+    world_bvh_hittable->object = world_bvh;
 
     // camera (same as the reference cornell_smoke)
     camera* cam;
@@ -99,7 +99,7 @@ inline void cornell_smoke() {
 
     auto render_start = std::chrono::system_clock::now();
 #if USE_BVH
-    cam->render(*bvh_hittable);
+    cam->render(*world_bvh_hittable);
 #else
     cam->render(*world_hittable);
 #endif
@@ -116,9 +116,9 @@ inline void cornell_smoke() {
         l->~hittable_list();   // frees each inner box list's objects array
     for (void* p : allocs)
         cudaFree(p);
-    bvh->~bvh_scene();         // frees its nodes/prim_index/prims buffers
-    cudaFree(bvh);
-    cudaFree(bvh_hittable);
+    world_bvh->~bvh();         // frees its nodes/prim_index/prims buffers
+    cudaFree(world_bvh);
+    cudaFree(world_bvh_hittable);
     world->~hittable_list();   // frees its objects array
     cudaFree(world);
     cudaFree(world_hittable);

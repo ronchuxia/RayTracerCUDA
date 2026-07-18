@@ -38,7 +38,7 @@ struct bvh_node {
     int prim_count;  // leaf: #prims (> 0); internal: 0  ← leaf/internal discriminator
 };
 
-struct bvh_scene {
+struct bvh {
     bvh_node* nodes;      // pre-allocated flat tree, root at index 0
     int node_count;
     int node_capacity;
@@ -48,7 +48,7 @@ struct bvh_scene {
     int prim_count;
     int prim_capacity;
 
-    bvh_scene() {
+    bvh() {
         prim_count = 0;
         prim_capacity = 16;
         checkCudaErrors(cudaMallocManaged((void**)&prims, prim_capacity * sizeof(hittable)));
@@ -58,7 +58,7 @@ struct bvh_scene {
         checkCudaErrors(cudaMallocManaged((void**)&nodes, node_capacity * sizeof(bvh_node)));
     }
 
-    ~bvh_scene() {
+    ~bvh() {
         cudaFree(prims);
         cudaFree(prim_index);
         cudaFree(nodes);
@@ -225,14 +225,14 @@ struct bvh_scene {
     }
 };
 
-// Dispatch shims declared in hittable.h (before bvh_scene is complete) and
+// Dispatch shims declared in hittable.h (before bvh is complete) and
 // defined here, so hittable's switches can route to the BVH.
-__device__ bool bvh_scene_hit(const bvh_scene* bvh, const ray& r, interval ray_t, hit_record& rec, curandState* state) {
-    return bvh->hit(r, ray_t, rec, state);
+__device__ bool bvh_hit(const bvh* b, const ray& r, interval ray_t, hit_record& rec, curandState* state) {
+    return b->hit(r, ray_t, rec, state);
 }
 
-__host__ __device__ aabb bvh_scene_bounding_box(const bvh_scene* bvh) {
-    return bvh->bounding_box();
+__host__ __device__ aabb bvh_bounding_box(const bvh* b) {
+    return b->bounding_box();
 }
 
 #endif // BVH_H
