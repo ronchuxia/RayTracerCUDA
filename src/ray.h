@@ -11,7 +11,7 @@ struct ray {
     __host__ __device__ point3 origin() const  { return orig; }
     __host__ __device__ vec3 direction() const { return dir; }
 
-    __host__ __device__ point3 at(double t) const {
+    __host__ __device__ point3 at(real t) const {
         return orig + t*dir;
     }
 

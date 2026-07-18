@@ -23,19 +23,19 @@ __global__ void initialize_rand(const camera& cam, curandState* state, unsigned 
 __global__ void render_pixel(const camera& cam, int max_depth, const hittable& world, color* pixel_colors, curandState* rand_states);
 
 struct camera {
-        double aspect_ratio      = 1.0;  // Ratio of image width over height
+        real aspect_ratio      = 1.0;  // Ratio of image width over height
         int    image_width       = 100;  // Rendered image width in pixel count
         int    image_height;             // Rendered image height in pixel count
         int    samples_per_pixel = 10;   // Count of random samples for each pixel
         int    max_depth         = 10;   // Maximum number of ray bounces into scene
 
-        double vfov     = 90;              // Vertical view angle (field of view)
+        real vfov     = 90;              // Vertical view angle (field of view)
         point3 lookfrom = point3(0,0,-1);  // Point camera is looking from
         point3 lookat   = point3(0,0,0);   // Point camera is looking at
         vec3   vup      = vec3(0,1,0);     // Camera-relative "up" direction
 
-        double defocus_angle = 0;  // Variation angle of rays through each pixel
-        double focus_dist = 10;    // Distance from camera lookfrom point to plane of perfect focus
+        real defocus_angle = 0;  // Variation angle of rays through each pixel
+        real focus_dist = 10;    // Distance from camera lookfrom point to plane of perfect focus
 
         long long seed = -1;       // RNG seed; negative → seed from time(0). Fix it for reproducible renders (tests).
 
@@ -89,7 +89,7 @@ struct camera {
             auto theta = degrees_to_radians(vfov);
             auto h = tan(theta/2);
             auto viewport_height = 2 * h * focus_dist;
-            auto viewport_width = viewport_height * (static_cast<double>(image_width)/image_height);
+            auto viewport_width = viewport_height * (static_cast<real>(image_width)/image_height);
 
             // Calculate the u,v,w unit basis vectors for the camera coordinate frame.
             w = unit_vector(lookfrom - lookat);
@@ -133,7 +133,7 @@ struct camera {
             hit_record rec;
 
             for (int i = 0; i < max_depth; i++) {
-                if (world.hit(current_ray, interval(0.001, 1.0/0.0), rec, state)) {
+                if (world.hit(current_ray, interval(real(0.001), infinity), rec, state)) {
                     ray scattered;
                     color attenuation;
                     color emit = rec.mat->emitted();
@@ -154,8 +154,8 @@ struct camera {
                     // If no hit, add background color and terminate
 #if RT_SKY
                     vec3 unit_direction = unit_vector(current_ray.direction());
-                    auto a = 0.5 * (unit_direction.y() + 1.0);
-                    color background = ((1.0-a)*color(1.0, 1.0, 1.0) + a*color(0.5, 0.7, 1.0)) * 0.7;
+                    real a = real(0.5) * (unit_direction.y() + real(1.0));
+                    color background = ((real(1.0)-a)*color(1.0, 1.0, 1.0) + a*color(0.5, 0.7, 1.0)) * real(0.7);
 #else
                     color background = color(0,0,0);
 #endif
@@ -177,8 +177,8 @@ struct camera {
 
         __device__ vec3 pixel_sample_square(curandState* state) const {
             // Returns a random point in the square surrounding a pixel at the origin.
-            auto px = -0.5 + curand_uniform_double(state);
-            auto py = -0.5 + curand_uniform_double(state);
+            real px = real(-0.5) + random_real(state);
+            real py = real(-0.5) + random_real(state);
             return (px * pixel_delta_u) + (py * pixel_delta_v);
         }
 

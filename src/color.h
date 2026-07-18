@@ -8,7 +8,7 @@
 
 using color = vec3;
 
-__host__ __device__ inline double linear_to_gamma(double linear_component)
+__host__ __device__ inline real linear_to_gamma(real linear_component)
 {
     return sqrt(linear_component);
 }
@@ -20,7 +20,7 @@ __host__ __device__ inline double linear_to_gamma(double linear_component)
 // GPU tonemap kernel so the two present the byte-identical image.
 __host__ __device__ inline void tonemap_pixel(color pixel_color, int samples_per_pixel,
                                               unsigned char& r, unsigned char& g, unsigned char& b) {
-    double scale = 1.0 / samples_per_pixel;
+    real scale = real(1.0) / samples_per_pixel;
     const interval intensity(0.000, 0.999);
     r = static_cast<unsigned char>(256 * intensity.clamp(linear_to_gamma(pixel_color.x() * scale)));
     g = static_cast<unsigned char>(256 * intensity.clamp(linear_to_gamma(pixel_color.y() * scale)));

@@ -209,8 +209,8 @@ struct bvh_scene {
         int mid = start + (end - start) / 2;
         std::nth_element(prim_index + start, prim_index + mid, prim_index + end,
             [centroids, axis](int a, int b) {
-                double ca = centroids[a][axis];
-                double cb = centroids[b][axis];
+                real ca = centroids[a][axis];
+                real cb = centroids[b][axis];
                 return ca < cb || (ca == cb && a < b);
             });
 

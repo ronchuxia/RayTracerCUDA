@@ -20,16 +20,16 @@ enum TextureType {
 struct solid_color {
     color albedo;
 
-    __device__ color value(double u, double v, const point3& p) const {
+    __device__ color value(real u, real v, const point3& p) const {
         return albedo;
     }
 };
 
 struct checker_texture {
-    double inv_scale;
+    real inv_scale;
     color even, odd;   // solid colors (no nested textures, unlike the book)
 
-    __device__ color value(double u, double v, const point3& p) const {
+    __device__ color value(real u, real v, const point3& p) const {
         // The book's 3-D spatial checker: parity of the hit point's integer
         // lattice cell (independent of the surface's UV).
         auto x = static_cast<int>(floor(inv_scale * p.x()));
@@ -43,7 +43,7 @@ struct image_texture {
     unsigned char* data;   // RGB8, row-major; managed memory owned by the scene's allocs
     int width, height;
 
-    __device__ color value(double u, double v, const point3& p) const {
+    __device__ color value(real u, real v, const point3& p) const {
         // Debug aid: solid cyan if there is no image data.
         if (data == nullptr || height <= 0) return color(0, 1, 1);
 
@@ -56,7 +56,7 @@ struct image_texture {
         if (j > height - 1) j = height - 1;
 
         const unsigned char* pixel = data + 3 * (j * width + i);
-        auto color_scale = 1.0 / 255.0;
+        real color_scale = real(1.0 / 255.0);
         return color(color_scale * pixel[0], color_scale * pixel[1], color_scale * pixel[2]);
     }
 };
@@ -74,7 +74,7 @@ struct texture {
     // Implicit color → solid texture, so lambertian(color(...)) keeps working.
     __host__ __device__ texture(const color& c) : type(SOLID_COLOR) { solid.albedo = c; }
 
-    __device__ color value(double u, double v, const point3& p) const {
+    __device__ color value(real u, real v, const point3& p) const {
         switch (type) {
             case SOLID_COLOR:
                 return solid.value(u, v, p);
@@ -99,7 +99,7 @@ inline texture make_solid_color(const color& albedo) {
     return t;
 }
 
-inline texture make_checker(double scale, const color& even, const color& odd) {
+inline texture make_checker(real scale, const color& even, const color& odd) {
     texture t;
     t.type = CHECKER;
     t.checker.inv_scale = 1.0 / scale;

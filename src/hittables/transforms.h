@@ -48,18 +48,18 @@ struct translate {
 
 struct rotate_y {
   hittable* child;
-  double sin_theta;
-  double cos_theta;
+  real sin_theta;
+  real cos_theta;
   aabb bbox;
 
-  rotate_y(hittable* _child, double angle) : child(_child) {
+  rotate_y(hittable* _child, real angle) : child(_child) {
     auto radians = degrees_to_radians(angle);
     sin_theta = sin(radians);
     cos_theta = cos(radians);
     bbox = child->bounding_box();
 
     // Rotate all 8 corners of the child's box and re-union them.
-    auto inf = std::numeric_limits<double>::infinity();
+    auto inf = std::numeric_limits<real>::infinity();
     point3 min( inf,  inf,  inf);
     point3 max(-inf, -inf, -inf);
 
@@ -125,10 +125,10 @@ struct rotate_y {
 
 struct uniform_scale {
   hittable* child;
-  double scale;   // assumed positive
+  real scale;   // assumed positive
   aabb bbox;
 
-  uniform_scale(hittable* _child, double _scale)
+  uniform_scale(hittable* _child, real _scale)
   : child(_child), scale(_scale) {
     bbox = child->bounding_box() * scale;
   }

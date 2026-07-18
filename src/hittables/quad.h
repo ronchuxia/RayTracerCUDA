@@ -15,7 +15,7 @@ struct quad {
   material* mat;
   vec3 w;       // n / dot(n,n), for planar hit-point coordinates
   vec3 normal;
-  double D;     // plane equation: dot(normal, p) = D
+  real D;     // plane equation: dot(normal, p) = D
   aabb bbox;
 
   quad(const point3& _Q, const vec3& _u, const vec3& _v, material* _material)
@@ -35,7 +35,7 @@ struct quad {
     auto denom = dot(normal, r.direction());
 
     // No hit if the ray is parallel to the plane.
-    if (fabs(denom) < 1e-8) return false;
+    if (fabs(denom) < real(1e-8)) return false;
 
     // Return false if the hit point parameter t is outside the ray interval.
     auto t = (D - dot(normal, r.origin())) / denom;
@@ -51,7 +51,7 @@ struct quad {
 
     rec.t = t;
     rec.p = intersection;
-    rec.u = alpha;   // planar coordinates double as the quad's UV
+    rec.u = alpha;   // planar coordinates real as the quad's UV
     rec.v = beta;
     rec.mat = mat;
     rec.set_face_normal(r, normal);

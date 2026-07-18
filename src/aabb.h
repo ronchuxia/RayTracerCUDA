@@ -29,7 +29,7 @@ struct aabb {
 
     __host__ __device__ aabb pad() {
         // Return an AABB that has no side narrower than some delta, padding if necessary.
-        double delta = 0.0001;
+        real delta = 0.0001;
         interval new_x = (x.size() >= delta) ? x : x.expand(delta);
         interval new_y = (y.size() >= delta) ? y : y.expand(delta);
         interval new_z = (z.size() >= delta) ? z : z.expand(delta);
@@ -75,11 +75,11 @@ __host__ __device__ aabb operator+(const vec3& offset, const aabb& bbox) {
     return bbox + offset;
 }
 
-__host__ __device__ aabb operator*(const aabb& bbox, double scale) {
+__host__ __device__ aabb operator*(const aabb& bbox, real scale) {
     return aabb(bbox.x * scale, bbox.y * scale, bbox.z * scale);
 }
 
-__host__ __device__ aabb operator*(double scale, const aabb& bbox) {
+__host__ __device__ aabb operator*(real scale, const aabb& bbox) {
     return bbox * scale;
 }
 

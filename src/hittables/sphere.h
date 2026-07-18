@@ -10,11 +10,11 @@ struct material;
 
 struct sphere {
   point3 center;
-  double radius;
+  real radius;
   material* mat;
   aabb bbox;
 
-  sphere(point3 _center, double _radius, material* _material)
+  sphere(point3 _center, real _radius, material* _material)
   : center(_center), radius(_radius), mat(_material) {
     auto rvec = vec3(radius, radius, radius);
     bbox = aabb(center - rvec, center + rvec);
@@ -55,8 +55,8 @@ struct sphere {
 
   // Spherical (u,v) of a point on the unit sphere: u from the angle around the
   // Y axis (from x=-1), v from the angle from y=-1 up to y=+1.
-  __device__ static void get_sphere_uv(const point3& p, double& u, double& v) {
-    const double pi = 3.1415926535897932385;
+  __device__ static void get_sphere_uv(const point3& p, real& u, real& v) {
+    const real pi = 3.1415926535897932385;
     auto theta = acos(-p.y());
     auto phi = atan2(-p.z(), p.x()) + pi;
 

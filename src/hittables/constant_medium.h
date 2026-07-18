@@ -21,24 +21,24 @@
 // RNG stream differently. Both are equally correct Monte Carlo estimates.
 struct constant_medium {
   hittable* boundary;
-  double neg_inv_density;
+  real neg_inv_density;
   material* phase_function;   // an ISOTROPIC material, owned by the scene
 
-  constant_medium(hittable* _boundary, double density, material* _phase_function)
+  constant_medium(hittable* _boundary, real density, material* _phase_function)
   : boundary(_boundary), neg_inv_density(-1/density), phase_function(_phase_function) {}
 
   __host__ __device__ aabb bounding_box() const {return boundary->bounding_box();}
 
   __device__ bool hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const {
     hit_record rec1, rec2;
-    const double inf = 1.0/0.0;
+    const real inf = infinity;
 
     // Entry and exit points of the ray through the boundary, over the whole
     // line (not just ray_t), so a ray starting inside still finds its exit.
     if (!boundary->hit(r, interval(-inf, inf), rec1, state))
         return false;
 
-    if (!boundary->hit(r, interval(rec1.t + 0.0001, inf), rec2, state))
+    if (!boundary->hit(r, interval(rec1.t + real(0.0001), inf), rec2, state))
         return false;
 
     if (rec1.t < ray_t.min) rec1.t = ray_t.min;
@@ -52,8 +52,8 @@ struct constant_medium {
 
     auto ray_length = r.direction().length();
     auto distance_inside_boundary = (rec2.t - rec1.t) * ray_length;
-    // curand_uniform_double is in (0, 1], so log() is finite.
-    auto hit_distance = neg_inv_density * log(curand_uniform_double(state));
+    // random_real is in (0, 1], so log() is finite.
+    auto hit_distance = neg_inv_density * log(random_real(state));
 
     if (hit_distance > distance_inside_boundary)
         return false;

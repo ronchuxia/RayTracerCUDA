@@ -37,9 +37,9 @@ struct lambertian {
 
 struct metal{
   color albedo;
-  double fuzz;
+  real fuzz;
 
-  metal(const color& a, double f) : albedo(a), fuzz(f < 1 ? f : 1) {}
+  metal(const color& a, real f) : albedo(a), fuzz(f < 1 ? f : 1) {}
 
   __device__ bool scatter(const ray& r_in, const hit_record& rec, color& attenuation, ray& scattered, curandState* state) const {
     vec3 reflected = reflect(unit_vector(r_in.direction()), rec.normal);
@@ -50,12 +50,12 @@ struct metal{
 };
 
 struct dielectric {
-  double ir;          // Index of Refraction
+  real ir;          // Index of Refraction
   color  absorption;  // Beer-Lambert coefficient per RGB channel; (0,0,0) = clear glass
 
-  dielectric(double index_of_refraction)
+  dielectric(real index_of_refraction)
     : ir(index_of_refraction), absorption(0, 0, 0) {}
-  dielectric(double index_of_refraction, const color& absorb)
+  dielectric(real index_of_refraction, const color& absorb)
     : ir(index_of_refraction), absorption(absorb) {}
 
   __device__ bool scatter(const ray& r_in, const hit_record& rec, color& attenuation, ray& scattered, curandState* state) const {
@@ -70,16 +70,16 @@ struct dielectric {
                             exp(-absorption.z() * rec.t));
     else
         attenuation = color(1.0, 1.0, 1.0);
-    double refraction_ratio = rec.front_face ? (1.0/ir) : ir;
+    real refraction_ratio = rec.front_face ? (real(1.0)/ir) : ir;
 
     vec3 unit_direction = unit_vector(r_in.direction());
-    double cos_theta = fmin(dot(-unit_direction, rec.normal), 1.0);
-    double sin_theta = sqrt(1.0 - cos_theta*cos_theta);
+    real cos_theta = fmin(dot(-unit_direction, rec.normal), real(1.0));
+    real sin_theta = sqrt(real(1.0) - cos_theta*cos_theta);
 
-    bool cannot_refract = refraction_ratio * sin_theta > 1.0;
+    bool cannot_refract = refraction_ratio * sin_theta > real(1.0);
     vec3 direction;
 
-    if (cannot_refract || reflectance(cos_theta, refraction_ratio) > curand_uniform_double(state))
+    if (cannot_refract || reflectance(cos_theta, refraction_ratio) > random_real(state))
         direction = reflect(unit_direction, rec.normal);
     else
         direction = refract(unit_direction, rec.normal, refraction_ratio);
@@ -88,12 +88,12 @@ struct dielectric {
     return true;
   }
 
-  __host__ __device__ static double reflectance(double cosine, double ref_idx) {
+  __host__ __device__ static real reflectance(real cosine, real ref_idx) {
       // Use Schlick's approximation for reflectance.
       // Reflectance measures the probability that the ray reflects instead of refracting.
       auto r0 = (1-ref_idx) / (1+ref_idx);
       r0 = r0*r0;
-      return r0 + (1-r0)*pow((1 - cosine),5);
+      return r0 + (1-r0)*pow((real(1.0) - cosine), real(5.0));
   }
 };
 

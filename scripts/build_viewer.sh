@@ -24,6 +24,12 @@ if [ -z "${ARCH:-}" ]; then
 fi
 echo "building viewer with -arch=$ARCH"
 
+# PRECISION=64 builds the double-precision reference viewer as build/viewer_fp64
+# (run it side by side with the default float build/viewer to compare trace ms).
+PRECISION="${PRECISION:-32}"
+OUT=build/viewer
+[ "$PRECISION" = 64 ] && OUT=build/viewer_fp64
+
 # Dear ImGui (vendored in src/external/imgui, pinned v1.92.8) is plain C++ —
 # nvcc hands the .cpp files to the host compiler. Its SDL2 backend does
 # `#include <SDL.h>`, so it needs SDL2's include dir from pkg-config.
@@ -32,6 +38,7 @@ IMGUI=src/external/imgui
 nvcc src/viewer/viewer.cu \
     "$IMGUI"/imgui.cpp "$IMGUI"/imgui_draw.cpp "$IMGUI"/imgui_tables.cpp \
     "$IMGUI"/imgui_widgets.cpp "$IMGUI"/imgui_impl_sdl2.cpp "$IMGUI"/imgui_impl_opengl2.cpp \
-    -o build/viewer -std=c++14 -arch="$ARCH" -Isrc -I"$IMGUI" $SDL_CFLAGS \
+    -o "$OUT" -std=c++14 -arch="$ARCH" -Isrc -I"$IMGUI" $SDL_CFLAGS \
+    -DRT_PRECISION="$PRECISION" \
     -lSDL2 -lGLEW -lGL "$@"
-echo "built build/viewer (log: $LOG)"
+echo "built $OUT (RT_PRECISION=$PRECISION, log: $LOG)"
