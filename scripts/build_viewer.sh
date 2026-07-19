@@ -40,5 +40,5 @@ nvcc src/viewer/viewer.cu \
     "$IMGUI"/imgui_widgets.cpp "$IMGUI"/imgui_impl_sdl2.cpp "$IMGUI"/imgui_impl_opengl2.cpp \
     -o "$OUT" -std=c++14 -arch="$ARCH" -Isrc -I"$IMGUI" $SDL_CFLAGS \
     -DRT_PRECISION="$PRECISION" \
-    -lSDL2 -lGLEW -lGL "$@"
+    -lSDL2 -lGLEW -lGL -lnvidia-ml "$@"
 echo "built $OUT (RT_PRECISION=$PRECISION, log: $LOG)"

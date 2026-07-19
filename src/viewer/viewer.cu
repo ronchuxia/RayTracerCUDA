@@ -50,6 +50,8 @@
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
 #include <cuda_gl_interop.h>
+#include <nvml.h>       // per-process VRAM query (links -lnvidia-ml)
+#include <unistd.h>     // getpid()
 
 // Dear ImGui (vendored in src/external/imgui, pinned v1.92.8): UI panel with
 // live render controls. SDL2 + fixed-function GL2 backends — the GL2 one
@@ -407,6 +409,22 @@ int main(int argc, char** argv) {
     int* pick_result;
     checkCudaErrors(cudaMallocManaged(&pick_result, sizeof(int)));
 
+    // ---- NVML: this process's VRAM on the SAME physical GPU CUDA is using ----
+    // cudaMemGetInfo is device-wide (counts other apps); NVML per-process is our
+    // own footprint, matching nvidia-smi. Bind NVML by the CUDA device's PCI bus
+    // id — device indices need not match on a multi-GPU box. Polled every ~30
+    // frames (the process-list query is heavier than a memory read).
+    nvmlDevice_t nvml_dev;
+    bool nvml_ok = (nvmlInit() == NVML_SUCCESS);
+    if (nvml_ok) {
+        int cuda_dev; cudaGetDevice(&cuda_dev);
+        char pci[32]; cudaDeviceGetPCIBusId(pci, sizeof(pci), cuda_dev);
+        nvml_ok = (nvmlDeviceGetHandleByPciBusId(pci, &nvml_dev) == NVML_SUCCESS);
+    }
+    const unsigned int my_pid = (unsigned int)getpid();
+    int vram_used_mb = -1;   // cached poll result (-1 = unknown)
+    int vram_poll = 0;
+
     // Rebuild the camera from the orbit state and reset accumulation. Called
     // whenever the view changes (drag / scroll / pan / R).
     auto rebuild_camera = [&]() {
@@ -518,6 +536,20 @@ int main(int argc, char** argv) {
                 ImGui::Text("tonemap %6.2f ms", ms_tonemap);
                 ImGui::Text("present %6.2f ms",
                             fmaxf(0.0f, io.DeltaTime * 1000.0f - ms_trace - ms_tonemap));
+                // This process's VRAM (NVML, matching nvidia-smi), re-polled
+                // every 30 frames; the value persists between polls.
+                if (nvml_ok && vram_poll++ % 30 == 0) {
+                    unsigned int n = 64;
+                    nvmlProcessInfo_t procs[64];
+                    if (nvmlDeviceGetComputeRunningProcesses(nvml_dev, &n, procs) == NVML_SUCCESS) {
+                        vram_used_mb = 0;   // our pid absent from the list = 0 MB
+                        for (unsigned int k = 0; k < n; k++)
+                            if (procs[k].pid == my_pid)
+                                vram_used_mb = (int)(procs[k].usedGpuMemory / (1024 * 1024));
+                    }
+                }
+                if (vram_used_mb >= 0) ImGui::Text("vram    %6d MB", vram_used_mb);
+                else                   ImGui::Text("vram    %6s MB", "n/a");
             }
 
             if (show_samples) {
@@ -667,6 +699,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- cleanup ----
+    if (nvml_ok) nvmlShutdown();
     cudaFree(pick_state);
     cudaFree(pick_result);
     cudaEventDestroy(ev_trace0);
