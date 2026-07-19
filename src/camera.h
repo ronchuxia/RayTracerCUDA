@@ -39,6 +39,19 @@ struct camera {
 
         long long seed = -1;       // RNG seed; negative → seed from time(0). Fix it for reproducible renders (tests).
 
+        // Derived frame state — computed by initialize() from the config above,
+        // so valid only after it runs. Public like the rest of the repo's
+        // C-style structs (image_height above is already a public derived
+        // field); external users should prefer the ray/pixel methods over
+        // reading these directly.
+        point3 center;          // Camera center
+        point3 pixel00_loc;     // Location of pixel 0, 0
+        vec3   pixel_delta_u;   // Offset to pixel to the right
+        vec3   pixel_delta_v;   // Offset to pixel below
+        vec3   u, v, w;         // Camera frame basis vectors
+        vec3   defocus_disk_u;  // Defocus disk horizontal radius
+        vec3   defocus_disk_v;  // Defocus disk vertical radius
+
         __host__ void render(const hittable& world) {
             initialize();
 
@@ -126,6 +139,32 @@ struct camera {
             return ray(ray_origin, ray_direction);
         }
 
+        // Deterministic ray through the CENTER of pixel (i, j): no jitter, no
+        // defocus sampling, no RNG consumed — the same pixel always yields the
+        // same ray. Used by the viewer's object picking (B4).
+        __host__ __device__ ray get_ray_through_pixel(int i, int j) const {
+            auto pixel_center = pixel00_loc + (i * pixel_delta_u) + (j * pixel_delta_v);
+            return ray(center, pixel_center - center);
+        }
+
+        // Inverse of get_ray_through_pixel: project a world point to fractional
+        // pixel coordinates by intersecting the ray center→p with the viewport
+        // plane and decomposing along the pixel grid. Built on the SAME frame
+        // fields ray generation uses, so projection and rendering can never
+        // disagree. Returns false for points at or behind the camera plane.
+        // Used by the viewer's selection-highlight overlay (B4).
+        __host__ __device__ bool world_to_pixel(const point3& p, real& px, real& py) const {
+            vec3 d = p - center;
+            real denom = dot(d, w);                    // w points BACKWARD: visible => denom < 0
+            if (denom >= real(-1e-6)) return false;
+            real s = dot(pixel00_loc - center, w) / denom;
+            point3 q = center + s * d;                 // p projected onto the viewport plane
+            vec3 offset = q - pixel00_loc;
+            px = dot(offset, pixel_delta_u) / pixel_delta_u.length_squared();
+            py = dot(offset, pixel_delta_v) / pixel_delta_v.length_squared();
+            return true;
+        }
+
         __device__ color ray_color(ray r, const hittable& world, int max_depth, curandState* state) const {
             ray current_ray = r;
             color current_color = color(0,0,0); // Total color until now
@@ -165,15 +204,6 @@ struct camera {
             }
             return current_color;
         }
-
-    private:
-        point3 center;          // Camera center
-        point3 pixel00_loc;     // Location of pixel 0, 0
-        vec3   pixel_delta_u;   // Offset to pixel to the right
-        vec3   pixel_delta_v;   // Offset to pixel below
-        vec3   u, v, w;         // Camera frame basis vectors
-        vec3   defocus_disk_u;  // Defocus disk horizontal radius
-        vec3   defocus_disk_v;  // Defocus disk vertical radius
 
         __device__ vec3 pixel_sample_square(curandState* state) const {
             // Returns a random point in the square surrounding a pixel at the origin.

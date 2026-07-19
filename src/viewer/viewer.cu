@@ -126,6 +126,23 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
     }
 }
 
+// --- B4 object picking ---------------------------------------------------
+// On click, one thread casts the deterministic ray through the clicked pixel
+// center (camera::get_ray_through_pixel) and reports hit_record.id — the stable
+// scene-object id stamped by the outermost tagged wrapper. The pick uses a
+// DEDICATED cuRAND state: hitting a stochastic hittable (constant_medium)
+// must never consume the render states, or accumulation determinism breaks.
+__global__ void pick(const camera& cam, const hittable& world, int px, int py,
+                     curandState* state, int* out_id) {
+    ray r = cam.get_ray_through_pixel(px, py);
+    hit_record rec;
+    *out_id = world.hit(r, interval(real(0.001), infinity), rec, state) ? rec.id : -1;
+}
+
+__global__ void initialize_rand_pick(curandState* state, unsigned long seed) {
+    curand_init(seed, 0, 0, state);
+}
+
 // --- scene: checker ground + the three book spheres (glass / diffuse / metal),
 // sky-lit. Built through the scene registry (scene.h): every sphere gets a
 // stable id (registration order), so a future pick ray can identify it via
@@ -372,6 +389,23 @@ int main(int argc, char** argv) {
 
     // Which sections of the Renderer panel are visible (toggled in View menu).
     bool show_performance = true, show_samples = true, show_config = true, show_camera = true;
+    bool show_selection = true;
+
+    // ---- B4 picking state ----
+    // A click (press+release with ≤2 px of motion) picks; a drag orbits.
+    int selected_id = -1;
+    int press_x = 0, press_y = 0;
+    bool maybe_click = false;
+
+    // Dedicated pick RNG (never touches the render states), seeded once.
+    curandState* pick_state;
+    checkCudaErrors(cudaMalloc(&pick_state, sizeof(curandState)));
+    initialize_rand_pick<<<1, 1>>>(pick_state, rng_seed + 1);
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    // The pick kernel's answer, in managed memory so the host can read it back.
+    int* pick_result;
+    checkCudaErrors(cudaMallocManaged(&pick_result, sizeof(int)));
 
     // Rebuild the camera from the orbit state and reset accumulation. Called
     // whenever the view changes (drag / scroll / pan / R).
@@ -402,6 +436,19 @@ int main(int argc, char** argv) {
             }
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_r) camera_dirty = true;
+            else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+                press_x = e.button.x; press_y = e.button.y;
+                maybe_click = true;
+            }
+            else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) {
+                // B4: a release near the press point is a pick, not a drag.
+                if (maybe_click && abs(e.button.x - press_x) <= 2 && abs(e.button.y - press_y) <= 2) {
+                    pick<<<1, 1>>>(*cam, world, e.button.x, e.button.y, pick_state, pick_result);
+                    checkCudaErrors(cudaDeviceSynchronize());
+                    selected_id = *pick_result;   // -1 on miss = deselect
+                }
+                maybe_click = false;
+            }
             else if (e.type == SDL_MOUSEWHEEL) {
                 radius *= pow(0.9, e.wheel.y);          // wheel up = zoom in
                 if (radius < 0.1) radius = 0.1;
@@ -447,6 +494,7 @@ int main(int argc, char** argv) {
                 ImGui::MenuItem("Samples", nullptr, &show_samples);
                 ImGui::MenuItem("Config",  nullptr, &show_config);
                 ImGui::MenuItem("Camera",  nullptr, &show_camera);
+                ImGui::MenuItem("Selection", nullptr, &show_selection);
                 ImGui::EndMenu();
             }
             ImGui::EndMainMenuBar();
@@ -510,8 +558,39 @@ int main(int argc, char** argv) {
                     camera_dirty = true;
                 }
             }
+
+            if (show_selection) {
+                section_break();
+                if (selected_id >= 0) {
+                    ImGui::Text("selected  id %d", selected_id);
+                } else {
+                    ImGui::Text("selected  none");
+                }
+            }
         }
         ImGui::End();
+
+        // B4 highlight: project the selected object's bbox and outline it as a
+        // 2D overlay — the render itself is untouched, so no accumulation
+        // reset, and the outline follows camera moves via reprojection.
+        if (selected_id >= 0) {
+            aabb bb = sc.get(selected_id)->bounding_box();
+            point3 corner[8];
+            for (int k = 0; k < 8; k++)
+                corner[k] = point3(k & 1 ? bb.x.max : bb.x.min,
+                                   k & 2 ? bb.y.max : bb.y.min,
+                                   k & 4 ? bb.z.max : bb.z.min);
+            static const int edge[12][2] = {{0,1},{0,2},{0,4},{1,3},{1,5},{2,3},
+                                            {2,6},{3,7},{4,5},{4,6},{5,7},{6,7}};
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            for (int k = 0; k < 12; k++) {
+                real ax, ay, bx, by;
+                if (cam->world_to_pixel(corner[edge[k][0]], ax, ay) &&
+                    cam->world_to_pixel(corner[edge[k][1]], bx, by))
+                    dl->AddLine(ImVec2((float)ax, (float)ay), ImVec2((float)bx, (float)by),
+                                IM_COL32(255, 220, 0, 255), 1.5f);
+            }
+        }
 
         if (camera_dirty) rebuild_camera();   // recompute view + reset accumulation
 
@@ -588,6 +667,8 @@ int main(int argc, char** argv) {
     }
 
     // ---- cleanup ----
+    cudaFree(pick_state);
+    cudaFree(pick_result);
     cudaEventDestroy(ev_trace0);
     cudaEventDestroy(ev_trace1);
     cudaEventDestroy(ev_tone0);
