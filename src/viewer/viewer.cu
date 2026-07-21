@@ -145,25 +145,37 @@ __global__ void initialize_rand_pick(curandState* state, unsigned long seed) {
     curand_init(seed, 0, 0, state);
 }
 
-// --- scene: checker ground + the three book spheres (glass / diffuse / metal),
-// sky-lit. Built through the scene registry (scene.h): every sphere gets a
-// stable id (registration order), so a future pick ray can identify it via
-// hit_record.id, and the registry's get()/refit() enable live mutation later.
+// --- scene: checker ground + editable objects, sky-lit. Every editable object
+// (spheres, a box, a triangle — one of each prim type) is registered as a
+// transform(prim), so B5 can drive full T/R/S on any of them uniformly. The
+// underlying prims are UNIT and centred at the origin; the transform supplies
+// position (translation) and size (scale). The ground stays a plain sphere —
+// it's the floor, not something you manipulate. Ids are registration order.
 static void build_viewer_scene(scene& sc) {
     sc.init();
 
-    material* ground = new_lambertian(
+    material* ground  = new_lambertian(
         make_checker(0.32, color(.2, .3, .1), color(.9, .9, .9)), sc.allocs);
     material* diffuse = new_lambertian(color(0.4, 0.2, 0.1), sc.allocs);
     material* glass   = new_dielectric(1.5, sc.allocs);
-    material* green   = new_tinted_glass(1.5, color(2.0, 0.2, 2.0), sc.allocs);
     material* metal_m = new_metal(color(0.7, 0.6, 0.5), 0.0, sc.allocs);
+    material* box_mat = new_lambertian(color(0.2, 0.4, 0.7), sc.allocs);
+    material* tri_mat = new_lambertian(color(0.9, 0.75, 0.2), sc.allocs);
 
-    sc.add(make_sphere(point3(0, -1000, 0), 1000, ground,  sc.allocs));  // id 0
-    sc.add(make_sphere(point3(-4, 1, 0),    1.0,  diffuse, sc.allocs));  // id 1
-    sc.add(make_sphere(point3(-1.4, 1, 2),  1.0,  green,   sc.allocs));  // id 2
-    sc.add(make_sphere(point3(0, 1, 0),     1.0,  glass,   sc.allocs));  // id 3
-    sc.add(make_sphere(point3(4, 1, 0),     1.0,  metal_m, sc.allocs));  // id 4
+    sc.add(make_sphere(point3(0, -1000, 0), 1000, ground, sc.allocs));   // id 0: floor (plain)
+
+    // Editable objects: unit prim at origin + transform(T, R°, S).
+    sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, diffuse, sc.allocs),
+                         vec3(-4, 1, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 1: diffuse sphere
+    sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, glass, sc.allocs),
+                         vec3(0, 1, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));    // id 2: glass sphere
+    sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, metal_m, sc.allocs),
+                         vec3(4, 1, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));    // id 3: metal sphere
+    sc.add(new_transform(new_box(point3(-0.6,-0.6,-0.6), point3(0.6,0.6,0.6), box_mat, sc.allocs, sc.list_dtors),
+                         vec3(-2, 0.6, -3), vec3(0, 35, 0), vec3(1,1,1), sc.allocs));  // id 4: box (composite)
+    sc.add(new_transform(make_triangle(point3(-0.8,-0.6,0), point3(0.8,-0.6,0), point3(0,0.9,0),
+                                       vec3(0,0,1), tri_mat, sc.allocs),
+                         vec3(2, 1.3, -3), vec3(0,0,0), vec3(1,1,1), sc.allocs));      // id 5: triangle
 
     sc.build();
 }
@@ -303,6 +315,22 @@ int main(int argc, char** argv) {
     build_viewer_scene(sc);
     hittable& world = sc.root();
 
+    // Snapshot each editable object's initial T/R/S so the Selection panel's
+    // "Reset transform" button (B5) can restore it. Indexed by scene id; a
+    // non-transform object records editable=false. Host-side only — the initial
+    // pose is editor state, kept out of the device `transform` struct.
+    struct init_trs { bool editable; vec3 t, r, s; };
+    std::vector<init_trs> initial_trs;
+    for (int id = 0; id < (int)sc.objects.size(); id++) {
+        hittable* h = sc.get(id);
+        if (h && h->type == TRANSFORM) {
+            transform* tr = static_cast<transform*>(h->object);
+            initial_trs.push_back({true, tr->translation, tr->rotation, tr->scale});
+        } else {
+            initial_trs.push_back({false, vec3(), vec3(), vec3()});
+        }
+    }
+
     curandState* rand_states;
     color* accum;
     checkCudaErrors(cudaMalloc(&rand_states, (size_t)W * H * sizeof(curandState)));
@@ -425,6 +453,14 @@ int main(int argc, char** argv) {
     int vram_used_mb = -1;   // cached poll result (-1 = unknown)
     int vram_poll = 0;
 
+    // Throw away accumulated samples and start converging afresh. Anything that
+    // changes what is rendered calls this: camera motion (below) and B5 object
+    // edits — mixing samples from different scenes would be wrong.
+    auto reset_accumulation = [&]() {
+        checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
+        total_samples = 0;
+    };
+
     // Rebuild the camera from the orbit state and reset accumulation. Called
     // whenever the view changes (drag / scroll / pan / R).
     auto rebuild_camera = [&]() {
@@ -433,8 +469,7 @@ int main(int argc, char** argv) {
         cam->lookfrom = target + radius * vec3(ce * ca, se, ce * sa);
         cam->lookat   = target;
         cam->initialize();
-        checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
-        total_samples = 0;
+        reset_accumulation();
     };
 
     // ---- present loop: accumulate a few spp, then present the running average ----
@@ -595,6 +630,41 @@ int main(int argc, char** argv) {
                 section_break();
                 if (selected_id >= 0) {
                     ImGui::Text("selected  id %d", selected_id);
+
+                    // B5 object manipulation: edit the selected object's full
+                    // TRS, then run the mutation protocol — placement-new the
+                    // transform (rewrites params AND recomputes matrices + bbox)
+                    // -> refit() -> restart accumulation. Generic over prim type:
+                    // every editable object is a transform(prim). The bbox
+                    // highlight follows via bounding_box().
+                    hittable* h = sc.get(selected_id);
+                    if (h->type == TRANSFORM) {
+                        transform* tr = static_cast<transform*>(h->object);
+                        float t[3] = {(float)tr->translation.x(), (float)tr->translation.y(), (float)tr->translation.z()};
+                        float r[3] = {(float)tr->rotation.x(),    (float)tr->rotation.y(),    (float)tr->rotation.z()};
+                        float s[3] = {(float)tr->scale.x(),       (float)tr->scale.y(),       (float)tr->scale.z()};
+                        bool edited = false;
+                        edited |= ImGui::DragFloat3("translate", t, 0.05f);
+                        edited |= ImGui::DragFloat3("rotate",    r, 1.0f);
+                        edited |= ImGui::DragFloat3("scale",     s, 0.02f, 0.01f, 100.0f);
+                        if (edited) {
+                            for (int c = 0; c < 3; c++) s[c] = fmaxf(s[c], 0.01f);  // scale must stay positive
+                            new(tr) transform(tr->child, point3(t[0], t[1], t[2]),
+                                              vec3(r[0], r[1], r[2]), vec3(s[0], s[1], s[2]));
+                            sc.refit();
+                            reset_accumulation();
+                        }
+                        // Restore the object's initial pose (same mutation protocol).
+                        // The drag fields re-read tr next frame, so the UI follows.
+                        if (ImGui::Button("Reset transform")) {
+                            const init_trs& in = initial_trs[selected_id];
+                            new(tr) transform(tr->child, in.t, in.r, in.s);
+                            sc.refit();
+                            reset_accumulation();
+                        }
+                    } else {
+                        ImGui::TextDisabled("not editable");
+                    }
                 } else {
                     ImGui::Text("selected  none");
                 }

@@ -38,7 +38,7 @@ IMGUI=src/external/imgui
 nvcc src/viewer/viewer.cu \
     "$IMGUI"/imgui.cpp "$IMGUI"/imgui_draw.cpp "$IMGUI"/imgui_tables.cpp \
     "$IMGUI"/imgui_widgets.cpp "$IMGUI"/imgui_impl_sdl2.cpp "$IMGUI"/imgui_impl_opengl2.cpp \
-    -o "$OUT" -std=c++14 -arch="$ARCH" -Isrc -I"$IMGUI" $SDL_CFLAGS \
+    -o "$OUT" -std=c++14 -arch="$ARCH" -rdc=true -Isrc -I"$IMGUI" $SDL_CFLAGS \
     -DRT_PRECISION="$PRECISION" \
     -lSDL2 -lGLEW -lGL -lnvidia-ml "$@"
 echo "built $OUT (RT_PRECISION=$PRECISION, log: $LOG)"

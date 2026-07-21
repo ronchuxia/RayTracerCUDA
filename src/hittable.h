@@ -21,6 +21,7 @@ enum HittableType {
   TRANSLATE,
   ROTATE_Y,
   UNIFORM_SCALE,
+  TRANSFORM,
   CONSTANT_MEDIUM,
   BVH
 };
@@ -50,6 +51,10 @@ __host__ __device__ aabb rotate_y_bounding_box(const rotate_y* rot);
 struct uniform_scale;
 __device__ bool uniform_scale_hit(const uniform_scale* s, const ray& r, interval ray_t, hit_record& rec, curandState* state);
 __host__ __device__ aabb uniform_scale_bounding_box(const uniform_scale* s);
+
+struct transform;
+__device__ bool transform_hit(const transform* t, const ray& r, interval ray_t, hit_record& rec, curandState* state);
+__host__ __device__ aabb transform_bounding_box(const transform* t);
 
 struct constant_medium;
 __device__ bool constant_medium_hit(const constant_medium* m, const ray& r, interval ray_t, hit_record& rec, curandState* state);
@@ -82,6 +87,8 @@ __device__ bool hittable::hit(const ray& r, interval ray_t, hit_record& rec, cur
         is_hit = rotate_y_hit(static_cast<rotate_y*>(object), r, ray_t, rec, state); break;
         case UNIFORM_SCALE:
         is_hit = uniform_scale_hit(static_cast<uniform_scale*>(object), r, ray_t, rec, state); break;
+        case TRANSFORM:
+        is_hit = transform_hit(static_cast<transform*>(object), r, ray_t, rec, state); break;
         case CONSTANT_MEDIUM:
         is_hit = constant_medium_hit(static_cast<constant_medium*>(object), r, ray_t, rec, state); break;
         case BVH:
@@ -115,6 +122,8 @@ __host__ __device__ aabb hittable::bounding_box() const {
         return rotate_y_bounding_box(static_cast<rotate_y*>(object));
         case UNIFORM_SCALE:
         return uniform_scale_bounding_box(static_cast<uniform_scale*>(object));
+        case TRANSFORM:
+        return transform_bounding_box(static_cast<transform*>(object));
         case CONSTANT_MEDIUM:
         return constant_medium_bounding_box(static_cast<constant_medium*>(object));
         case BVH:

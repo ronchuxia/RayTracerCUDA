@@ -151,6 +151,96 @@ struct uniform_scale {
   }
 };
 
+// Full TRS instance transform: translation + Euler rotation (degrees) +
+// per-axis scale, in one node (vs. chaining translate/rotate_y/uniform_scale).
+// Rotation order is fixed R = Rz * Ry * Rx (apply X, then Y, then Z). The
+// forward map (object -> world) of a point is  p_world = T + R (S . p_obj),
+// where "." is per-component scale. The rotation matrix rows are cached in m[];
+// scale's reciprocal in inv_scale.
+struct transform {
+  hittable* child;
+  vec3 translation;
+  vec3 rotation;    // Euler angles in DEGREES (kept for the editor to read back)
+  vec3 scale;
+  vec3 inv_scale;   // 1 / scale, per component
+  vec3 m[3];        // rows of the combined rotation matrix R
+  aabb bbox;
+
+  // R * v  (m holds R's rows)
+  __host__ __device__ vec3 apply_R(const vec3& v) const {
+    return vec3(dot(m[0], v), dot(m[1], v), dot(m[2], v));
+  }
+  // R^T * v  (= R^-1 v, since R is orthonormal): columns of R are v-weighted rows
+  __host__ __device__ vec3 apply_Rt(const vec3& v) const {
+    return v.x() * m[0] + v.y() * m[1] + v.z() * m[2];
+  }
+
+  transform(hittable* _child, const vec3& t, const vec3& rot_deg, const vec3& s)
+  : child(_child), translation(t), rotation(rot_deg), scale(s) {
+    inv_scale = vec3(real(1) / s.x(), real(1) / s.y(), real(1) / s.z());
+
+    real a = degrees_to_radians(rot_deg.x());
+    real b = degrees_to_radians(rot_deg.y());
+    real g = degrees_to_radians(rot_deg.z());
+    real ca = cos(a), sa = sin(a), cb = cos(b), sb = sin(b), cg = cos(g), sg = sin(g);
+
+    // R = Rz(g) * Ry(b) * Rx(a), stored as rows (standard Tait-Bryan ZYX).
+    m[0] = vec3(cg*cb, cg*sb*sa - sg*ca, cg*sb*ca + sg*sa);
+    m[1] = vec3(sg*cb, sg*sb*sa + cg*ca, sg*sb*ca - cg*sa);
+    m[2] = vec3(  -sb,            cb*sa,            cb*ca);
+
+    // bbox of the transformed child. A SPHERE is the one leaf whose AABB (a
+    // cube) is looser than its geometry, so rotating that cube's 8 corners would
+    // spuriously inflate the box — even though a sphere's AABB is rotation-
+    // invariant. Bound the exact transformed sphere (an ellipsoid) instead:
+    // center via the forward map, half-extent along world axis k =
+    // radius * || row_k(R · diag(scale)) ||. Every OTHER leaf (quad/triangle/box)
+    // equals its AABB corners, so transforming those corners is already tight.
+    auto inf = std::numeric_limits<real>::infinity();
+    point3 lo( inf,  inf,  inf), hi(-inf, -inf, -inf);
+    if (child->type == SPHERE) {
+      const sphere* sp = static_cast<const sphere*>(child->object);
+      vec3 center = apply_R(sp->center * scale) + translation;   // ellipsoid center
+      vec3 ext;
+      for (int k = 0; k < 3; k++) {
+        vec3 row(m[k].x() * scale.x(), m[k].y() * scale.y(), m[k].z() * scale.z());
+        ext[k] = sp->radius * row.length();
+      }
+      lo = center - ext;  hi = center + ext;
+    } else {
+      aabb c = child->bounding_box();
+      for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+          for (int k = 0; k < 2; k++) {
+            vec3 corner(i ? c.x.max : c.x.min, j ? c.y.max : c.y.min, k ? c.z.max : c.z.min);
+            vec3 w = apply_R(corner * scale) + translation;   // object -> world
+            for (int d = 0; d < 3; d++) { lo[d] = fmin(lo[d], w[d]); hi[d] = fmax(hi[d], w[d]); }
+          }
+    }
+    bbox = aabb(lo, hi);
+  }
+
+  __host__ __device__ aabb bounding_box() const { return bbox; }
+
+  __device__ bool hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const {
+    // World -> object: o' = S^-1 R^T (o - T), d' = S^-1 R^T d. Direction is left
+    // UNNORMALIZED so the child's hit t carries back to world space unchanged.
+    vec3 o = apply_Rt(r.origin() - translation) * inv_scale;
+    vec3 d = apply_Rt(r.direction()) * inv_scale;
+
+    if (!child->hit(ray(o, d), ray_t, rec, state))
+        return false;
+
+    // Object -> world: point via the forward map; normal via the
+    // inverse-transpose (R * S^-1), renormalized (non-uniform scale changes its
+    // length). The sign of dot(dir, normal) is preserved by this pair, so the
+    // child's front_face flag stays valid.
+    rec.p = apply_R(rec.p * scale) + translation;
+    rec.normal = unit_vector(apply_R(rec.normal * inv_scale));
+    return true;
+  }
+};
+
 // Dispatch shims declared in hittable.h (before the transforms are complete)
 // and defined here, so hittable's switches can route to them.
 __device__ bool translate_hit(const translate* t, const ray& r, interval ray_t, hit_record& rec, curandState* state) {
@@ -175,6 +265,14 @@ __device__ bool uniform_scale_hit(const uniform_scale* s, const ray& r, interval
 
 __host__ __device__ aabb uniform_scale_bounding_box(const uniform_scale* s) {
     return s->bounding_box();
+}
+
+__device__ bool transform_hit(const transform* t, const ray& r, interval ray_t, hit_record& rec, curandState* state) {
+    return t->hit(r, ray_t, rec, state);
+}
+
+__host__ __device__ aabb transform_bounding_box(const transform* t) {
+    return t->bounding_box();
 }
 
 #endif // TRANSFORMS_H

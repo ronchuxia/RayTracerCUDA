@@ -274,4 +274,24 @@ inline hittable* new_uniform_scale(hittable* child, double scale,
     return h;
 }
 
+// Full TRS wrapper (translate + Euler-degrees rotation + per-axis scale) in one
+// node — what the viewer registers so any object gets uniform T/R/S editing.
+inline hittable* new_transform(hittable* child, const vec3& translation,
+                               const vec3& rotation, const vec3& scale,
+                               std::vector<void*>& allocs) {
+    transform* t;
+    checkCudaErrors(cudaMallocManaged((void**)&t, sizeof(transform)));
+    new(t) transform(child, translation, rotation, scale);
+
+    hittable* h;
+    checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
+    h->type = TRANSFORM;
+    h->id = -1;
+    h->object = t;
+
+    allocs.push_back(t);
+    allocs.push_back(h);
+    return h;
+}
+
 #endif // SCENE_UTILS_H
