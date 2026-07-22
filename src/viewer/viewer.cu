@@ -91,6 +91,7 @@
 #endif
 
 #include "camera.h"
+#include "physics.h"
 #include "scene.h"
 #include "scenes/scene_utils.h"
 
@@ -143,33 +144,6 @@ __global__ void pick(const camera& cam, const hittable& world, int px, int py,
 
 __global__ void initialize_rand_pick(curandState* state, unsigned long seed) {
     curand_init(seed, 0, 0, state);
-}
-
-// --- D physics: a simulated rigid sphere (equal mass = 1 for the MVP). `id` is
-// its scene-object id; baseR/baseS carry the transform's rotation/scale so the
-// pose can be rebuilt as transform(child, pos, baseR, baseS).
-struct phys_body { int id; vec3 pos, vel; real radius; vec3 baseR, baseS; };
-
-// Sphere-sphere collision: if overlapping, split the penetration and apply an
-// equal-mass restitution impulse along the contact normal (only if approaching).
-static void resolve_sphere_pair(phys_body& a, phys_body& b, real e) {
-    vec3 d = a.pos - b.pos;                       // b -> a
-    real dist2 = d.length_squared();
-    real rsum = a.radius + b.radius;
-    if (dist2 >= rsum * rsum || dist2 < real(1e-12)) return;
-    real dist = sqrt(dist2);
-    vec3 n = d / dist;
-    real pen = rsum - dist;
-    vec3 half = n * (pen * real(0.5));
-    a.pos += half;                                // positional correction (split)
-    b.pos = b.pos - half;
-    real vrel = dot(a.vel - b.vel, n);
-    if (vrel < 0) {                               // approaching -> impulse
-        real j = -(real(1) + e) * vrel / real(2); // (1/m_a + 1/m_b) = 2 at m = 1
-        vec3 imp = n * j;
-        a.vel += imp;
-        b.vel = b.vel - imp;
-    }
 }
 
 // --- scene: checker ground + editable objects, sky-lit. Every editable object
@@ -462,11 +436,11 @@ int main(int argc, char** argv) {
     bool   animating   = false;   // Play/pause the sim (Drop launches it)
     bool   asleep      = false;   // all settled -> stop stepping + resetting accumulation
     int    still_steps = 0;       // consecutive fixed steps with every body slow
-    double sim_accum   = 0.0;     // fixed-step time accumulator (real seconds)
+    double phys_accum   = 0.0;     // fixed-step time accumulator (real seconds)
     float  gravity     = -9.8f;   // world units / s^2 (negative = down)
     float  restitution = 0.7f;    // bounce energy retained (0..1)
     float  drop_height = 3.0f;    // spawn height above the ground
-    const double PHYS_H = 1.0 / 240.0;  // fixed integration step
+    const double PHYS_DT = 1.0 / 240.0;  // fixed integration step
     const int    PHYS_MAX_STEPS = 8;    // per-frame substep cap (spiral-of-death guard)
     const real   SLEEP_VEL   = real(0.1);// per-body speed under which a body is "still"
     const int    SLEEP_STEPS = 60;       // all-still for this many steps (~0.25s) => sleep
@@ -539,7 +513,7 @@ int main(int argc, char** argv) {
             bodies[i].pos = vec3(ox, drop_height + real(1.8) * real(i), oz);
             bodies[i].vel = vec3(0, 0, 0);
         }
-        sim_accum   = 0.0;
+        phys_accum   = 0.0;
         asleep      = false;
         still_steps = 0;
         animating   = true;
@@ -791,39 +765,22 @@ int main(int argc, char** argv) {
 
         if (camera_dirty) rebuild_camera();   // recompute view + reset accumulation
 
-        // D (physics): fixed-step gravity + ground bounce + sphere-sphere
-        // collision over all bodies. Wall dt drives a fixed-h accumulator
-        // (frame-rate independent), clamped to PHYS_MAX_STEPS. Each stepped frame
-        // rewrites every body's transform (B5 mutation protocol) and restarts
-        // accumulation; when ALL bodies stay slow for SLEEP_STEPS the sim sleeps
-        // (stops resetting) so the image converges.
+        // D (physics): the wall-clock accumulator DRIVES the fixed-step
+        // integrator (physics.h::physics_step); this loop is the driver + the
+        // coupling. Wall dt is clamped to PHYS_MAX_STEPS (spiral-of-death guard);
+        // each stepped frame rewrites every body's transform (B5 mutation
+        // protocol) and restarts accumulation; when ALL bodies stay slow for
+        // SLEEP_STEPS the sim sleeps (stops resetting) so the image converges.
         if (animating && !asleep && !bodies.empty()) {
-            sim_accum += ImGui::GetIO().DeltaTime;
-            const double cap = PHYS_H * PHYS_MAX_STEPS;
-            if (sim_accum > cap) sim_accum = cap;     // spiral-of-death clamp
+            const phys_params pp{ real(gravity), real(restitution), GROUND_FRICTION };
+            phys_accum += ImGui::GetIO().DeltaTime;
+            const double cap = PHYS_DT * PHYS_MAX_STEPS;
+            if (phys_accum > cap) phys_accum = cap;     // spiral-of-death clamp
             bool stepped = false;
-            while (sim_accum >= PHYS_H) {
-                const real h = real(PHYS_H);
-                for (phys_body& b : bodies) {                 // integrate + ground
-                    b.vel[1] += gravity * h;
-                    b.pos    += b.vel * h;
-                    if (b.pos[1] - b.radius <= 0) {
-                        b.pos[1] = b.radius;
-                        b.vel[1] = -restitution * b.vel[1];
-                    }
-                    if (b.pos[1] <= b.radius + real(1e-3)) {  // grounded: tangential friction
-                        b.vel[0] *= GROUND_FRICTION;
-                        b.vel[2] *= GROUND_FRICTION;
-                    }
-                }
-                for (int it = 0; it < 2; it++)                // sphere-sphere (relax)
-                    for (size_t i = 0; i < bodies.size(); i++)
-                        for (size_t j = i + 1; j < bodies.size(); j++)
-                            resolve_sphere_pair(bodies[i], bodies[j], restitution);
-                real maxv = 0;                                // global still tracking
-                for (phys_body& b : bodies) maxv = fmax(maxv, b.vel.length());
+            while (phys_accum >= PHYS_DT) {
+                real maxv = physics_step(bodies, pp, real(PHYS_DT));
                 if (maxv < SLEEP_VEL) still_steps++; else still_steps = 0;
-                sim_accum -= PHYS_H;
+                phys_accum -= PHYS_DT;
                 stepped = true;
             }
             if (still_steps > SLEEP_STEPS) asleep = true;
