@@ -421,15 +421,25 @@ int main(int argc, char** argv) {
     bool show_performance = true, show_samples = true, show_config = true, show_camera = true;
     bool show_selection = true, show_dynamic = true;
 
-    // ---- C (dynamic scene): time-driven object motion ----
-    // While playing, one demo object bounces via the B5 mutation protocol
-    // (rewrite transform -> refit -> reset accumulation) each frame. The base
-    // (rest) pose is initial_trs[anim_id]; motion offsets from it.
-    bool   animating   = false;
-    double anim_time   = 0.0;
-    float  anim_speed  = 3.0f;   // bounce angular frequency
-    float  anim_height = 1.5f;   // bounce peak above rest
-    const int anim_id  = 3;      // the metal sphere is the demo's moving object
+    // ---- C/D: dynamic scene — physics-simulated object ----
+    // One demo body (a sphere) falls under gravity and bounces on the ground
+    // plane (y=0). Each simulated frame rewrites its transform via the B5
+    // mutation protocol (placement-new -> refit -> reset accumulation). The
+    // integrator steps a FIXED dt (accumulator-paced against wall time), so
+    // behaviour is frame-rate-independent; when the body settles it SLEEPS,
+    // stopping the accumulation reset so the image converges. Rest pose is
+    // initial_trs[anim_id]; the body spawns drop_height above it.
+    bool   animating   = false;   // Play/pause the sim (Drop launches it)
+    bool   asleep      = false;   // settled -> stop stepping + resetting accumulation
+    double sim_accum   = 0.0;     // fixed-step time accumulator (real seconds)
+    vec3   phys_pos, phys_vel;    // world center + velocity of the simulated sphere
+    float  gravity     = -9.8f;   // world units / s^2 (negative = down)
+    float  restitution = 0.7f;    // bounce energy retained (0..1)
+    float  drop_height = 3.0f;    // spawn height above the rest pose
+    const int anim_id  = 3;       // the metal sphere is the simulated body
+    const double PHYS_H = 1.0 / 240.0;  // fixed integration step
+    const int    PHYS_MAX_STEPS = 8;    // per-frame substep cap (spiral-of-death guard)
+    const real   SLEEP_VEL = real(0.08);// |v| below this on the ground => sleep
 
     // ---- B4 picking state ----
     // A click (press+release with ≤2 px of motion) picks; a drag orbits.
@@ -469,6 +479,17 @@ int main(int argc, char** argv) {
     auto reset_accumulation = [&]() {
         checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
         total_samples = 0;
+    };
+
+    // D: (re)launch the simulated body — lift it drop_height above its rest pose
+    // with zero velocity and wake the sim. Rest pose = initial_trs[anim_id].
+    auto drop_ball = [&]() {
+        const init_trs& base = initial_trs[anim_id];
+        phys_pos  = base.t + vec3(0, drop_height, 0);
+        phys_vel  = vec3(0, 0, 0);
+        sim_accum = 0.0;
+        asleep    = false;
+        animating = true;
     };
 
     // Rebuild the camera from the orbit state and reset accumulation. Called
@@ -626,9 +647,12 @@ int main(int argc, char** argv) {
 
             if (show_dynamic) {
                 section_break();
-                ImGui::Checkbox("Play", &animating);   // C: time-driven motion
-                ImGui::SliderFloat("speed",  &anim_speed,  0.2f, 8.0f, "%.1f");
-                ImGui::SliderFloat("height", &anim_height, 0.0f, 4.0f, "%.1f");
+                if (ImGui::Button("Drop")) drop_ball();   // D: launch the sim
+                ImGui::SameLine();
+                ImGui::Checkbox("Play", &animating);      // pause/resume
+                ImGui::SliderFloat("gravity",     &gravity,     -30.0f, 0.0f, "%.1f");
+                ImGui::SliderFloat("restitution", &restitution,   0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("drop height",  &drop_height,  0.0f, 8.0f, "%.1f");
             }
 
             if (show_camera) {
@@ -714,18 +738,40 @@ int main(int argc, char** argv) {
 
         if (camera_dirty) rebuild_camera();   // recompute view + reset accumulation
 
-        // C (dynamic scene): while playing, move the demo object each frame via
-        // the B5 mutation protocol, then restart accumulation (it moved, so prior
-        // samples are stale). Paused => the hook stops firing and the image
-        // converges in place. One fixed object today; per-object motion later.
-        if (animating) {
-            anim_time += ImGui::GetIO().DeltaTime * anim_speed;
-            hittable* h = sc.get(anim_id);
-            if (h && h->type == TRANSFORM && initial_trs[anim_id].editable) {
-                const init_trs& base = initial_trs[anim_id];
-                real y = anim_height * fabs(sin(anim_time));   // |sin| = elastic bounce
-                transform* tr = static_cast<transform*>(h->object);
-                new(tr) transform(tr->child, base.t + vec3(0, y, 0), base.r, base.s);
+        // D (physics): fixed-step gravity + ground-plane bounce on the simulated
+        // body. Wall dt drives a fixed-h accumulator (frame-rate independent),
+        // clamped to PHYS_MAX_STEPS to avoid the spiral of death. Each stepped
+        // frame rewrites the transform (B5 mutation protocol) and restarts
+        // accumulation; when the body settles it SLEEPS so the image converges.
+        hittable* body = sc.get(anim_id);
+        if (animating && !asleep && body && body->type == TRANSFORM
+            && initial_trs[anim_id].editable) {
+            const init_trs& base = initial_trs[anim_id];
+            transform* tr = static_cast<transform*>(body->object);
+            real radius = real(1);   // vertical extent of the sphere on the ground
+            if (tr->child->type == SPHERE)
+                radius = static_cast<sphere*>(tr->child->object)->radius * base.s.y();
+
+            sim_accum += ImGui::GetIO().DeltaTime;
+            const double cap = PHYS_H * PHYS_MAX_STEPS;
+            if (sim_accum > cap) sim_accum = cap;     // spiral-of-death clamp
+            bool stepped = false;
+            while (sim_accum >= PHYS_H) {
+                phys_vel[1] += gravity * real(PHYS_H);        // gravity (y only)
+                phys_pos    += phys_vel * real(PHYS_H);       // integrate
+                if (phys_pos[1] - radius <= 0) {              // ground collision
+                    phys_pos[1] = radius;
+                    phys_vel[1] = -restitution * phys_vel[1];
+                }
+                sim_accum -= PHYS_H;
+                stepped = true;
+            }
+            // Sleep once settled on the ground, so accumulation can converge.
+            if (phys_pos[1] <= radius + real(1e-3) && phys_vel.length() < SLEEP_VEL) {
+                phys_pos[1] = radius; phys_vel = vec3(0, 0, 0); asleep = true;
+            }
+            if (stepped) {   // apply pose -> refit -> restart accumulation
+                new(tr) transform(tr->child, point3(phys_pos), base.r, base.s);
                 sc.refit();
                 reset_accumulation();
             }
