@@ -419,7 +419,17 @@ int main(int argc, char** argv) {
 
     // Which sections of the Renderer panel are visible (toggled in View menu).
     bool show_performance = true, show_samples = true, show_config = true, show_camera = true;
-    bool show_selection = true;
+    bool show_selection = true, show_dynamic = true;
+
+    // ---- C (dynamic scene): time-driven object motion ----
+    // While playing, one demo object bounces via the B5 mutation protocol
+    // (rewrite transform -> refit -> reset accumulation) each frame. The base
+    // (rest) pose is initial_trs[anim_id]; motion offsets from it.
+    bool   animating   = false;
+    double anim_time   = 0.0;
+    float  anim_speed  = 3.0f;   // bounce angular frequency
+    float  anim_height = 1.5f;   // bounce peak above rest
+    const int anim_id  = 3;      // the metal sphere is the demo's moving object
 
     // ---- B4 picking state ----
     // A click (press+release with ≤2 px of motion) picks; a drag orbits.
@@ -548,6 +558,7 @@ int main(int argc, char** argv) {
                 ImGui::MenuItem("Config",  nullptr, &show_config);
                 ImGui::MenuItem("Camera",  nullptr, &show_camera);
                 ImGui::MenuItem("Selection", nullptr, &show_selection);
+                ImGui::MenuItem("Dynamic", nullptr, &show_dynamic);
                 ImGui::EndMenu();
             }
             ImGui::EndMainMenuBar();
@@ -611,6 +622,13 @@ int main(int argc, char** argv) {
                     cam->max_depth = max_depth0;
                     cam->vfov      = vfov0;
                 }
+            }
+
+            if (show_dynamic) {
+                section_break();
+                ImGui::Checkbox("Play", &animating);   // C: time-driven motion
+                ImGui::SliderFloat("speed",  &anim_speed,  0.2f, 8.0f, "%.1f");
+                ImGui::SliderFloat("height", &anim_height, 0.0f, 4.0f, "%.1f");
             }
 
             if (show_camera) {
@@ -695,6 +713,23 @@ int main(int argc, char** argv) {
         }
 
         if (camera_dirty) rebuild_camera();   // recompute view + reset accumulation
+
+        // C (dynamic scene): while playing, move the demo object each frame via
+        // the B5 mutation protocol, then restart accumulation (it moved, so prior
+        // samples are stale). Paused => the hook stops firing and the image
+        // converges in place. One fixed object today; per-object motion later.
+        if (animating) {
+            anim_time += ImGui::GetIO().DeltaTime * anim_speed;
+            hittable* h = sc.get(anim_id);
+            if (h && h->type == TRANSFORM && initial_trs[anim_id].editable) {
+                const init_trs& base = initial_trs[anim_id];
+                real y = anim_height * fabs(sin(anim_time));   // |sin| = elastic bounce
+                transform* tr = static_cast<transform*>(h->object);
+                new(tr) transform(tr->child, base.t + vec3(0, y, 0), base.r, base.s);
+                sc.refit();
+                reset_accumulation();
+            }
+        }
 
         // B2: add spp_per_frame fresh samples per pixel until the target is
         // reached; after that just keep presenting the converged image.
