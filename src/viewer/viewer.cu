@@ -90,13 +90,15 @@
 #define RT_SKY 1            // viewer lights the scene with the sky gradient
 #endif
 #ifndef VIEWER_SCENE
-#define VIEWER_SCENE 0      // 0 = B5 editing showcase; 1 = physics container (balls in a box)
+#define VIEWER_SCENE 0      // 0 = primitives (one of each prim, editable); 1 = ball pit (physics)
 #endif
 
 #include "camera.h"
 #include "physics.h"
 #include "scene.h"
 #include "scenes/scene_utils.h"
+#include "viewer/scenes/primitives.h"
+#include "viewer/scenes/ball_pit.h"
 
 // --- device tonemap: accumulator (sum of samples) -> RGBA8 -------------------
 // Per pixel, calls color.h's shared tonemap_pixel (the same routine the offline
@@ -149,95 +151,6 @@ __global__ void initialize_rand_pick(curandState* state, unsigned long seed) {
     curand_init(seed, 0, 0, state);
 }
 
-// Physics-scene container: floor (the ground plane) + 4 walls, open top. BOX_HALF
-// is the half-width on x/z, BOX_H the wall height; the wall quads and the physics
-// wall bounds (phys_params) are both derived from these so they stay in sync.
-static constexpr float BOX_HALF = 1.3f;
-static constexpr float BOX_H    = 3.0f;
-static constexpr int   BALL_N   = 8;      // spheres in the physics scene
-static constexpr float BALL_R   = 0.5f;
-
-// --- SHOWCASE scene (VIEWER_SCENE 0): checker ground + editable objects, sky-lit.
-// Every editable object (spheres, a box, a triangle — one of each prim type) is
-// registered as a transform(prim), so B5 can drive full T/R/S on any of them
-// uniformly. The underlying prims are UNIT and centred at the origin; the
-// transform supplies position and size. The ground stays a plain sphere — it's
-// the floor, not something you manipulate. Ids are registration order.
-static void build_showcase_scene(scene& sc) {
-    sc.init();
-
-    material* ground  = new_lambertian(
-        make_checker(0.32, color(.2, .3, .1), color(.9, .9, .9)), sc.allocs);
-    material* diffuse = new_lambertian(color(0.4, 0.2, 0.1), sc.allocs);
-    material* glass   = new_dielectric(1.5, sc.allocs);
-    material* metal_m = new_metal(color(0.7, 0.6, 0.5), 0.0, sc.allocs);
-    material* box_mat = new_lambertian(color(0.2, 0.4, 0.7), sc.allocs);
-    material* tri_mat = new_lambertian(color(0.9, 0.75, 0.2), sc.allocs);
-
-    sc.add(make_sphere(point3(0, -1000, 0), 1000, ground, sc.allocs));   // id 0: floor (plain)
-
-    // Editable objects: unit prim at origin + transform(T, R°, S).
-    sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, diffuse, sc.allocs),
-                         vec3(-4, 1, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 1: diffuse sphere
-    sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, glass, sc.allocs),
-                         vec3(0, 1, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));    // id 2: glass sphere
-    sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, metal_m, sc.allocs),
-                         vec3(4, 1, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));    // id 3: metal sphere
-    sc.add(new_transform(new_box(point3(-0.6,-0.6,-0.6), point3(0.6,0.6,0.6), box_mat, sc.allocs, sc.list_dtors),
-                         vec3(-2, 0.6, -3), vec3(0, 35, 0), vec3(1,1,1), sc.allocs));  // id 4: box (composite)
-    sc.add(new_transform(make_triangle(point3(-0.8,-0.6,0), point3(0.8,-0.6,0), point3(0,0.9,0),
-                                       vec3(0,0,1), tri_mat, sc.allocs),
-                         vec3(2, 1.3, -3), vec3(0,0,0), vec3(1,1,1), sc.allocs));      // id 5: triangle
-
-    sc.build();
-}
-
-// --- PHYSICS scene (VIEWER_SCENE 1): a container (checker ground + 4 walls, open
-// top) with BALL_N diffuse spheres to drop and collide. Each sphere is a UNIT
-// prim scaled to BALL_R and transform-wrapped, so the physics-body scan (which
-// selects transform-wrapped spheres) picks them up; the walls are plain static
-// quads (not bodies, not editable). Wall positions match the phys_params bounds.
-static void build_physics_scene(scene& sc) {
-    sc.init();
-
-    material* ground = new_lambertian(
-        make_checker(0.6, color(.2, .3, .1), color(.9, .9, .9)), sc.allocs);
-    material* wall   = new_lambertian(color(0.55, 0.55, 0.6), sc.allocs);
-
-    sc.add(make_sphere(point3(0, -1000, 0), 1000, ground, sc.allocs));   // id 0: floor
-
-    // 4 walls: quads spanning z (or x) horizontally and y=[0,BOX_H] vertically.
-    const real W = real(BOX_HALF), H = real(BOX_H);
-    sc.add(make_quad(point3(-W, 0, -W), vec3(0, 0, 2*W), vec3(0, H, 0), wall, sc.allocs));  // x = -W
-    sc.add(make_quad(point3( W, 0, -W), vec3(0, 0, 2*W), vec3(0, H, 0), wall, sc.allocs));  // x = +W
-    sc.add(make_quad(point3(-W, 0, -W), vec3(2*W, 0, 0), vec3(0, H, 0), wall, sc.allocs));  // z = -W
-    sc.add(make_quad(point3(-W, 0,  W), vec3(2*W, 0, 0), vec3(0, H, 0), wall, sc.allocs));  // z = +W
-
-    // BALL_N diffuse spheres, resting in a grid on the floor (Drop launches them).
-    const int cols = 3;
-    for (int i = 0; i < BALL_N; i++) {
-        int r = i / cols, c = i % cols;
-        real x = (real(c) - 1) * real(1.0);          // grid centred on the floor
-        real z = (real(r) - 1) * real(1.0);
-        color col(0.5 + 0.4 * ((i * 37) % 7) / 6.0,  // spread hues deterministically
-                  0.5 + 0.4 * ((i * 53) % 5) / 4.0,
-                  0.5 + 0.4 * ((i * 29) % 3) / 2.0);
-        material* m = new_lambertian(col, sc.allocs);
-        sc.add(new_transform(make_sphere(point3(0,0,0), BALL_R, m, sc.allocs),
-                             vec3(x, BALL_R, z), vec3(0,0,0), vec3(1,1,1), sc.allocs));
-    }
-
-    sc.build();
-}
-
-static void build_viewer_scene(scene& sc) {
-#if VIEWER_SCENE == 1
-    build_physics_scene(sc);
-#else
-    build_showcase_scene(sc);
-#endif
-}
-
 int main(int argc, char** argv) {
     bool headless = false;
     int frames = RT_FRAMES;          // --frames N: headless accumulation count
@@ -278,20 +191,26 @@ int main(int argc, char** argv) {
     camera* cam;
     checkCudaErrors(cudaMallocManaged((void**)&cam, sizeof(camera)));
     new(cam) camera();
+
+    // Build the scene first: its viewer_scene config supplies the initial camera
+    // and (physics scene) the collision wall bounds — one place per scene, no
+    // scattered `#if VIEWER_SCENE`.
+    scene sc;
+#if VIEWER_SCENE == 1
+    const viewer_scene vs = build_ball_pit_scene(sc);
+#else
+    const viewer_scene vs = build_primitives_scene(sc);
+#endif
+    hittable& world = sc.root();
+
     cam->aspect_ratio      = 16.0 / 9.0;
     cam->image_width       = RT_IMAGE_WIDTH;
     cam->samples_per_pixel = spp_per_frame;   // per accumulation pass (B2)
     cam->max_depth         = RT_MAX_DEPTH;
     cam->seed              = RT_SEED;
-#if VIEWER_SCENE == 1
-    cam->vfov     = 35;                       // physics scene: look down into the container
-    cam->lookfrom = point3(4.5, 4.5, 4.5);
-    cam->lookat   = point3(0, 0.5, 0);
-#else
-    cam->vfov     = 20;                       // showcase scene
-    cam->lookfrom = point3(13, 2, 3);
-    cam->lookat   = point3(0, 0, 0);
-#endif
+    cam->vfov     = vs.vfov;
+    cam->lookfrom = vs.lookfrom;
+    cam->lookat   = vs.lookat;
     cam->vup      = vec3(0, 1, 0);
     cam->defocus_angle = 0;
     cam->focus_dist    = 10.0;
@@ -370,14 +289,11 @@ int main(int argc, char** argv) {
         checkCudaErrors(cudaMallocHost(&h_rgba, frame_bytes));
     }
 
-    // ---- build scene + accumulation buffers ----
+    // ---- accumulation buffers ----
     // Raise the device stack limit like the offline scenes do: the recursive
-    // hittable dispatch (world BVH → shapes) can exceed the 1 KB default.
+    // hittable dispatch (world BVH → shapes) can exceed the 1 KB default. (The
+    // scene itself was already built above, to source the camera from it.)
     checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
-
-    scene sc;
-    build_viewer_scene(sc);
-    hittable& world = sc.root();
 
     // Snapshot each editable object's initial T/R/S so the Selection panel's
     // "Reset transform" button (B5) can restore it. Indexed by scene id; a
@@ -509,14 +425,8 @@ int main(int argc, char** argv) {
     const int    SLEEP_STEPS = 60;       // all-still for this many steps (~0.25s) => sleep
     const real   GROUND_FRICTION = real(0.99);  // tangential velocity retained per grounded step
                                                 // (without it, a frictionless ground slides forever)
-    // Container walls (physics scene only); +/- huge = no walls (showcase scene).
-#if VIEWER_SCENE == 1
-    const vec3 wall_min(real(-BOX_HALF), 0, real(-BOX_HALF));
-    const vec3 wall_max(real( BOX_HALF), 0, real( BOX_HALF));
-#else
-    const vec3 wall_min(real(-1e30), 0, real(-1e30));
-    const vec3 wall_max(real( 1e30), 0, real( 1e30));
-#endif
+    // Container walls come from the scene config (+/- huge = no walls).
+    const vec3 wall_min = vs.wall_min, wall_max = vs.wall_max;
 
     // A body per transform-wrapped sphere (excludes the plain-sphere ground and
     // the box/triangle). pos seeds from the rest pose; radius = sphere.radius * scale.
