@@ -89,6 +89,9 @@
 #ifndef RT_SKY
 #define RT_SKY 1            // viewer lights the scene with the sky gradient
 #endif
+#ifndef VIEWER_SCENE
+#define VIEWER_SCENE 0      // 0 = B5 editing showcase; 1 = physics container (balls in a box)
+#endif
 
 #include "camera.h"
 #include "physics.h"
@@ -146,13 +149,21 @@ __global__ void initialize_rand_pick(curandState* state, unsigned long seed) {
     curand_init(seed, 0, 0, state);
 }
 
-// --- scene: checker ground + editable objects, sky-lit. Every editable object
-// (spheres, a box, a triangle — one of each prim type) is registered as a
-// transform(prim), so B5 can drive full T/R/S on any of them uniformly. The
-// underlying prims are UNIT and centred at the origin; the transform supplies
-// position (translation) and size (scale). The ground stays a plain sphere —
-// it's the floor, not something you manipulate. Ids are registration order.
-static void build_viewer_scene(scene& sc) {
+// Physics-scene container: floor (the ground plane) + 4 walls, open top. BOX_HALF
+// is the half-width on x/z, BOX_H the wall height; the wall quads and the physics
+// wall bounds (phys_params) are both derived from these so they stay in sync.
+static constexpr float BOX_HALF = 1.3f;
+static constexpr float BOX_H    = 3.0f;
+static constexpr int   BALL_N   = 8;      // spheres in the physics scene
+static constexpr float BALL_R   = 0.5f;
+
+// --- SHOWCASE scene (VIEWER_SCENE 0): checker ground + editable objects, sky-lit.
+// Every editable object (spheres, a box, a triangle — one of each prim type) is
+// registered as a transform(prim), so B5 can drive full T/R/S on any of them
+// uniformly. The underlying prims are UNIT and centred at the origin; the
+// transform supplies position and size. The ground stays a plain sphere — it's
+// the floor, not something you manipulate. Ids are registration order.
+static void build_showcase_scene(scene& sc) {
     sc.init();
 
     material* ground  = new_lambertian(
@@ -179,6 +190,52 @@ static void build_viewer_scene(scene& sc) {
                          vec3(2, 1.3, -3), vec3(0,0,0), vec3(1,1,1), sc.allocs));      // id 5: triangle
 
     sc.build();
+}
+
+// --- PHYSICS scene (VIEWER_SCENE 1): a container (checker ground + 4 walls, open
+// top) with BALL_N diffuse spheres to drop and collide. Each sphere is a UNIT
+// prim scaled to BALL_R and transform-wrapped, so the physics-body scan (which
+// selects transform-wrapped spheres) picks them up; the walls are plain static
+// quads (not bodies, not editable). Wall positions match the phys_params bounds.
+static void build_physics_scene(scene& sc) {
+    sc.init();
+
+    material* ground = new_lambertian(
+        make_checker(0.6, color(.2, .3, .1), color(.9, .9, .9)), sc.allocs);
+    material* wall   = new_lambertian(color(0.55, 0.55, 0.6), sc.allocs);
+
+    sc.add(make_sphere(point3(0, -1000, 0), 1000, ground, sc.allocs));   // id 0: floor
+
+    // 4 walls: quads spanning z (or x) horizontally and y=[0,BOX_H] vertically.
+    const real W = real(BOX_HALF), H = real(BOX_H);
+    sc.add(make_quad(point3(-W, 0, -W), vec3(0, 0, 2*W), vec3(0, H, 0), wall, sc.allocs));  // x = -W
+    sc.add(make_quad(point3( W, 0, -W), vec3(0, 0, 2*W), vec3(0, H, 0), wall, sc.allocs));  // x = +W
+    sc.add(make_quad(point3(-W, 0, -W), vec3(2*W, 0, 0), vec3(0, H, 0), wall, sc.allocs));  // z = -W
+    sc.add(make_quad(point3(-W, 0,  W), vec3(2*W, 0, 0), vec3(0, H, 0), wall, sc.allocs));  // z = +W
+
+    // BALL_N diffuse spheres, resting in a grid on the floor (Drop launches them).
+    const int cols = 3;
+    for (int i = 0; i < BALL_N; i++) {
+        int r = i / cols, c = i % cols;
+        real x = (real(c) - 1) * real(1.0);          // grid centred on the floor
+        real z = (real(r) - 1) * real(1.0);
+        color col(0.5 + 0.4 * ((i * 37) % 7) / 6.0,  // spread hues deterministically
+                  0.5 + 0.4 * ((i * 53) % 5) / 4.0,
+                  0.5 + 0.4 * ((i * 29) % 3) / 2.0);
+        material* m = new_lambertian(col, sc.allocs);
+        sc.add(new_transform(make_sphere(point3(0,0,0), BALL_R, m, sc.allocs),
+                             vec3(x, BALL_R, z), vec3(0,0,0), vec3(1,1,1), sc.allocs));
+    }
+
+    sc.build();
+}
+
+static void build_viewer_scene(scene& sc) {
+#if VIEWER_SCENE == 1
+    build_physics_scene(sc);
+#else
+    build_showcase_scene(sc);
+#endif
 }
 
 int main(int argc, char** argv) {
@@ -226,9 +283,15 @@ int main(int argc, char** argv) {
     cam->samples_per_pixel = spp_per_frame;   // per accumulation pass (B2)
     cam->max_depth         = RT_MAX_DEPTH;
     cam->seed              = RT_SEED;
-    cam->vfov     = 20;
+#if VIEWER_SCENE == 1
+    cam->vfov     = 35;                       // physics scene: look down into the container
+    cam->lookfrom = point3(4.5, 4.5, 4.5);
+    cam->lookat   = point3(0, 0.5, 0);
+#else
+    cam->vfov     = 20;                       // showcase scene
     cam->lookfrom = point3(13, 2, 3);
     cam->lookat   = point3(0, 0, 0);
+#endif
     cam->vup      = vec3(0, 1, 0);
     cam->defocus_angle = 0;
     cam->focus_dist    = 10.0;
@@ -446,6 +509,14 @@ int main(int argc, char** argv) {
     const int    SLEEP_STEPS = 60;       // all-still for this many steps (~0.25s) => sleep
     const real   GROUND_FRICTION = real(0.99);  // tangential velocity retained per grounded step
                                                 // (without it, a frictionless ground slides forever)
+    // Container walls (physics scene only); +/- huge = no walls (showcase scene).
+#if VIEWER_SCENE == 1
+    const vec3 wall_min(real(-BOX_HALF), 0, real(-BOX_HALF));
+    const vec3 wall_max(real( BOX_HALF), 0, real( BOX_HALF));
+#else
+    const vec3 wall_min(real(-1e30), 0, real(-1e30));
+    const vec3 wall_max(real( 1e30), 0, real( 1e30));
+#endif
 
     // A body per transform-wrapped sphere (excludes the plain-sphere ground and
     // the box/triangle). pos seeds from the rest pose; radius = sphere.radius * scale.
@@ -502,15 +573,19 @@ int main(int argc, char** argv) {
         total_samples = 0;
     };
 
-    // D: (re)launch the sim — cluster the bodies above the ground centre at
-    // staggered heights with small horizontal offsets, so they fall, bounce, and
-    // collide off-axis (rather than dropping straight down and missing). Zero
-    // velocity; wake the sim.
+    // D: (re)launch the sim — spawn the bodies in a grid above the centre at
+    // staggered heights, so they fall, collide off-axis, and (in the container)
+    // pile up. Grid spacing scales with radius so they don't overlap at spawn.
+    // Zero velocity; wake the sim.
     auto drop_all = [&]() {
-        for (size_t i = 0; i < bodies.size(); i++) {
-            real ox = real(0.7) * ((i & 1) ? real(1) : real(-1));   // alternate L/R
-            real oz = real(0.4) * (real(i) - real(bodies.size() - 1) * real(0.5));
-            bodies[i].pos = vec3(ox, drop_height + real(1.8) * real(i), oz);
+        const int n = (int)bodies.size();
+        for (int i = 0; i < n; i++) {
+            real R = bodies[i].radius;
+            real ang = real(2.4) * real(i);              // loose spiral so they interleave
+            real rad = real(0.7) * R;                     // horizontal offset < diameter
+            bodies[i].pos = vec3(rad * std::cos(ang),
+                                 drop_height + real(2.4) * R * real(i),  // staggered > diameter
+                                 rad * std::sin(ang));
             bodies[i].vel = vec3(0, 0, 0);
         }
         phys_accum   = 0.0;
@@ -772,7 +847,8 @@ int main(int argc, char** argv) {
         // protocol) and restarts accumulation; when ALL bodies stay slow for
         // SLEEP_STEPS the sim sleeps (stops resetting) so the image converges.
         if (animating && !asleep && !bodies.empty()) {
-            const phys_params pp{ real(gravity), real(restitution), GROUND_FRICTION };
+            const phys_params pp{ real(gravity), real(restitution), GROUND_FRICTION,
+                                  wall_min, wall_max };
             phys_accum += ImGui::GetIO().DeltaTime;
             const double cap = PHYS_DT * PHYS_MAX_STEPS;
             if (phys_accum > cap) phys_accum = cap;     // spiral-of-death clamp

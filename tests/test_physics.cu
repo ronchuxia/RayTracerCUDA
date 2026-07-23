@@ -38,7 +38,8 @@ int main() {
     //    + pair collisions). Uses the viewer's own cluster/params.
     {
         const real h = real(1.0 / 240);
-        phys_params p{ real(-9.8), real(0.7), real(0.99) };
+        phys_params p{ real(-9.8), real(0.7), real(0.99),
+                       vec3(-1e30f, 0, -1e30f), vec3(1e30f, 0, 1e30f) };  // no walls
         std::vector<phys_body> bodies;
         const int N = 3; const real drop = 3;
         for (int i = 0; i < N; i++) {

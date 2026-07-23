@@ -32,6 +32,8 @@ struct phys_params {
     real gravity;          // world units / s^2 (negative = down)
     real restitution;      // bounce energy retained (0..1)
     real ground_friction;  // tangential velocity retained per grounded step
+    vec3 wall_min, wall_max;  // axis-aligned container walls on x/z (y unused; the
+                              // floor is the ground plane). Use +/- huge for "no walls".
 };
 
 // Sphere-sphere collision: if overlapping, split the penetration equally and
@@ -72,6 +74,16 @@ inline real physics_step(std::vector<phys_body>& bodies, const phys_params& p, r
         if (b.pos[1] <= b.radius + real(1e-3)) {  // grounded: tangential friction
             b.vel[0] *= p.ground_friction;
             b.vel[2] *= p.ground_friction;
+        }
+        for (int k = 0; k <= 2; k += 2) {         // container walls on x (0) and z (2)
+            if (b.pos[k] - b.radius < p.wall_min[k]) {
+                b.pos[k] = p.wall_min[k] + b.radius;
+                b.vel[k] = -p.restitution * b.vel[k];
+            }
+            if (b.pos[k] + b.radius > p.wall_max[k]) {
+                b.pos[k] = p.wall_max[k] - b.radius;
+                b.vel[k] = -p.restitution * b.vel[k];
+            }
         }
     }
     for (int it = 0; it < 2; it++)
