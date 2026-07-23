@@ -39,7 +39,8 @@ int main() {
     {
         const real h = real(1.0 / 240);
         phys_params p{ real(-9.8), real(0.7), real(0.99),
-                       vec3(-1e30f, 0, -1e30f), vec3(1e30f, 0, 1e30f) };  // no walls
+                       vec3(-1e30f, 0, -1e30f), vec3(1e30f, 0, 1e30f),  // no walls
+                       false, vec3(), vec3() };                          // no box obstacle
         std::vector<phys_body> bodies;
         const int N = 3; const real drop = 3;
         for (int i = 0; i < N; i++) {
@@ -62,6 +63,38 @@ int main() {
         CHECK(maxv < real(0.05), "dropped spheres settle (max |v| -> 0)");
         CHECK(on_ground,         "all bodies rest on the ground plane");
         CHECK(no_overlap,        "no interpenetration at rest");
+    }
+
+    // 3. Sphere vs a static axis-aligned box [-1,1]^3, e=0.5.
+    const vec3 bmin(-1, -1, -1), bmax(1, 1, 1);
+    {
+        // (a) FACE: sphere approaching the +x face head-on, overlapping. Closest
+        //     point is on the face -> axis-aligned normal (+x); bounce back at 0.5.
+        phys_body s{0, vec3(1.4, 0, 0), vec3(-1, 0, 0), real(0.5), vec3(), vec3()};
+        resolve_sphere_box(s, bmin, bmax, real(0.5));
+        CHECK(std::fabs((double)s.pos[0] - 1.5) < 1e-4 &&      // pushed to just touching (x = bmax+r)
+              std::fabs((double)s.vel[0] - 0.5) < 1e-4 &&      // bounced +x at e*1
+              std::fabs((double)s.vel[1]) < 1e-6,              // no tangential change
+              "sphere-vs-box FACE: axis normal, restitution bounce");
+    }
+    {
+        // (b) CORNER: sphere past the (+,+,+) corner along the diagonal. Closest
+        //     point is the vertex -> diagonal normal; the whole velocity is normal.
+        real off = real(1) + real(0.5) / std::sqrt(3.0) - real(0.05);  // overlapping the corner
+        phys_body s{0, vec3(off, off, off), vec3(-1, -1, -1), real(0.5), vec3(), vec3()};
+        resolve_sphere_box(s, bmin, bmax, real(0.5));
+        vec3 d = s.pos - vec3(1, 1, 1);                        // vertex -> centre
+        CHECK(std::fabs((double)d.length() - 0.5) < 1e-3,      // pushed to exactly radius from the corner
+              "sphere-vs-box CORNER: closest point is the vertex, pushed to radius");
+        CHECK(dot(s.vel, unit_vector(vec3(1,1,1))) > 0,        // now separating along the diagonal
+              "sphere-vs-box CORNER: bounced along the corner diagonal");
+    }
+    {
+        // (c) INSIDE: centre inside the box, nearest the +x face -> ejected out +x.
+        phys_body s{0, vec3(0.8, 0, 0), vec3(0, 0, 0), real(0.5), vec3(), vec3()};
+        resolve_sphere_box(s, bmin, bmax, real(0.5));
+        CHECK(std::fabs((double)s.pos[0] - 1.5) < 1e-4,        // ejected to x = bmax + r
+              "sphere-vs-box INSIDE: ejected along the nearest face");
     }
 
     printf(fails ? "PHYSICS TESTS FAILED (%d)\n" : "ALL PHYSICS TESTS PASSED\n", fails);

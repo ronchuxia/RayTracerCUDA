@@ -11,6 +11,8 @@ struct viewer_scene {
     point3 lookfrom, lookat;   // initial camera
     real   vfov;
     vec3   wall_min, wall_max; // physics container walls on x/z; +/- huge = none
+    bool   has_box;            // a static box obstacle to collide against
+    vec3   box_min, box_max;
 };
 
 #endif // VIEWER_SCENES_VIEWER_SCENE_H

@@ -758,7 +758,7 @@ int main(int argc, char** argv) {
         // SLEEP_STEPS the sim sleeps (stops resetting) so the image converges.
         if (animating && !asleep && !bodies.empty()) {
             const phys_params pp{ real(gravity), real(restitution), GROUND_FRICTION,
-                                  wall_min, wall_max };
+                                  wall_min, wall_max, vs.has_box, vs.box_min, vs.box_max };
             phys_accum += ImGui::GetIO().DeltaTime;
             const double cap = PHYS_DT * PHYS_MAX_STEPS;
             if (phys_accum > cap) phys_accum = cap;     // spiral-of-death clamp

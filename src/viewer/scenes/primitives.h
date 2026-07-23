@@ -39,7 +39,8 @@ inline viewer_scene build_primitives_scene(scene& sc) {
 
     sc.build();
     return { point3(13, 2, 3), point3(0, 0, 0), real(20),          // camera
-             vec3(real(-1e30), 0, real(-1e30)), vec3(real(1e30), 0, real(1e30)) };  // no walls
+             vec3(real(-1e30), 0, real(-1e30)), vec3(real(1e30), 0, real(1e30)),  // no walls
+             false, vec3(), vec3() };                              // no box obstacle
 }
 
 #endif // VIEWER_SCENES_PRIMITIVES_H
