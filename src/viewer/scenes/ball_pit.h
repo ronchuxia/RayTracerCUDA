@@ -1,28 +1,33 @@
 #ifndef VIEWER_SCENES_BALL_PIT_H
 #define VIEWER_SCENES_BALL_PIT_H
 
+#include <cmath>
+
 #include "scene.h"
 #include "scenes/scene_utils.h"
 #include "viewer/scenes/viewer_scene.h"
 
-// Physics-scene container: floor (the ground plane) + 4 walls, open top. BOX_HALF
-// is the half-width on x/z, BOX_H the wall height; the wall quads and the returned
-// wall bounds are both derived from these, so geometry and collision stay in sync.
-static constexpr float BOX_HALF = 1.5f;   // room to settle around the central obstacle
-static constexpr float BOX_H    = 3.0f;
-static constexpr int   BALL_N   = 8;      // spheres in the physics scene
-static constexpr float BALL_R   = 0.5f;
-// A static box obstacle in the centre: balls drop onto it and cascade off the
-// edges (sphere-vs-box collision). Its extents are the collision AABB too.
-static constexpr float OBS_HALF = 0.5f;   // x/z half-width
-static constexpr float OBS_TOP  = 0.9f;   // height
-
-// BALL-PIT scene (VIEWER_SCENE 1): physics container: a container with BALL_N diffuse spheres to drop
-// and collide. Each sphere is a UNIT prim scaled to BALL_R and transform-wrapped,
-// so the physics-body scan (which selects transform-wrapped spheres) picks them
-// up; the walls are plain static quads (not bodies, not editable).
-inline viewer_scene build_ball_pit_scene(scene& sc) {
+// Ball pit (VIEWER_SCENE 1 = roomy, 2 = tight): a physics container (ground + 4
+// walls, open top) with a static central box obstacle and BALL_N diffuse spheres.
+// The balls' initial location IS their drop-start: a loose spiral column above
+// the box (off-axis angles + staggered heights), so on Drop they fall one-by-one
+// and cascade off the box. Each sphere is a UNIT prim scaled to BALL_R and
+// transform-wrapped so the physics-body scan picks it up; Drop resets each body
+// to this authored pose.
+//
+// The two variants differ ONLY in the container half-width (box_half), so they
+// share build_ball_pit(): the ROOMY pit (1.5) gives the balls room to spread and
+// settle under either solver; the TIGHT pit (1.3) crowds them into a pile that
+// only the sequential solver settles.
+inline viewer_scene build_ball_pit(scene& sc, real box_half) {
     sc.init();
+
+    constexpr real BOX_H    = real(3.0);   // wall height
+    constexpr int  BALL_N   = 8;           // spheres to drop
+    constexpr real BALL_R   = real(0.5);
+    constexpr real OBS_HALF = real(0.5);   // central obstacle x/z half-width
+    constexpr real OBS_TOP  = real(0.9);   // central obstacle height
+    constexpr real DROP_H   = real(3.0);   // spawn height of the lowest ball
 
     material* ground = new_lambertian(
         make_checker(0.6, color(.2, .3, .1), color(.9, .9, .9)), sc.allocs);
@@ -31,40 +36,43 @@ inline viewer_scene build_ball_pit_scene(scene& sc) {
     sc.add(make_sphere(point3(0, -1000, 0), 1000, ground, sc.allocs));   // id 0: floor
 
     // 4 walls: quads spanning z (or x) horizontally and y=[0,BOX_H] vertically.
-    const real W = real(BOX_HALF), H = real(BOX_H);
+    const real W = box_half, H = BOX_H;
     sc.add(make_quad(point3(-W, 0, -W), vec3(0, 0, 2*W), vec3(0, H, 0), wall, sc.allocs));  // x = -W
     sc.add(make_quad(point3( W, 0, -W), vec3(0, 0, 2*W), vec3(0, H, 0), wall, sc.allocs));  // x = +W
     sc.add(make_quad(point3(-W, 0, -W), vec3(2*W, 0, 0), vec3(0, H, 0), wall, sc.allocs));  // z = -W
     sc.add(make_quad(point3(-W, 0,  W), vec3(2*W, 0, 0), vec3(0, H, 0), wall, sc.allocs));  // z = +W
 
-    // Static box obstacle in the centre (a plain box, not a physics body).
+    // Static box obstacle in the centre (a plain box, not a physics body); its
+    // extents are the collision AABB too.
     material* obs_mat = new_lambertian(color(0.7, 0.3, 0.2), sc.allocs);
-    const real OH = real(OBS_HALF), OT = real(OBS_TOP);
-    sc.add(new_box(point3(-OH, 0, -OH), point3(OH, OT, OH), obs_mat, sc.allocs, sc.list_dtors));
+    sc.add(new_box(point3(-OBS_HALF, 0, -OBS_HALF), point3(OBS_HALF, OBS_TOP, OBS_HALF),
+                   obs_mat, sc.allocs, sc.list_dtors));
 
-    // BALL_N diffuse spheres, resting in the 3x3 grid AROUND the obstacle. The
-    // centre cell sits inside the box, so skip it (BALL_N == 8 == the 8 ring
-    // cells). Drop launches them from above.
-    int placed = 0;
-    for (int dz = -1; dz <= 1 && placed < BALL_N; dz++)
-        for (int dx = -1; dx <= 1 && placed < BALL_N; dx++) {
-            if (dx == 0 && dz == 0) continue;             // centre cell is inside the obstacle
-            color col(0.5 + 0.4 * ((placed * 37) % 7) / 6.0,  // spread hues deterministically
-                      0.5 + 0.4 * ((placed * 53) % 5) / 4.0,
-                      0.5 + 0.4 * ((placed * 29) % 3) / 2.0);
-            material* m = new_lambertian(col, sc.allocs);
-            sc.add(new_transform(make_sphere(point3(0,0,0), BALL_R, m, sc.allocs),
-                                 vec3(real(dx), BALL_R, real(dz)), vec3(0,0,0), vec3(1,1,1), sc.allocs));
-            placed++;
-        }
+    // BALL_N spheres in a loose spiral column above the box: this IS the drop pose
+    // (off-axis angles + staggered heights > a diameter apart), so they fall one
+    // by one and cascade off the box. Drop re-spawns each body at exactly this pose.
+    for (int i = 0; i < BALL_N; i++) {
+        real ang = real(2.4) * real(i);                  // loose spiral so they interleave
+        real rad = real(0.7) * BALL_R;                   // horizontal offset < diameter
+        real x = rad * std::cos(ang), z = rad * std::sin(ang);
+        real y = DROP_H + real(2.4) * BALL_R * real(i);  // staggered > diameter
+        color col(0.5 + 0.4 * ((i * 37) % 7) / 6.0,      // spread hues deterministically
+                  0.5 + 0.4 * ((i * 53) % 5) / 4.0,
+                  0.5 + 0.4 * ((i * 29) % 3) / 2.0);
+        material* m = new_lambertian(col, sc.allocs);
+        sc.add(new_transform(make_sphere(point3(0,0,0), BALL_R, m, sc.allocs),
+                             vec3(x, y, z), vec3(0,0,0), vec3(1,1,1), sc.allocs));
+    }
 
     sc.build();
-    return { point3(4.5, 4.5, 4.5), point3(0, 0.5, 0), real(35),   // look down into the box
-             vec3(real(-BOX_HALF), 0, real(-BOX_HALF)),
-             vec3(real( BOX_HALF), 0, real( BOX_HALF)),
-             true,                                              // collide balls against the obstacle
-             vec3(real(-OBS_HALF), 0,            real(-OBS_HALF)),
-             vec3(real( OBS_HALF), real(OBS_TOP), real( OBS_HALF)) };
+    return { point3(3.5, 8, 3.5), point3(0, 0.5, 0), real(40),     // look down into the container
+             vec3(-W, 0, -W), vec3(W, 0, W),                       // container walls (x/z)
+             true, vec3(-OBS_HALF, 0, -OBS_HALF), vec3(OBS_HALF, OBS_TOP, OBS_HALF) };  // box obstacle
 }
+
+// ROOMY pit (1.5): the balls spread and settle; either solver handles it.
+inline viewer_scene build_ball_pit_scene(scene& sc)       { return build_ball_pit(sc, real(1.5)); }
+// TIGHT pit (1.3): crowded pile — only the sequential solver settles it.
+inline viewer_scene build_ball_pit_tight_scene(scene& sc) { return build_ball_pit(sc, real(1.3)); }
 
 #endif // VIEWER_SCENES_BALL_PIT_H

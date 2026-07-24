@@ -10,7 +10,9 @@
 // registered as a transform(prim), so B5 can drive full T/R/S on any of them
 // uniformly. The underlying prims are UNIT and centred at the origin; the
 // transform supplies position and size. The ground stays a plain sphere — it's
-// the floor, not something you manipulate. Ids are registration order.
+// the floor, not something you manipulate. Ids are registration order. The three
+// spheres rest ON the ground (centre y = radius = 1), so the viewer's shared Drop
+// control is a no-op here — this scene is for viewing/editing, not simulation.
 inline viewer_scene build_primitives_scene(scene& sc) {
     sc.init();
 

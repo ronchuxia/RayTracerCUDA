@@ -90,7 +90,7 @@
 #define RT_SKY 1            // viewer lights the scene with the sky gradient
 #endif
 #ifndef VIEWER_SCENE
-#define VIEWER_SCENE 0      // 0 = primitives (one of each prim, editable); 1 = ball pit (physics)
+#define VIEWER_SCENE 0      // 0 = primitives (editable); 1 = ball pit (roomy 1.5); 2 = ball pit (tight 1.3)
 #endif
 
 #include "camera.h"
@@ -98,7 +98,7 @@
 #include "scene.h"
 #include "scenes/scene_utils.h"
 #include "viewer/scenes/primitives.h"
-#include "viewer/scenes/ball_pit.h"
+#include "viewer/scenes/ball_pit.h"          // build_ball_pit_scene (roomy) + _tight_scene
 
 // --- device tonemap: accumulator (sum of samples) -> RGBA8 -------------------
 // Per pixel, calls color.h's shared tonemap_pixel (the same routine the offline
@@ -196,7 +196,9 @@ int main(int argc, char** argv) {
     // and (physics scene) the collision wall bounds — one place per scene, no
     // scattered `#if VIEWER_SCENE`.
     scene sc;
-#if VIEWER_SCENE == 1
+#if VIEWER_SCENE == 2
+    const viewer_scene vs = build_ball_pit_tight_scene(sc);
+#elif VIEWER_SCENE == 1
     const viewer_scene vs = build_ball_pit_scene(sc);
 #else
     const viewer_scene vs = build_primitives_scene(sc);
@@ -418,7 +420,6 @@ int main(int argc, char** argv) {
     double phys_accum   = 0.0;     // fixed-step time accumulator (real seconds)
     float  gravity     = -9.8f;   // world units / s^2 (negative = down)
     float  restitution = 0.7f;    // bounce energy retained (0..1)
-    float  drop_height = 3.0f;    // spawn height above the ground
     const double PHYS_DT = 1.0 / 240.0;  // fixed integration step
     const int    PHYS_MAX_STEPS = 8;    // per-frame substep cap (spiral-of-death guard)
     const real   SLEEP_VEL   = real(0.1);// per-body speed under which a body is "still"
@@ -429,7 +430,9 @@ int main(int argc, char** argv) {
     const vec3 wall_min = vs.wall_min, wall_max = vs.wall_max;
 
     // A body per transform-wrapped sphere (excludes the plain-sphere ground and
-    // the box/triangle). pos seeds from the rest pose; radius = sphere.radius * scale.
+    // the box/triangle). pos seeds from the scene's start pose (which is also the
+    // Drop pose); radius = sphere.radius * scale. Scenes whose spheres rest on the
+    // ground (e.g. the showcase) simply don't move on Drop.
     for (int id = 0; id < (int)sc.objects.size(); id++) {
         hittable* h = sc.get(id);
         if (h && h->type == TRANSFORM) {
@@ -483,22 +486,15 @@ int main(int argc, char** argv) {
         total_samples = 0;
     };
 
-    // D: (re)launch the sim — spawn the bodies in a grid above the centre at
-    // staggered heights, so they fall, collide off-axis, and (in the container)
-    // pile up. Grid spacing scales with radius so they don't overlap at spawn.
-    // Zero velocity; wake the sim.
+    // D: (re)launch the sim — reset every body to its scene-defined drop pose
+    // (the scene places the balls at their start transform, so that IS the drop
+    // pose) with zero velocity, and wake the sim.
     auto drop_all = [&]() {
-        const int n = (int)bodies.size();
-        for (int i = 0; i < n; i++) {
-            real R = bodies[i].radius;
-            real ang = real(2.4) * real(i);              // loose spiral so they interleave
-            real rad = real(0.7) * R;                     // horizontal offset < diameter
-            bodies[i].pos = vec3(rad * std::cos(ang),
-                                 drop_height + real(2.4) * R * real(i),  // staggered > diameter
-                                 rad * std::sin(ang));
-            bodies[i].vel = vec3(0, 0, 0);
+        for (phys_body& b : bodies) {
+            b.pos = initial_trs[b.id].t;
+            b.vel = vec3(0, 0, 0);
         }
-        phys_accum   = 0.0;
+        phys_accum  = 0.0;
         asleep      = false;
         still_steps = 0;
         animating   = true;
@@ -664,7 +660,6 @@ int main(int argc, char** argv) {
                 ImGui::Checkbox("Play", &animating);      // pause/resume
                 ImGui::SliderFloat("gravity",     &gravity,     -30.0f, 0.0f, "%.1f");
                 ImGui::SliderFloat("restitution", &restitution,   0.0f, 1.0f, "%.2f");
-                ImGui::SliderFloat("drop height",  &drop_height,  0.0f, 8.0f, "%.1f");
             }
 
             if (show_camera) {
