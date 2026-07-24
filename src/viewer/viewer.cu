@@ -486,6 +486,27 @@ int main(int argc, char** argv) {
         total_samples = 0;
     };
 
+    // B5 + physics: after a transform edit, push the new pose into the object's
+    // physics body (if it has one), so the edit isn't immediately overwritten by
+    // the next sim step (physics owns bodies and rewrites transforms from them).
+    // No-op for objects that aren't simulated bodies. Radius tracks the scale,
+    // mirroring the body scan.
+    auto sync_body_to_transform = [&](int id) {
+        hittable* h = sc.get(id);
+        if (!h || h->type != TRANSFORM) return;
+        transform* tr = static_cast<transform*>(h->object);
+        if (tr->child->type != SPHERE) return;
+        for (phys_body& b : bodies)
+            if (b.id == id) {
+                b.pos    = tr->translation;
+                b.vel    = vec3(0, 0, 0);
+                b.baseR  = tr->rotation;
+                b.baseS  = tr->scale;
+                b.radius = static_cast<sphere*>(tr->child->object)->radius * tr->scale.y();
+                break;
+            }
+    };
+
     // D: (re)launch the sim — reset every body to its scene-defined drop pose
     // (the scene places the balls at their start transform, so that IS the drop
     // pose) with zero velocity, and wake the sim.
@@ -702,6 +723,7 @@ int main(int argc, char** argv) {
                                               vec3(r[0], r[1], r[2]), vec3(s[0], s[1], s[2]));
                             sc.refit();
                             reset_accumulation();
+                            sync_body_to_transform(selected_id);  // so the edit sticks under sim
                         }
                         // Restore the object's initial pose (same mutation protocol).
                         // The drag fields re-read tr next frame, so the UI follows.
@@ -710,6 +732,7 @@ int main(int argc, char** argv) {
                             new(tr) transform(tr->child, in.t, in.r, in.s);
                             sc.refit();
                             reset_accumulation();
+                            sync_body_to_transform(selected_id);
                         }
                     } else {
                         ImGui::TextDisabled("not editable");
