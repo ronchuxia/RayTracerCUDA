@@ -487,10 +487,12 @@ int main(int argc, char** argv) {
     };
 
     // B5 + physics: after a transform edit, push the new pose into the object's
-    // physics body (if it has one), so the edit isn't immediately overwritten by
-    // the next sim step (physics owns bodies and rewrites transforms from them).
-    // No-op for objects that aren't simulated bodies. Radius tracks the scale,
-    // mirroring the body scan.
+    // physics body (if it has one) so the edit isn't overwritten by the next sim
+    // step (physics owns bodies and rewrites transforms from them), AND wake the
+    // sim: a settled pile goes asleep (stops stepping so the image converges), so
+    // a moved body must re-activate it or it just floats in place. No-op for
+    // objects that aren't simulated bodies. Radius tracks the scale, mirroring the
+    // body scan.
     auto sync_body_to_transform = [&](int id) {
         hittable* h = sc.get(id);
         if (!h || h->type != TRANSFORM) return;
@@ -503,6 +505,7 @@ int main(int argc, char** argv) {
                 b.baseR  = tr->rotation;
                 b.baseS  = tr->scale;
                 b.radius = static_cast<sphere*>(tr->child->object)->radius * tr->scale.y();
+                asleep = false; still_steps = 0;   // a moved body disturbs the pile -> resume stepping
                 break;
             }
     };
