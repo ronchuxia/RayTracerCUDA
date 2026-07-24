@@ -685,9 +685,38 @@ int main(int argc, char** argv) {
 
             if (show_camera) {
                 section_break();
-                ImGui::Text("cam    (%.2f, %.2f, %.2f)", cam->lookfrom.x(), cam->lookfrom.y(), cam->lookfrom.z());
-                ImGui::Text("target (%.2f, %.2f, %.2f)", target.x(), target.y(), target.z());
-                ImGui::Text("r      %.2f", radius);
+                // Editable orbit camera: cam moves the whole rig (rigid translate,
+                // target follows); target re-aims (eye stays, aims at the new point);
+                // r dollies along the view direction. lookfrom is derived from
+                // target + radius + angles, so cam/target edits update those.
+                float pos[3] = {(float)cam->lookfrom.x(), (float)cam->lookfrom.y(), (float)cam->lookfrom.z()};
+                if (ImGui::DragFloat3("cam", pos, 0.05f)) {
+                    // rigid translate: move the whole rig, so moving the eye doesn't
+                    // re-aim it — shift the pivot by the same delta the eye moved.
+                    target = target + (point3(pos[0], pos[1], pos[2]) - cam->lookfrom);
+                    camera_dirty = true;
+                }
+                float tgt[3] = {(float)target.x(), (float)target.y(), (float)target.z()};
+                if (ImGui::DragFloat3("target", tgt, 0.05f)) {
+                    // re-aim: the eye stays put and aims at the new target; recompute
+                    // the orbit offset (radius + angles) from the fixed eye to it.
+                    point3 nt(tgt[0], tgt[1], tgt[2]);
+                    vec3 off = cam->lookfrom - nt;
+                    target = nt;
+                    radius = off.length();
+                    if (radius < 0.1) radius = 0.1;
+                    azimuth = atan2(off.z(), off.x());
+                    double s = off.y() / radius;                 // clamp asin's domain against fp error
+                    elevation = asin(s < -1.0 ? -1.0 : (s > 1.0 ? 1.0 : s));
+                    if (elevation >  1.55) elevation =  1.55;    // match the orbit-drag pole clamp
+                    if (elevation < -1.55) elevation = -1.55;
+                    camera_dirty = true;
+                }
+                float rad_f = (float)radius;
+                if (ImGui::DragFloat("r", &rad_f, 0.05f, 0.1f, 1.0e4f)) {
+                    radius = rad_f < 0.1f ? 0.1 : (double)rad_f;
+                    camera_dirty = true;
+                }
                 float vfov_f = (float)cam->vfov;
                 if (ImGui::SliderFloat("vfov", &vfov_f, 5.0f, 90.0f, "%.0f deg")) {
                     cam->vfov = vfov_f;
