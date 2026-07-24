@@ -382,7 +382,7 @@ int main(int argc, char** argv) {
     const double radius0 = radius, azimuth0 = azimuth, elevation0 = elevation;
     const double vfov0 = cam->vfov;
 
-    // Launch config, restored by the UI panel's "Reset config" button.
+    // Launch config, restored by the UI panel's "Reset rendering" button (vfov by "Reset camera").
     const int spp_per_frame0  = spp_per_frame;
     const int target_samples0 = target_samples;
     const int max_depth0      = cam->max_depth;
@@ -400,8 +400,8 @@ int main(int argc, char** argv) {
     float ms_trace = 0.0f, ms_tonemap = 0.0f;
 
     // Which sections of the Renderer panel are visible (toggled in View menu).
-    bool show_performance = true, show_samples = true, show_config = true, show_camera = true;
-    bool show_selection = true, show_dynamic = true;
+    bool show_performance = true, show_rendering = true, show_camera = true;
+    bool show_object = true, show_physics = true;
 
     // ---- C/D: dynamic scene — physics-simulated bodies ----
     // Every transform-wrapped sphere is a rigid body that falls under gravity,
@@ -414,7 +414,7 @@ int main(int argc, char** argv) {
     // converges. (Box/triangle are static decor — no collider yet; that's the
     // convex-hull/GJK work in Phase 3.)
     std::vector<phys_body> bodies;   // built below from the transform-wrapped spheres
-    bool   animating   = false;   // Play/pause the sim (Drop launches it)
+    bool   animating   = false;   // Play/Pause/Stop transport (Stop resets to the drop pose)
     bool   asleep      = false;   // all settled -> stop stepping + resetting accumulation
     int    still_steps = 0;       // consecutive fixed steps with every body slow
     double phys_accum   = 0.0;     // fixed-step time accumulator (real seconds)
@@ -431,8 +431,8 @@ int main(int argc, char** argv) {
 
     // A body per transform-wrapped sphere (excludes the plain-sphere ground and
     // the box/triangle). pos seeds from the scene's start pose (which is also the
-    // Drop pose); radius = sphere.radius * scale. Scenes whose spheres rest on the
-    // ground (e.g. the showcase) simply don't move on Drop.
+    // drop pose); radius = sphere.radius * scale. Scenes whose spheres rest on the
+    // ground (e.g. the showcase) simply don't move when the sim plays.
     for (int id = 0; id < (int)sc.objects.size(); id++) {
         hittable* h = sc.get(id);
         if (h && h->type == TRANSFORM) {
@@ -510,18 +510,23 @@ int main(int argc, char** argv) {
             }
     };
 
-    // D: (re)launch the sim — reset every body to its scene-defined drop pose
-    // (the scene places the balls at their start transform, so that IS the drop
-    // pose) with zero velocity, and wake the sim.
-    auto drop_all = [&]() {
+    // Stop: reset every simulated body to its authored drop pose (position,
+    // orientation, scale, zero velocity), rewrite its transform, and pause. The
+    // scene authors the balls at their drop pose, so this is also the initial pose.
+    auto reset_sim = [&]() {
         for (phys_body& b : bodies) {
-            b.pos = initial_trs[b.id].t;
-            b.vel = vec3(0, 0, 0);
+            const init_trs& in = initial_trs[b.id];
+            transform* tr = static_cast<transform*>(sc.get(b.id)->object);
+            new(tr) transform(tr->child, in.t, in.r, in.s);
+            b.pos    = in.t;
+            b.vel    = vec3(0, 0, 0);
+            b.baseR  = in.r;
+            b.baseS  = in.s;
+            b.radius = static_cast<sphere*>(tr->child->object)->radius * in.s.y();
         }
-        phys_accum  = 0.0;
-        asleep      = false;
-        still_steps = 0;
-        animating   = true;
+        sc.refit();
+        reset_accumulation();
+        phys_accum = 0.0; still_steps = 0; asleep = false; animating = false;
     };
 
     // Rebuild the camera from the orbit state and reset accumulation. Called
@@ -607,11 +612,10 @@ int main(int argc, char** argv) {
             }
             if (ImGui::BeginMenu("View")) {
                 ImGui::MenuItem("Performance", nullptr, &show_performance);
-                ImGui::MenuItem("Samples", nullptr, &show_samples);
-                ImGui::MenuItem("Config",  nullptr, &show_config);
-                ImGui::MenuItem("Camera",  nullptr, &show_camera);
-                ImGui::MenuItem("Selection", nullptr, &show_selection);
-                ImGui::MenuItem("Dynamic", nullptr, &show_dynamic);
+                ImGui::MenuItem("Rendering",   nullptr, &show_rendering);
+                ImGui::MenuItem("Physics",     nullptr, &show_physics);
+                ImGui::MenuItem("Camera",      nullptr, &show_camera);
+                ImGui::MenuItem("Object",      nullptr, &show_object);
                 ImGui::EndMenu();
             }
             ImGui::EndMainMenuBar();
@@ -651,37 +655,30 @@ int main(int argc, char** argv) {
                 else                   ImGui::Text("vram    %6s MB", "n/a");
             }
 
-            if (show_samples) {
+            if (show_rendering) {
                 section_break();
                 ImGui::Text("%lld spp", total_samples);
-            }
-
-            if (show_config) {
-                section_break();
                 ImGui::SliderInt("spp", &spp_per_frame, 1, 64);
                 ImGui::SliderInt("target spp", &target_samples, 16, 65536, "%d",
                                  ImGuiSliderFlags_Logarithmic);
                 if (ImGui::SliderInt("max depth", &cam->max_depth, 1, 50)) camera_dirty = true;
-                float vfov_f = (float)cam->vfov;
-                if (ImGui::SliderFloat("vfov", &vfov_f, 5.0f, 90.0f, "%.0f deg")) {
-                    cam->vfov = vfov_f;
-                    camera_dirty = true;
-                }
-                if (ImGui::Button("Reset config")) {
+                if (ImGui::Button("Reset rendering")) {
                     spp_per_frame  = spp_per_frame0;
                     target_samples = target_samples0;
-                    // max depth / vfov change what's rendered — restart only if they moved
-                    if (cam->max_depth != max_depth0 || cam->vfov != vfov0) camera_dirty = true;
+                    if (cam->max_depth != max_depth0) camera_dirty = true;  // max depth changes the render
                     cam->max_depth = max_depth0;
-                    cam->vfov      = vfov0;
                 }
             }
 
-            if (show_dynamic) {
+            if (show_physics) {
                 section_break();
-                if (ImGui::Button("Drop")) drop_all();    // D: launch the sim
+                // Transport: Play runs/resumes, Pause freezes in place, Stop
+                // resets every body to its drop pose and pauses.
+                if (ImGui::Button("Play"))  animating = true;
                 ImGui::SameLine();
-                ImGui::Checkbox("Play", &animating);      // pause/resume
+                if (ImGui::Button("Pause")) animating = false;
+                ImGui::SameLine();
+                if (ImGui::Button("Stop"))  reset_sim();
                 ImGui::SliderFloat("gravity",     &gravity,     -30.0f, 0.0f, "%.1f");
                 ImGui::SliderFloat("restitution", &restitution,   0.0f, 1.0f, "%.2f");
             }
@@ -691,6 +688,11 @@ int main(int argc, char** argv) {
                 ImGui::Text("cam    (%.2f, %.2f, %.2f)", cam->lookfrom.x(), cam->lookfrom.y(), cam->lookfrom.z());
                 ImGui::Text("target (%.2f, %.2f, %.2f)", target.x(), target.y(), target.z());
                 ImGui::Text("r      %.2f", radius);
+                float vfov_f = (float)cam->vfov;
+                if (ImGui::SliderFloat("vfov", &vfov_f, 5.0f, 90.0f, "%.0f deg")) {
+                    cam->vfov = vfov_f;
+                    camera_dirty = true;
+                }
                 if (ImGui::Button("Reset camera")) {
                     target = target0; radius = radius0;
                     azimuth = azimuth0; elevation = elevation0;
@@ -699,7 +701,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            if (show_selection) {
+            if (show_object) {
                 section_break();
                 if (selected_id >= 0) {
                     ImGui::Text("selected  id %d", selected_id);
