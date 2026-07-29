@@ -97,6 +97,7 @@
 #include "physics.h"
 #include "scene.h"
 #include "scenes/scene_utils.h"
+#include "viewer/physics_utils.h"           // box_collider_of: shared with the scenes
 #include "viewer/scenes/primitives.h"
 #include "viewer/scenes/ball_pit.h"          // build_ball_pit_scene (roomy) + _tight_scene
 
@@ -419,32 +420,29 @@ int main(int argc, char** argv) {
     int    still_steps = 0;       // consecutive fixed steps with every body slow
     double phys_accum   = 0.0;     // fixed-step time accumulator (real seconds)
     float  gravity     = -9.8f;   // world units / s^2 (negative = down)
-    float  restitution = 0.7f;    // bounce energy retained (0..1)
+    // How a contact's friction/restitution are derived from its two surfaces.
+    // Sim-wide policy, not a surface property, so these live here and in the
+    // Physics panel; the coefficients themselves are per-body (Object panel).
+    int    friction_combine    = (int)COMBINE_AVERAGE;   // PhysX's default
+    int    restitution_combine = (int)COMBINE_AVERAGE;
     const double PHYS_DT = 1.0 / 240.0;  // fixed integration step
     const int    PHYS_MAX_STEPS = 8;    // per-frame substep cap (spiral-of-death guard)
     const real   SLEEP_VEL   = real(0.1);// per-body speed under which a body is "still"
     const int    SLEEP_STEPS = 60;       // all-still for this many steps (~0.25s) => sleep
-    const real   GROUND_FRICTION = real(0.99);  // tangential velocity retained per grounded step
-                                                // (without it, a frictionless ground slides forever)
-    // Container walls come from the scene config (+/- huge = no walls).
-    const vec3 wall_min = vs.wall_min, wall_max = vs.wall_max;
 
-    // A body per transform-wrapped sphere (excludes the plain-sphere ground and
-    // the box/triangle). pos seeds from the scene's start pose (which is also the
-    // drop pose); radius = sphere.radius * scale. Scenes whose spheres rest on the
-    // ground (e.g. the showcase) simply don't move when the sim plays.
-    for (int id = 0; id < (int)sc.objects.size(); id++) {
-        hittable* h = sc.get(id);
-        if (h && h->type == TRANSFORM) {
-            transform* tr = static_cast<transform*>(h->object);
-            if (tr->child->type == SPHERE) {
-                sphere* sp = static_cast<sphere*>(tr->child->object);
-                const init_trs& base = initial_trs[id];
-                bodies.push_back({ id, base.t, vec3(0,0,0),
-                                   sp->radius * base.s.y(), base.r, base.s });
-            }
-        }
-    }
+    // The scene AUTHORS its physics bodies (viewer/physics_utils.h) — the viewer
+    // derives nothing, because only the scene knows which sphere is meant to fall
+    // and whether a triangle collides at all. We just take the list and index it.
+    bodies = vs.bodies;
+
+    // Scene-object id -> index into `bodies` (-1 = not simulated). Unlinked
+    // bodies carry scene_id < 0 and so never appear in this table at all. One
+    // lookup table serves both the edit->body sync and the panel's role editor.
+    // The two int spaces are deliberately spelled apart: the KEY is a scene id,
+    // the VALUE is an index into `bodies`, which is also what contact.a/.b hold.
+    std::vector<int> body_of_scene_id((size_t)sc.objects.size(), -1);
+    for (int i = 0; i < (int)bodies.size(); i++)
+        if (bodies[i].scene_id >= 0) body_of_scene_id[bodies[i].scene_id] = i;
 
     // ---- B4 picking state ----
     // A click (press+release with ≤2 px of motion) picks; a drag orbits.
@@ -493,21 +491,21 @@ int main(int argc, char** argv) {
     // a moved body must re-activate it or it just floats in place. No-op for
     // objects that aren't simulated bodies. Radius tracks the scale, mirroring the
     // body scan.
-    auto sync_body_to_transform = [&](int id) {
-        hittable* h = sc.get(id);
-        if (!h || h->type != TRANSFORM) return;
-        transform* tr = static_cast<transform*>(h->object);
-        if (tr->child->type != SPHERE) return;
-        for (phys_body& b : bodies)
-            if (b.id == id) {
-                b.pos    = tr->translation;
-                b.vel    = vec3(0, 0, 0);
-                b.baseR  = tr->rotation;
-                b.baseS  = tr->scale;
-                b.radius = static_cast<sphere*>(tr->child->object)->radius * tr->scale.y();
-                asleep = false; still_steps = 0;   // a moved body disturbs the pile -> resume stepping
-                break;
-            }
+    auto sync_body_to_transform = [&](int scene_id) {
+        if (scene_id < 0 || body_of_scene_id[scene_id] < 0) return;   // not simulated
+        transform* tr = static_cast<transform*>(sc.get(scene_id)->object);
+        phys_body& b = bodies[body_of_scene_id[scene_id]];
+        b.vel   = vec3(0, 0, 0);   // position-only: a dragged body shoves, it doesn't strike
+        b.baseR = tr->rotation;
+        b.baseS = tr->scale;
+        if (b.shape == COLLIDER_SPHERE) {
+            b.pos    = tr->translation;
+            b.radius = static_cast<sphere*>(tr->child->object)->radius * tr->scale.y();
+        } else {                   // box collider re-derived from the new pose,
+                                   // rotation included (physics_utils.h)
+            box_collider_of(tr, b.pos, b.half, b.axes);
+        }
+        asleep = false; still_steps = 0;   // a moved body disturbs the pile -> resume stepping
     };
 
     // Stop: reset every simulated body to its authored drop pose (position,
@@ -515,14 +513,11 @@ int main(int argc, char** argv) {
     // scene authors the balls at their drop pose, so this is also the initial pose.
     auto reset_sim = [&]() {
         for (phys_body& b : bodies) {
-            const init_trs& in = initial_trs[b.id];
-            transform* tr = static_cast<transform*>(sc.get(b.id)->object);
+            if (b.scene_id < 0) continue;           // unlinked: no scene pose to restore
+            const init_trs& in = initial_trs[b.scene_id];
+            transform* tr = static_cast<transform*>(sc.get(b.scene_id)->object);
             new(tr) transform(tr->child, in.t, in.r, in.s);
-            b.pos    = in.t;
-            b.vel    = vec3(0, 0, 0);
-            b.baseR  = in.r;
-            b.baseS  = in.s;
-            b.radius = static_cast<sphere*>(tr->child->object)->radius * in.s.y();
+            sync_body_to_transform(b.scene_id);     // re-derive pos + collider from the restored pose
         }
         sc.refit();
         reset_accumulation();
@@ -679,8 +674,14 @@ int main(int argc, char** argv) {
                 if (ImGui::Button("Pause")) animating = false;
                 ImGui::SameLine();
                 if (ImGui::Button("Stop"))  reset_sim();
-                ImGui::SliderFloat("gravity",     &gravity,     -30.0f, 0.0f, "%.1f");
-                ImGui::SliderFloat("restitution", &restitution,   0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("gravity", &gravity, -30.0f, 0.0f, "%.1f");
+                // Must stay in combine_mode order — the combos write their index
+                // straight back as the enum. Listed deadest -> bounciest.
+                static const char* kCombine[] = { "multiply", "min", "geometric", "average", "max" };
+                if (ImGui::Combo("friction mix", &friction_combine, kCombine, IM_ARRAYSIZE(kCombine)))
+                    { asleep = false; still_steps = 0; }
+                if (ImGui::Combo("restitution mix", &restitution_combine, kCombine, IM_ARRAYSIZE(kCombine)))
+                    { asleep = false; still_steps = 0; }
             }
 
             if (show_camera) {
@@ -768,6 +769,78 @@ int main(int argc, char** argv) {
                             reset_accumulation();
                             sync_body_to_transform(selected_id);
                         }
+
+                        // A3: the object's PHYSICS ROLE — how it moves (motion),
+                        // whether it collides at all, and its mass. None of these
+                        // change the image, so no accumulation reset; they do
+                        // change the dynamics, so each edit WAKES a settled sim
+                        // (otherwise the change would sit inert until something
+                        // else disturbed the pile). Authoring only — Stop resets
+                        // the pose, never the role.
+                        int bi = body_of_scene_id[selected_id];
+                        if (bi >= 0) {
+                            phys_body& b = bodies[bi];
+                            ImGui::Spacing();
+                            // Ordered as the two questions nest: does it collide
+                            // at all, and if it moves, how?
+                            if (ImGui::Checkbox("collidable", &b.collidable)) {
+                                asleep = false; still_steps = 0;
+                            }
+                            // Must stay in motion_type order — the combo writes
+                            // its index straight back as the enum value.
+                            //
+                            // A PLANE is never offered "dynamic": it has no
+                            // finite extent, so no centre of mass and no inertia
+                            // tensor (see inv_mass, which enforces this whatever
+                            // the field says). STATIC = 0 and KINEMATIC = 1, so
+                            // truncating the list needs no index remapping — the
+                            // enum's ordering pays for itself again. A scene that
+                            // authored a dynamic plane displays as the role it
+                            // actually gets, the same way `mass` below stays
+                            // stored but hidden once a body is immovable.
+                            static const char* kMotion[] = { "static", "kinematic", "dynamic" };
+                            const bool is_plane = (b.shape == COLLIDER_PLANE);
+                            int m = (int)b.motion;
+                            if (is_plane && m > (int)KINEMATIC) m = (int)STATIC;
+                            if (ImGui::Combo("motion", &m, kMotion,
+                                             is_plane ? 2 : IM_ARRAYSIZE(kMotion))) {
+                                b.motion = (motion_type)m;
+                                // A stale velocity on an immovable body would still
+                                // be read as approach speed at its contacts, so it
+                                // would shove things while standing still.
+                                if (b.motion != DYNAMIC) b.vel = vec3(0, 0, 0);
+                                asleep = false; still_steps = 0;
+                            }
+                            // Mass only means anything for a DYNAMIC body —
+                            // inv_mass() discards it otherwise — so the field is
+                            // hidden rather than shown inert. The authored value
+                            // still lives in b.mass, so making the body dynamic
+                            // again brings the field back with its old value.
+                            if (b.motion == DYNAMIC) {
+                                float mass_f = (float)b.mass;   // must stay > 0: inv_mass() divides by it
+                                if (ImGui::DragFloat("mass", &mass_f, 0.05f, 0.01f, 1000.0f, "%.2f")) {
+                                    b.mass = real(fmaxf(mass_f, 0.01f));
+                                    asleep = false; still_steps = 0;
+                                }
+                            }
+                            // Surface properties. Unlike mass these apply to
+                            // IMMOVABLE bodies too — a static floor's friction
+                            // and bounce are exactly what make it slippery or
+                            // springy — so they show for every role. Each is
+                            // combined with the other surface's value per
+                            // contact, by the rule set in the Physics panel.
+                            float fr = (float)b.friction, rest = (float)b.restitution;
+                            if (ImGui::SliderFloat("friction", &fr, 0.0f, 2.0f, "%.2f")) {
+                                b.friction = real(fr);
+                                asleep = false; still_steps = 0;
+                            }
+                            if (ImGui::SliderFloat("restitution", &rest, 0.0f, 1.0f, "%.2f")) {
+                                b.restitution = real(rest);
+                                asleep = false; still_steps = 0;
+                            }
+                        } else {
+                            ImGui::TextDisabled("not simulated");
+                        }
                     } else {
                         ImGui::TextDisabled("not editable");
                     }
@@ -809,8 +882,8 @@ int main(int argc, char** argv) {
         // protocol) and restarts accumulation; when ALL bodies stay slow for
         // SLEEP_STEPS the sim sleeps (stops resetting) so the image converges.
         if (animating && !asleep && !bodies.empty()) {
-            const phys_params pp{ real(gravity), real(restitution), GROUND_FRICTION,
-                                  wall_min, wall_max, vs.has_box, vs.box_min, vs.box_max };
+            const phys_params pp{ real(gravity), (combine_mode)friction_combine,
+                                                 (combine_mode)restitution_combine };
             phys_accum += ImGui::GetIO().DeltaTime;
             const double cap = PHYS_DT * PHYS_MAX_STEPS;
             if (phys_accum > cap) phys_accum = cap;     // spiral-of-death clamp
@@ -824,7 +897,11 @@ int main(int argc, char** argv) {
             if (still_steps > SLEEP_STEPS) asleep = true;
             if (stepped) {   // apply all poses -> refit -> restart accumulation
                 for (phys_body& b : bodies) {
-                    transform* tr = static_cast<transform*>(sc.get(b.id)->object);
+                    // An unlinked body has no transform to write into, and only
+                    // DYNAMIC bodies are moved BY the sim — a kinematic body's
+                    // pose is the driver's, so writing it back would fight the drag.
+                    if (b.scene_id < 0 || b.motion != DYNAMIC) continue;
+                    transform* tr = static_cast<transform*>(sc.get(b.scene_id)->object);
                     new(tr) transform(tr->child, point3(b.pos), b.baseR, b.baseS);
                 }
                 sc.refit();
