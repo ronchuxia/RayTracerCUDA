@@ -25,7 +25,10 @@ inline viewer_scene build_primitives_scene(scene& sc) {
     material* box_mat = new_lambertian(color(0.2, 0.4, 0.7), sc.allocs);
     material* tri_mat = new_lambertian(color(0.9, 0.75, 0.2), sc.allocs);
 
-    sc.add(make_sphere(point3(0, -1000, 0), 1000, ground, sc.allocs));   // id 0: floor (plain)
+    // Transform-wrapped like everything else: a body can only be linked to an
+    // object that has a pose to follow, and the transform is what supplies one.
+    sc.add(new_transform(make_sphere(point3(0,0,0), 1000, ground, sc.allocs),
+                         vec3(0, -1000, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));  // id 0: floor
 
     // Editable objects: unit prim at origin + transform(T, R°, S).
     int s1 = sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, diffuse, sc.allocs),
@@ -50,7 +53,7 @@ inline viewer_scene build_primitives_scene(scene& sc) {
     // not match what you see. Authoring bodies rather than deriving them from
     // geometry is exactly what makes "no collider" expressible.
     std::vector<phys_body> bodies;
-    bodies.push_back(make_plane_body(vec3(0, 1, 0), 0));
+    bodies.push_back(make_sphere_body(sc, 0, STATIC));   // floor: collides as the sphere it draws as
     bodies.push_back(make_sphere_body(sc, s1));
     bodies.push_back(make_sphere_body(sc, s2));
     bodies.push_back(make_sphere_body(sc, s3));

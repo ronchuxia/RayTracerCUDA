@@ -51,14 +51,18 @@ int main() {
     std::vector<phys_body> bodies = vs.bodies;
     std::vector<int> body_of_scene_id = index_bodies(bodies, (int)sc.objects.size());
 
-    int planes = 0, boxes = 0, spheres = 0, box_i = -1, box_id = -1;
+    int boxes = 0, spheres = 0, unlinked = 0, box_i = -1, box_id = -1;
     for (int i = 0; i < (int)bodies.size(); i++) {
-        if (bodies[i].shape == COLLIDER_PLANE)  planes++;
+        if (bodies[i].scene_id < 0) unlinked++;
         if (bodies[i].shape == COLLIDER_SPHERE) spheres++;
-        if (bodies[i].shape == COLLIDER_BOX)  { boxes++; box_i = i; box_id = bodies[i].scene_id; }
+        if (bodies[i].shape == COLLIDER_BOX)    boxes++;
+        if (bodies[i].shape == COLLIDER_BOX && bodies[i].scene_id == 5)
+            { box_i = i; box_id = bodies[i].scene_id; }   // the obstacle
     }
-    CHECK(planes == 5 && boxes == 1 && spheres == 8,
-          "ball pit authors 5 plane + 1 box + 8 sphere bodies");
+    // 4 walls + 1 obstacle as boxes; floor + 8 balls as spheres. EVERY body is
+    // linked, and every collider is the shape its object actually draws as.
+    CHECK(boxes == 5 && spheres == 9 && unlinked == 0,
+          "ball pit authors 5 box + 9 sphere bodies, all linked to their objects");
     CHECK(box_id >= 0 && body_of_scene_id[box_id] == box_i,
           "the obstacle is LINKED, so it can be selected and dragged");
 
@@ -82,14 +86,16 @@ int main() {
         for (int s = 0; s < SETTLE; s++) maxv = physics_step(b, p, H);
         bool above_ground = true, inside_walls = true, clear_of_box = true, no_overlap = true;
         for (int i = 0; i < (int)b.size(); i++) {
-            if (b[i].shape != COLLIDER_SPHERE) continue;
-            if (b[i].pos[1] < b[i].radius - real(0.02)) above_ground = false;
+            if (b[i].motion != DYNAMIC) continue;          // the balls
+            vec3 gn; real gpen;                       // the ground is a sphere now, so
+            if (contact_between(b[i], b[0], gn, gpen) && gpen > real(0.02))
+                above_ground = false;                 // ask the narrow phase, not y > r
             if (std::fabs((double)b[i].pos[0]) > (double)BOX_HALF + 0.02 ||
                 std::fabs((double)b[i].pos[2]) > (double)BOX_HALF + 0.02) inside_walls = false;
             vec3 n; real pen;
             if (contact_between(b[i], b[box_i], n, pen) && pen > real(0.02)) clear_of_box = false;
             for (int j = i + 1; j < (int)b.size(); j++) {
-                if (b[j].shape != COLLIDER_SPHERE) continue;
+                if (b[j].motion != DYNAMIC) continue;
                 if ((b[i].pos - b[j].pos).length() < b[i].radius + b[j].radius - real(0.02))
                     no_overlap = false;
             }
@@ -119,7 +125,7 @@ int main() {
         }
         int pushed = 0; bool clear = true;
         for (int i = 0; i < (int)b.size(); i++) {
-            if (b[i].shape != COLLIDER_SPHERE) continue;
+            if (b[i].motion != DYNAMIC) continue;          // the balls
             if ((b[i].pos - before[i]).length() > real(0.15)) pushed++;
             vec3 n; real pen;
             if (contact_between(b[i], box, n, pen) && pen > real(0.05)) clear = false;
@@ -163,7 +169,7 @@ int main() {
         for (int s = 0; s < SETTLE; s++) maxv = physics_step(b, p, H);
         bool clear = true;
         for (int i = 0; i < (int)b.size(); i++) {
-            if (b[i].shape != COLLIDER_SPHERE) continue;
+            if (b[i].motion != DYNAMIC) continue;          // the balls
             vec3 n; real pen;
             if (contact_between(b[i], b[box_i], n, pen) && pen > real(0.02)) clear = false;
         }
@@ -186,10 +192,10 @@ int main() {
         int without_body = 0;
         for (int id = 0; id < (int)sc2.objects.size(); id++) if (idx[id] < 0) without_body++;
 
-        CHECK(vs2.bodies.size() == 5 && linked == 4 && unlinked == 1,
-              "showcase authors 5 bodies: 4 linked + 1 unlinked ground plane");
-        CHECK((int)sc2.objects.size() == 6 && without_body == 2,
-              "6 objects, 2 with no body: the plain floor and the decorative triangle");
+        CHECK(vs2.bodies.size() == 5 && linked == 5 && unlinked == 0,
+              "showcase authors 5 bodies, all linked to their objects");
+        CHECK((int)sc2.objects.size() == 6 && without_body == 1,
+              "6 objects, 1 with no body: the decorative triangle");
         sc2.release();
     }
 

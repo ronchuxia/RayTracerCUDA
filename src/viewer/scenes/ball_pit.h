@@ -49,14 +49,27 @@ inline viewer_scene build_ball_pit(scene& sc, real box_half) {
         make_checker(0.6, color(.2, .3, .1), color(.9, .9, .9)), sc.allocs);
     material* wall   = new_lambertian(color(0.55, 0.55, 0.6), sc.allocs);
 
-    sc.add(make_sphere(point3(0, -1000, 0), 1000, ground, sc.allocs));   // id 0: floor
+    // EVERY object here is transform-wrapped, container included: a body can only
+    // be linked to an object that has a pose to follow, and the transform is
+    // what supplies one. The prim is authored centred on its own origin and the
+    // transform places it, so `translation` reads as the object's position — the
+    // same convention the balls and the obstacle already use.
+    sc.add(new_transform(make_sphere(point3(0, 0, 0), 1000, ground, sc.allocs),
+                         vec3(0, -1000, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));  // id 0: floor
 
-    // 4 walls: quads spanning z (or x) horizontally and y=[0,BOX_H] vertically.
+    // 4 walls: quads spanning z (or x) horizontally and y=[0,BOX_H] vertically,
+    // authored about their own centre and translated into place.
     const real W = box_half, H = BOX_H;
-    sc.add(make_quad(point3(-W, 0, -W), vec3(0, 0, 2*W), vec3(0, H, 0), wall, sc.allocs));  // x = -W
-    sc.add(make_quad(point3( W, 0, -W), vec3(0, 0, 2*W), vec3(0, H, 0), wall, sc.allocs));  // x = +W
-    sc.add(make_quad(point3(-W, 0, -W), vec3(2*W, 0, 0), vec3(0, H, 0), wall, sc.allocs));  // z = -W
-    sc.add(make_quad(point3(-W, 0,  W), vec3(2*W, 0, 0), vec3(0, H, 0), wall, sc.allocs));  // z = +W
+    const vec3 span_z(0, 0, 2*W), span_x(2*W, 0, 0), up(0, H, 0);
+    const point3 corner_z(0, -H/2, -W), corner_x(-W, -H/2, 0);   // centred prims
+    sc.add(new_transform(make_quad(corner_z, span_z, up, wall, sc.allocs),
+                         vec3(-W, H/2, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 1: x = -W
+    sc.add(new_transform(make_quad(corner_z, span_z, up, wall, sc.allocs),
+                         vec3( W, H/2, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 2: x = +W
+    sc.add(new_transform(make_quad(corner_x, span_x, up, wall, sc.allocs),
+                         vec3(0, H/2, -W), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 3: z = -W
+    sc.add(new_transform(make_quad(corner_x, span_x, up, wall, sc.allocs),
+                         vec3(0, H/2,  W), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 4: z = +W
 
     // Box obstacle in the centre. Transform-wrapped like every editable object,
     // which is what makes it a physics body (STATIC + an oriented box collider
@@ -71,16 +84,15 @@ inline viewer_scene build_ball_pit(scene& sc, real box_half) {
                                       vec3(0, OBS_HALF_Y, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));
 
     // ---- physics ----
-    // The container's collision shapes, deliberately NOT the visual ones:
-    // the floor renders as a huge sphere and the walls as thin quads, but both
-    // collide as half-spaces (a plane cannot be tunnelled through the way a thin
-    // box can, and it costs one dot product).
+    // EVERY collider is read from the object it belongs to, so nothing here can
+    // disagree with what you see: the floor collides as the radius-1000 sphere it
+    // draws as, and each wall as its own quad (2W x H x ~1e-4 thick, which is
+    // bounded — a ball above the wall top now clears it instead of hitting a
+    // barrier that is not drawn).
     std::vector<phys_body> bodies;
-    bodies.push_back(make_plane_body(vec3(0, 1, 0), 0,   PIT_MU));  // ground y = 0
-    bodies.push_back(make_plane_body(vec3( 1, 0, 0), -W, PIT_MU));  // x = -W, facing inward
-    bodies.push_back(make_plane_body(vec3(-1, 0, 0), -W, PIT_MU));  // x = +W
-    bodies.push_back(make_plane_body(vec3(0, 0,  1), -W, PIT_MU));  // z = -W
-    bodies.push_back(make_plane_body(vec3(0, 0, -1), -W, PIT_MU));  // z = +W
+    bodies.push_back(make_sphere_body(sc, 0, STATIC, real(1), PIT_MU));   // floor
+    for (int wall_id = 1; wall_id <= 4; wall_id++)
+        bodies.push_back(make_box_body(sc, wall_id, STATIC, real(1), PIT_MU));
     // The obstacle: STATIC, but switch it to KINEMATIC in the Object panel and
     // dragging it shoves the whole pile around.
     bodies.push_back(make_box_body(sc, obs_id, STATIC, real(1), PIT_MU));

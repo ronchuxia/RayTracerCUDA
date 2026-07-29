@@ -15,7 +15,7 @@
 // the caller. See docs/plans/physics.md and docs/timestep-and-pacing.md.
 //
 // EVERYTHING THAT COLLIDES IS A BODY. The ground, the container walls and any
-// obstacle are `phys_body`s with STATIC motion and a plane/box collider, exactly
+// obstacle are `phys_body`s with STATIC motion and a sphere/box collider, exactly
 // like the falling spheres — there is no separate notion of "world geometry".
 // That is what lets one code path cover every case: a contact is always a pair
 // of real body indices, immovability is always just inv_mass() == 0, and a
@@ -35,9 +35,15 @@
 // combine_friction(), so STATIC / KINEMATIC / DYNAMIC and any mass ratio all
 // share one code path. See docs/plans/physics.md (Phase 3).
 //
-// Current scope: SPHERE colliders against planes, boxes and each other. Boxes
-// are ORIENTED (they carry their own axes), so a rotated box collides as itself.
-// Box-box / box-plane and angular dynamics are Phase 3B (GJK/EPA + quaternions).
+// Current scope: SPHERE colliders against boxes and each other. Boxes are
+// ORIENTED (they carry their own axes), so a rotated box collides as itself.
+// Box-box and angular dynamics are Phase 3B (GJK/EPA + quaternions).
+//
+// THERE IS NO PLANE COLLIDER. Every collider is read from the scene object it is
+// attached to, and no object is an infinite plane — a bounded surface is a box
+// (the ball pit's walls are its own wall quads) and an unbounded one is whatever
+// large shape actually renders (its floor is a radius-1000 sphere, and collides
+// as that sphere). So a collider can never disagree with the thing you see.
 
 // How a body moves — the physics ROLE (with `collidable`, the 2-field model
 // USD/PhysX use). The solver never switches on this directly; it reads the
@@ -56,7 +62,7 @@ enum motion_type { STATIC, KINEMATIC, DYNAMIC };
 // What a body collides AS, independent of what it renders as. Prefixed because
 // a bare SPHERE/BOX would collide with hittable.h's HittableType at global
 // scope in the viewer, which includes both headers.
-enum collider_type { COLLIDER_PLANE, COLLIDER_SPHERE, COLLIDER_BOX };
+enum collider_type { COLLIDER_SPHERE, COLLIDER_BOX };
 
 // A simulated body. pos/vel + the collider fields are the physics state the step
 // touches; scene_id + baseR/baseS are caller bookkeeping (which scene object
@@ -71,7 +77,7 @@ enum collider_type { COLLIDER_PLANE, COLLIDER_SPHERE, COLLIDER_BOX };
 //
 // The collider parameters sit FLAT rather than in a tagged union: this is
 // host-side code over a handful of bodies, so readability beats the few dead
-// bytes a sphere carries for the plane/box fields, and appending them keeps
+// bytes a sphere carries for the box fields, and appending them keeps
 // every existing aggregate initialiser valid.
 struct phys_body {
     int  scene_id;
@@ -93,8 +99,6 @@ struct phys_body {
     // collider and the rendered pose cannot drift apart. B3's quaternion
     // becomes the authoritative orientation and these are derived from it.
     vec3          axes[3]    = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };
-    vec3          normal     = vec3(0, 1, 0);  // COLLIDER_PLANE unit normal (inward)
-    real          offset     = real(0);        // COLLIDER_PLANE: dot(x, normal) = offset
 };
 
 // Inverse mass — the ONLY channel through which a role reaches the solver: a
@@ -107,15 +111,7 @@ struct phys_body {
 // runtime (the viewer dragging a box to KINEMATIC) can never be left behind
 // with a finite mass. Authoring keeps `mass` because that is the meaningful UI
 // quantity; switching a body back to DYNAMIC restores the mass it was given.
-// A COLLIDER_PLANE is never dynamic, whatever `motion` says. An infinite plane
-// has no finite extent, so it has no centre of mass and no inertia tensor —
-// there is nothing for gravity to act on or for an impulse to rotate. It is a
-// boundary condition, not a rigid body. Both major engines put the restriction
-// in the type (Bullet names the shape btStaticPlaneShape; PhysX allows plane
-// geometry only on static actors); with a flat shape enum we enforce it here
-// instead. KINEMATIC stays legal and useful: a driven plane is a moving floor.
 inline real inv_mass(const phys_body& b) {
-    if (b.shape == COLLIDER_PLANE) return real(0);
     return b.motion == DYNAMIC ? real(1) / b.mass : real(0);
 }
 
@@ -234,8 +230,7 @@ struct contact {
 
 // Narrow phase for ONE ORDERED pair: fills n (from B toward A) and pen. Every
 // implemented test is sphere-vs-X, so build_contacts canonicalises the sphere
-// into A before calling. Box-box / box-plane / plane-plane return false until
-// B2's GJK/EPA lands.
+// into A before calling. Box-box returns false until B2's GJK/EPA lands.
 inline bool contact_between(const phys_body& A, const phys_body& B, vec3& n, real& pen) {
     if (A.shape != COLLIDER_SPHERE) return false;
 
@@ -247,13 +242,6 @@ inline bool contact_between(const phys_body& A, const phys_body& B, vec3& n, rea
         real dist = std::sqrt(dist2);
         n = d / dist;
         pen = rsum - dist;
-        return true;
-    }
-    if (B.shape == COLLIDER_PLANE) {               // sphere vs half-space
-        real dist = dot(A.pos, B.normal) - B.offset;   // signed distance, + is inside
-        if (dist >= A.radius) return false;
-        n = B.normal;
-        pen = A.radius - dist;
         return true;
     }
     // Sphere vs ORIENTED box: move the sphere centre into the box's own frame
@@ -401,7 +389,7 @@ inline void solve_sequential(std::vector<phys_body>& bodies, const phys_params& 
 // EXACTLY THE BODIES THE SOLVER CAN PUSH. That equivalence is the point: a body
 // that fell under gravity but absorbed no impulse would be unpushable and yet in
 // motion. Testing the same function everywhere makes the two impossible to
-// disagree — including for a plane, which inv_mass() refuses to make dynamic.
+// disagree.
 // (`mass` is authored strictly positive, so a movable body's reciprocal is
 // always > 0; the viewer's field clamps it to [0.01, 1000].)
 //

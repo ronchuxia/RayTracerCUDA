@@ -788,22 +788,9 @@ int main(int argc, char** argv) {
                             }
                             // Must stay in motion_type order — the combo writes
                             // its index straight back as the enum value.
-                            //
-                            // A PLANE is never offered "dynamic": it has no
-                            // finite extent, so no centre of mass and no inertia
-                            // tensor (see inv_mass, which enforces this whatever
-                            // the field says). STATIC = 0 and KINEMATIC = 1, so
-                            // truncating the list needs no index remapping — the
-                            // enum's ordering pays for itself again. A scene that
-                            // authored a dynamic plane displays as the role it
-                            // actually gets, the same way `mass` below stays
-                            // stored but hidden once a body is immovable.
                             static const char* kMotion[] = { "static", "kinematic", "dynamic" };
-                            const bool is_plane = (b.shape == COLLIDER_PLANE);
                             int m = (int)b.motion;
-                            if (is_plane && m > (int)KINEMATIC) m = (int)STATIC;
-                            if (ImGui::Combo("motion", &m, kMotion,
-                                             is_plane ? 2 : IM_ARRAYSIZE(kMotion))) {
+                            if (ImGui::Combo("motion", &m, kMotion, IM_ARRAYSIZE(kMotion))) {
                                 b.motion = (motion_type)m;
                                 // A stale velocity on an immovable body would still
                                 // be read as approach speed at its contacts, so it

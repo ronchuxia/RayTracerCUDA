@@ -6,8 +6,8 @@
 //   nvcc tests/test_physics.cu -o build/test_physics -std=c++14 -arch=sm_86 -rdc=true -Isrc
 //
 // Everything that collides is a body, so these build their world the same way
-// the viewer does: a STATIC plane body for the ground, STATIC box bodies for
-// obstacles, DYNAMIC spheres for the movers.
+// the viewer does: STATIC box bodies for the ground and obstacles, DYNAMIC
+// spheres for the movers.
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -18,10 +18,13 @@
                               else printf("ok: %s\n", msg); } while (0)
 
 // --- world builders, mirroring the viewer's body scan ---
+// The ground is a large flat static BOX with its top face at y = 0. There is no
+// plane collider any more: every collider is read from the object it belongs to,
+// and no scene object is an infinite plane. A box top gives the same contact
+// normal and penetration a plane did, so the assertions below are unchanged.
 static phys_body ground_plane(real friction = real(0.5), real restitution = real(0.7)) {
-    phys_body g{ -1, vec3(0,0,0), vec3(0,0,0), real(0), vec3(), vec3() };
-    g.motion = STATIC; g.shape = COLLIDER_PLANE;
-    g.normal = vec3(0,1,0); g.offset = real(0);
+    phys_body g{ -1, vec3(0, -100, 0), vec3(0,0,0), real(0), vec3(), vec3() };
+    g.motion = STATIC; g.shape = COLLIDER_BOX; g.half = vec3(1000, 100, 1000);
     g.friction = friction; g.restitution = restitution;
     return g;
 }
@@ -192,35 +195,6 @@ int main() {
         for (int s = 0; s < 4000; s++) physics_step(b, p_bounce, h);
         CHECK(b[2].pos[1] < real(0.3),
               "oriented box: a ball over the turned box's corner falls to the ground");
-    }
-
-    // 3p. An infinite PLANE can never be dynamic: no finite extent, so no centre
-    //     of mass and no inertia tensor. inv_mass() refuses it whatever `motion`
-    //     says, and physics_step gates on inv_mass too — so it is refused
-    //     consistently, rather than falling under gravity while absorbing no
-    //     impulse (which is what enforcing it in only one of the two would give).
-    {
-        phys_body g = ground_plane();
-        g.motion = DYNAMIC;                 // what a scene must not author
-        CHECK(inv_mass(g) == real(0), "plane: DYNAMIC still yields zero inverse mass");
-
-        std::vector<phys_body> b;
-        b.push_back(g);
-        b.push_back(ball(0, vec3(0, 3, 0), vec3(), real(0.5)));
-        for (int s = 0; s < 2400; s++) physics_step(b, p_bounce, h);   // 10 s
-        CHECK(b[0].pos.length() < real(1e-9) && b[0].vel.length() < real(1e-9),
-              "plane: a DYNAMIC plane is never integrated (no fall, no velocity)");
-        // The failure mode of an over-eager fix is the plane leaving collision
-        // altogether, so check it still holds the ball up.
-        CHECK(std::fabs((double)b[1].pos[1] - 0.5) < 1e-2,
-              "plane: a ball still rests on it — immovable, not absent");
-    }
-    {
-        // KINEMATIC stays legal: a driven plane is a moving floor, and it is
-        // immovable to the solver exactly as STATIC is.
-        phys_body g = ground_plane();
-        g.motion = KINEMATIC;
-        CHECK(inv_mass(g) == real(0), "plane: KINEMATIC remains legal and immovable");
     }
 
     // 4. Physics ROLES (motion + collidable). Gravity is off and the bodies sit

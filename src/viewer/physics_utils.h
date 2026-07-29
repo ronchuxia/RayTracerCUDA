@@ -1,6 +1,9 @@
 #ifndef VIEWER_PHYSICS_UTILS_H
 #define VIEWER_PHYSICS_UTILS_H
 
+#include <cstdlib>
+#include <iostream>
+
 #include "hittable.h"
 #include "hittables/sphere.h"
 #include "hittables/transforms.h"
@@ -24,41 +27,54 @@
 // solver, and both carry the same role, mass and surface properties.
 //   scene_id >= 0  LINKED to a scene object. The viewer writes simulated poses
 //                  back to its transform and the Object panel can select it.
-//   scene_id <  0  UNLINKED: no render counterpart, so there is no transform to
-//                  write a pose into and no way to pick it. Today that is the
-//                  ground plane and the container walls, whose visual stand-ins
-//                  (a huge sphere, thin quads) are deliberately NOT their
-//                  collision shape.
-// Unlinked says nothing about being immovable or part of the environment: an
-// unlinked body defaults to DYNAMIC like any other, and the linked obstacle box
-// is as much "the scenery" as the walls are. Linkage becomes optional for every
-// collider in the next step, at which point the ground can be linked to the
-// floor object it stands in for and still be the ground.
+//   scene_id <  0  UNLINKED: no render counterpart. Nothing produces one today
+//                  — every collider is read from an object — but the field and
+//                  the solver both still support it, for the deferred
+//                  "collider with no visual" case.
+//
+// EVERY COLLIDER IS READ FROM ITS OBJECT. There is no way to author a shape that
+// differs from what renders, which is why there is no plane collider: nothing in
+// a scene is an infinite plane. The ground collides as the big sphere it draws
+// as; a wall collides as the quad it draws as. Letting a scene write its own
+// shape — a box collider on a sphere, or a collider with no visual at all — is
+// designed in docs/plans/phase3-status.md item 1 and deliberately not built.
 //
 // The sphere/box factories read the object's live pose, so call them after the
 // object is added. Both require a TRANSFORM-wrapped object: the transform is
 // what supplies pose (and what a drag edits), which is also what makes the
 // object selectable in the first place.
 
-// An unlinked plane: the half-space `dot(x, normal) >= offset` is the solid side.
-// Ground is (normal (0,1,0), offset 0); a wall at x = -W facing inward is
-// (normal (1,0,0), offset -W); the opposite wall is (normal (-1,0,0), offset -W).
-inline phys_body make_plane_body(const vec3& normal, real offset,
-                                 real friction = real(0.5), real restitution = real(0.7)) {
-    phys_body b{ -1, vec3(0,0,0), vec3(0,0,0), real(0), vec3(), vec3() };
-    b.motion = STATIC;  b.shape = COLLIDER_PLANE;
-    b.normal = normal;  b.offset = offset;
-    b.friction = friction;  b.restitution = restitution;
-    return b;
+// Every factory needs a TRANSFORM-wrapped object: the transform is what supplies
+// the pose a collider is placed by. Checked rather than assumed — a static_cast
+// through a wrong tag reads unrelated bytes as a pose. Fatal like the asset
+// loaders (loaders/stl_loader.h), because it is an authoring mistake that would
+// otherwise produce a silently wrong collider.
+inline transform* get_body_transform(scene& sc, int scene_id) {
+    hittable* h = sc.get(scene_id);
+    if (!h || h->type != TRANSFORM) {
+        std::cerr << "scene object " << scene_id << " is not transform-wrapped\n";
+        std::exit(1);
+    }
+    return static_cast<transform*>(h->object);
 }
 
-// A sphere collider for scene object `scene_id`. Radius is the prim's radius scaled by
-// the transform, matching how the viewer re-derives it after an edit.
+// A sphere collider for scene object `scene_id`. Radius is the prim's radius
+// scaled by the transform, matching how the viewer re-derives it after an edit.
+//
+// Both casts are CHECKED. `hittable` carries a type tag precisely so this is
+// checkable, and reading past a wrong tag is not a wrong number but a read of
+// unrelated memory: pointing this at the ball pit's obstacle (a transform-wrapped
+// BOX) yields radius 0.450050 — the box's own half-height, read out of the
+// child list's bounding box — which is plausible enough to survive review.
 inline phys_body make_sphere_body(scene& sc, int scene_id, motion_type motion = DYNAMIC,
                                   real mass = real(1),
                                   real friction = real(0.5), real restitution = real(0.7)) {
-    transform* tr = static_cast<transform*>(sc.get(scene_id)->object);
-    sphere*    sp = static_cast<sphere*>(tr->child->object);
+    transform* tr = get_body_transform(sc, scene_id);
+    if (tr->child->type != SPHERE) {
+        std::cerr << "scene object " << scene_id << " does not wrap a sphere\n";
+        std::exit(1);
+    }
+    sphere* sp = static_cast<sphere*>(tr->child->object);
     phys_body b{ scene_id, tr->translation, vec3(0,0,0),
                  sp->radius * tr->scale.y(), tr->rotation, tr->scale };
     b.motion = motion;  b.mass = mass;
@@ -100,7 +116,7 @@ inline void box_collider_of(const transform* tr, vec3& pos, vec3& half, vec3 axe
 inline phys_body make_box_body(scene& sc, int scene_id, motion_type motion = STATIC,
                                real mass = real(1),
                                real friction = real(0.5), real restitution = real(0.7)) {
-    transform* tr = static_cast<transform*>(sc.get(scene_id)->object);
+    transform* tr = get_body_transform(sc, scene_id);
     phys_body b{ scene_id, vec3(0,0,0), vec3(0,0,0), real(0), tr->rotation, tr->scale };
     b.motion = motion;  b.mass = mass;
     b.shape  = COLLIDER_BOX;
