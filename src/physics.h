@@ -27,17 +27,21 @@
 // SOLVER (how to respond). The solver is SEQUENTIAL IMPULSE: build the contact
 // set once, then iterate accumulated normal + friction impulses (Gauss-Seidel)
 // for velocity, followed by a projected position pass. Crowded piles settle
-// instead of buzzing. This is the seam the convex-convex (GJK/EPA) detector
-// will emit into.
+// instead of buzzing. A contact is a normal plus a depth and nothing else, which
+// is what lets the analytic tests here and the convex-convex detector in gjk.h
+// feed the same solver.
 //
 // Every body carries a physics ROLE (`motion` + `collidable`), a `mass` and a
 // surface `friction`, which the solver reads only through inv_mass() and
 // combine_friction(), so STATIC / KINEMATIC / DYNAMIC and any mass ratio all
 // share one code path. See docs/plans/physics.md (Phase 3).
 //
-// Current scope: SPHERE colliders against boxes and each other. Boxes are
-// ORIENTED (they carry their own axes), so a rotated box collides as itself.
-// Box-box and angular dynamics are Phase 3B (GJK/EPA + quaternions).
+// Current scope: SPHERE and BOX colliders, every pairing. Boxes are ORIENTED
+// (they carry their own axes), so a rotated box collides as itself. Sphere-sphere
+// and sphere-box have exact analytic tests; everything else goes through the
+// support-function detector in gjk.h. Angular dynamics — a box SPINNING in
+// response to an off-centre hit — is still B3, so contacts carry a normal and a
+// depth but no contact point.
 //
 // THERE IS NO PLANE COLLIDER. Every collider is read from the scene object it is
 // attached to, and no object is an infinite plane — a bounded surface is a box
@@ -100,6 +104,12 @@ struct phys_body {
     // becomes the authoritative orientation and these are derived from it.
     vec3          axes[3]    = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };
 };
+
+// Convex-convex detection, DEFINED IN gjk.h, which is included at the bottom of
+// this file once phys_body is complete — the same wiring hittable.h uses for its
+// composite shapes. Declared here because contact_between below calls it.
+inline vec3 support(const phys_body& b, const vec3& dir);
+inline bool gjk_epa_contact(const phys_body& A, const phys_body& B, vec3& n, real& pen);
 
 // Inverse mass — the ONLY channel through which a role reaches the solver: a
 // heavier body simply takes less of each contact impulse, and an immovable one
@@ -228,13 +238,22 @@ struct contact {
     real pen;
 };
 
-// Narrow phase for ONE ORDERED pair: fills n (from B toward A) and pen. Every
-// implemented test is sphere-vs-X, so build_contacts canonicalises the sphere
-// into A before calling. Box-box returns false until B2's GJK/EPA lands.
+// Narrow phase for ONE ORDERED pair: fills n (from B toward A) and pen.
+//
+// Sphere-sphere and sphere-box have exact closed-form answers, so they are taken
+// directly; build_contacts canonicalises the sphere into A so those two cases
+// are what an ordered pair usually is. EVERY OTHER PAIRING FALLS THROUGH TO
+// GJK/EPA, which needs nothing but each shape's support function and so is
+// already correct for box-box, for a box handed in as A with a sphere as B, and
+// for B4's convex hulls without further cases here.
+//
+// The two paths are interchangeable, not layered: both fill the same n and pen
+// in the same convention, and tests/test_physics.cu pins them against each other
+// on the same configurations. Keeping the analytic pair is a cost decision (a
+// handful of operations against an iterative search) and an exactness one, not a
+// correctness one.
 inline bool contact_between(const phys_body& A, const phys_body& B, vec3& n, real& pen) {
-    if (A.shape != COLLIDER_SPHERE) return false;
-
-    if (B.shape == COLLIDER_SPHERE) {              // sphere vs sphere
+    if (A.shape == COLLIDER_SPHERE && B.shape == COLLIDER_SPHERE) {   // sphere vs sphere
         vec3 d = A.pos - B.pos;
         real dist2 = d.length_squared();
         real rsum = A.radius + B.radius;
@@ -244,24 +263,26 @@ inline bool contact_between(const phys_body& A, const phys_body& B, vec3& n, rea
         pen = rsum - dist;
         return true;
     }
-    // Sphere vs ORIENTED box: move the sphere centre into the box's own frame
-    // (project the separation onto each box axis), run the axis-aligned test
-    // there against +/-half, then rotate the normal back out. The box's axes
-    // absorb the rotation, so no separate oriented-box test is needed — the same
-    // move B2's support functions generalise to every convex shape. For an
-    // axis-aligned box the axes are identity and this reduces to the plain test,
-    // now expressed relative to the box centre.
-    vec3 d = A.pos - B.pos;
-    vec3 c_local(dot(d, B.axes[0]), dot(d, B.axes[1]), dot(d, B.axes[2]));
-    vec3 n_local;
-    if (!sphere_box_contact(c_local, A.radius, -B.half, B.half, n_local, pen)) return false;
-    n = n_local.x() * B.axes[0] + n_local.y() * B.axes[1] + n_local.z() * B.axes[2];
-    return true;   // unit: n_local is unit and the axes are orthonormal
+    if (A.shape == COLLIDER_SPHERE && B.shape == COLLIDER_BOX) {
+        // Sphere vs ORIENTED box: move the sphere centre into the box's own
+        // frame (project the separation onto each box axis), run the
+        // axis-aligned test there against +/-half, then rotate the normal back
+        // out. The box's axes absorb the rotation, so no separate oriented-box
+        // test is needed. For an axis-aligned box the axes are identity and this
+        // reduces to the plain test, expressed relative to the box centre.
+        vec3 d = A.pos - B.pos;
+        vec3 c_local(dot(d, B.axes[0]), dot(d, B.axes[1]), dot(d, B.axes[2]));
+        vec3 n_local;
+        if (!sphere_box_contact(c_local, A.radius, -B.half, B.half, n_local, pen)) return false;
+        n = n_local.x() * B.axes[0] + n_local.y() * B.axes[1] + n_local.z() * B.axes[2];
+        return true;   // unit: n_local is unit and the axes are orthonormal
+    }
+    return gjk_epa_contact(A, B, n, pen);
 }
 
-// Shared NARROW PHASE: every overlapping pair, as a contact. This is the seam
-// Phase 3B's convex-convex (GJK/EPA) detector will emit into — the solver below
-// does not care what shape produced a contact.
+// Shared NARROW PHASE: every overlapping pair, as a contact. The solver below
+// does not care what shape produced a contact, nor which of contact_between's
+// two paths found it.
 //
 // ROLES filter here rather than in the solver: a non-collidable body has no
 // contacts at all, and a pair that cannot move EITHER side is never worth
@@ -277,7 +298,9 @@ inline void build_contacts(const std::vector<phys_body>& bodies, std::vector<con
         for (std::size_t j = i + 1; j < bodies.size(); j++) {
             if (!bodies[i].collidable || !bodies[j].collidable) continue;
             if (inv_mass(bodies[i]) + inv_mass(bodies[j]) <= real(0)) continue;  // both immovable
-            // Canonicalise so the sphere is the first operand (see contact_between).
+            // Canonicalise so the sphere is the first operand, which is what
+            // puts a sphere/box pair on contact_between's analytic fast path.
+            // Correctness does not depend on it — GJK/EPA handles either order.
             int a = (int)i, b = (int)j;
             if (bodies[a].shape != COLLIDER_SPHERE && bodies[b].shape == COLLIDER_SPHERE)
                 { a = (int)j; b = (int)i; }
@@ -413,5 +436,10 @@ inline real physics_step(std::vector<phys_body>& bodies, const phys_params& p, r
     }
     return maxv;
 }
+
+// The convex-convex detector, wired in at the bottom so it can see the complete
+// phys_body it reads colliders from (hittable.h does the same for the composite
+// shapes its dispatch calls). Include physics.h, never gjk.h.
+#include "gjk.h"
 
 #endif // PHYSICS_H

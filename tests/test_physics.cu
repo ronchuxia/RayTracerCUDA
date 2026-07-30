@@ -35,6 +35,15 @@ static phys_body static_box(const vec3& centre, const vec3& half,
     b.friction = friction; b.restitution = restitution;
     return b;
 }
+// A box that FALLS. Box-box contact is convex-convex (gjk.h), so this is the
+// only body type that exercises it end to end; before B2 a dynamic box fell
+// through everything because the narrow phase had no test for it.
+static phys_body dynamic_box(const vec3& centre, const vec3& half,
+                             real friction = real(0.5), real restitution = real(0.7)) {
+    phys_body b = static_box(centre, half, friction, restitution);
+    b.motion = DYNAMIC;
+    return b;
+}
 // The same box turned `deg` degrees about y. physics.h reads the box's axes, not
 // an angle, so the test writes them directly — it has no dependency on
 // transforms.h. These are the columns of Ry(deg), matching what
@@ -392,6 +401,185 @@ int main() {
         printf("  rebound height: MAX %.3f, GEOMETRIC %.3f\n", (double)max_top, (double)geo_top);
         CHECK(max_top > real(0.8) && geo_top < real(0.6),
               "combine: the rule reaches the solver (bouncy ball on a dead floor)");
+    }
+
+    // 8. CONVEX-CONVEX (B2): support functions + GJK/EPA, in src/gjk.h. These
+    //    are what let ANY pair of convex colliders collide from one code path,
+    //    where before every pair needed its own analytic test and box-box
+    //    silently had none.
+    {
+        const double SQRT2 = 1.41421356237309504880;
+
+        // 8a. support(): the only thing GJK and EPA ever ask a shape. Everything
+        //     downstream is wrong if this is wrong, and it is three lines, so it
+        //     is pinned directly.
+        {
+            phys_body s = ball(-1, vec3(1, 2, 3), vec3(), real(2));
+            vec3 sp = support(s, vec3(0, 5, 0));                 // length must not matter
+            CHECK(std::fabs((double)sp[0] - 1) < 1e-5 &&
+                  std::fabs((double)sp[1] - 4) < 1e-5 &&
+                  std::fabs((double)sp[2] - 3) < 1e-5,
+                  "support: a sphere answers with its centre plus one radius along the direction");
+
+            phys_body bx = static_box(vec3(0, 0, 0), vec3(1, 2, 3));
+            vec3 bp = support(bx, vec3(1, -1, 1));
+            CHECK(bp[0] == real(1) && bp[1] == real(-2) && bp[2] == real(3),
+                  "support: a box answers with the corner extreme along each of its own axes");
+
+            // The turned box is the case that makes the whole approach worth it:
+            // its support reaches a CORNER at sqrt(2), where a world bounding box
+            // would report a flat face there. Same fact B1e fixed by hand for
+            // sphere-box, now falling out of the support function for every pair.
+            phys_body r45 = rotated_box_y(vec3(0, 0, 0), vec3(1, 1, 1), real(45));
+            vec3 rp = support(r45, vec3(1, 0, 0));
+            CHECK(std::fabs((double)rp[0] - SQRT2) < 1e-4,
+                  "support: a turned box reaches out to its corner, not its face");
+        }
+
+        // 8b. GJK's yes/no, on the pair that had no test at all before B2.
+        {
+            vec3 n; real pen;
+            CHECK(!gjk_epa_contact(static_box(vec3(0,0,0), vec3(1,1,1)),
+                                   static_box(vec3(3,0,0), vec3(1,1,1)), n, pen),
+                  "gjk: two separated boxes do not touch");
+            CHECK(gjk_epa_contact(static_box(vec3(0,0,0), vec3(1,1,1)),
+                                  static_box(vec3(real(1.9),0,0), vec3(1,1,1)), n, pen),
+                  "gjk: two overlapping boxes do touch");
+        }
+
+        // 8c. EPA's depth and normal. Each case has an answer computable by hand,
+        //     which is the point of choosing them.
+        {
+            vec3 n; real pen;
+            // Overlapping 0.1 along x. A is at the origin, so A must move -x.
+            gjk_epa_contact(static_box(vec3(0,0,0), vec3(1,1,1)),
+                            static_box(vec3(real(1.9),0,0), vec3(1,1,1)), n, pen);
+            CHECK(std::fabs((double)n[0] + 1) < 1e-3 && std::fabs((double)pen - 0.1) < 1e-3,
+                  "epa: box overlapping a box along x gives normal -x, depth 0.1");
+
+            // Face-to-face and axis-aligned — the configuration most likely to
+            // degenerate, because so many support points tie.
+            gjk_epa_contact(static_box(vec3(0, real(1.95), 0), vec3(1,1,1)),
+                            static_box(vec3(0, 0, 0), vec3(1,1,1)), n, pen);
+            CHECK(std::fabs((double)n[1] - 1) < 1e-3 && std::fabs((double)pen - 0.05) < 1e-3,
+                  "epa: a box resting squarely on a box gives normal +y, depth 0.05");
+
+            // A 45-degree box driven corner-first into a face. Its corner reaches
+            // x = sqrt(2); the other box's face is at 1.3.
+            gjk_epa_contact(rotated_box_y(vec3(0,0,0), vec3(1,1,1), real(45)),
+                            static_box(vec3(real(2.3),0,0), vec3(1,1,1)), n, pen);
+            CHECK(std::fabs((double)n[0] + 1) < 1e-3 &&
+                  std::fabs((double)pen - (SQRT2 - 1.3)) < 2e-3,
+                  "epa: a turned box driven corner-first reports the corner's depth");
+
+            // COINCIDENT CENTRES. A small box entirely inside a big one, sharing
+            // its centre exactly. The shallowest way out is +/-y, through the
+            // 0.8 half-height, so the depth is 0.8 + 0.3 = 1.1.
+            //
+            // This is the case that caught EPA orienting its faces from the
+            // ORIGIN: with the centres exactly equal, the origin can land on a
+            // starting face's plane, which leaves that face's direction
+            // undetermined and its distance 0 — permanently the nearest face, and
+            // one the convergence test accepts immediately. It reported zero
+            // penetration for a 1.98-deep overlap, and moving the centres apart
+            // by 0.001 hid it completely. Faces are oriented from the
+            // tetrahedron's centroid now, which cannot lie on one of its own
+            // faces.
+            bool concentric = gjk_epa_contact(
+                static_box(vec3(0,0,0), vec3(real(0.5), real(0.3), real(0.6))),
+                static_box(vec3(0,0,0), vec3(real(1), real(0.8), real(1.2))), n, pen);
+            CHECK(concentric && std::fabs((double)pen - 1.1) < 1e-3 &&
+                  std::fabs((double)std::fabs((double)n[1]) - 1) < 1e-3,
+                  "epa: two boxes sharing a centre exactly report the shallowest way out");
+        }
+
+        // 8d. The two paths must agree. contact_between takes the analytic
+        //     sphere-box test; gjk_epa_contact takes the general one. Same
+        //     configuration, same answer — that is what makes the fast path a
+        //     cost decision rather than a second implementation to keep in sync.
+        //
+        //     The normal tolerance is 0.01, not 1e-5 like the depth: EPA's
+        //     tolerance is on DISTANCE, which bounds the ANGLE only to
+        //     sqrt(2*TOL/r) on a curved surface. Measured worst case here is
+        //     0.0063 rad (0.36 degrees), identical in float and double. See the
+        //     table at EPA_TOL in src/gjk.h.
+        {
+            double worst_n = 0, worst_pen = 0, worst_swapped = 0;
+            int disagreements = 0, touching = 0;
+            for (int i = 0; i < 12; i++)
+            for (int j = 0; j < 12; j++)
+            for (int k = 0; k < 12; k++) {
+                vec3 c(real(-1.6 + 0.29*i), real(-1.6 + 0.29*j), real(-1.6 + 0.29*k));
+                phys_body S = ball(-1, c, vec3(), real(0.5));
+                phys_body B = rotated_box_y(vec3(0,0,0), vec3(1, real(0.6), real(0.8)), real(30));
+
+                vec3 n1, n2; real p1, p2;
+                bool h1 = contact_between(S, B, n1, p1);      // analytic fast path
+                bool h2 = gjk_epa_contact(S, B, n2, p2);      // general path
+                if (h1 != h2) { disagreements++; continue; }
+                if (!h1) continue;
+                touching++;
+                double dn = (double)(n1 - n2).length();
+                double dp = std::fabs((double)p1 - (double)p2);
+                if (dn > worst_n)   worst_n = dn;
+                if (dp > worst_pen) worst_pen = dp;
+
+                // Handed in the other way round, the box lands in slot A and
+                // there is no analytic test for it, so it goes through GJK/EPA.
+                // The answer must be the same collision with the normal flipped.
+                vec3 n3; real p3;
+                if (contact_between(B, S, n3, p3)) {
+                    double d = (double)(n1 + n3).length() + std::fabs((double)p1 - (double)p3);
+                    if (d > worst_swapped) worst_swapped = d;
+                } else disagreements++;
+            }
+            printf("  sphere-box: %d touching of 1728, worst |dn| %.5f, worst |dpen| %.7f,"
+                   " worst swapped-order error %.5f\n",
+                   touching, worst_n, worst_pen, worst_swapped);
+            CHECK(disagreements == 0 && touching > 400,
+                  "analytic and convex-convex agree on WHETHER a sphere and box touch");
+            CHECK(worst_n < 0.01 && worst_pen < 1e-4,
+                  "analytic and convex-convex agree on the normal and the depth");
+            CHECK(worst_swapped < 0.02,
+                  "the pair order does not change the collision, only the normal's sign");
+        }
+
+        // 8e. The narrow phase emits box-box now. Before B2 contact_between
+        //     returned false for any pair without a sphere, so two overlapping
+        //     boxes produced NO contact and passed through each other.
+        {
+            std::vector<phys_body> b;
+            b.push_back(static_box(vec3(0, 0, 0), vec3(1, 1, 1)));
+            b.push_back(dynamic_box(vec3(0, real(1.9), 0), vec3(1, 1, 1)));
+            std::vector<contact> C;
+            build_contacts(b, C);
+            // Neither body is a sphere, so there is nothing to canonicalise and
+            // the pair keeps scan order. Assert the CONVENTION the solver relies
+            // on instead of that order: n points from b toward a, so it agrees
+            // in sign with the separation of their centres.
+            bool oriented = C.size() == 1 &&
+                            dot(C[0].n, b[C[0].a].pos - b[C[0].b].pos) > real(0) &&
+                            std::fabs((double)std::fabs((double)C[0].n[1]) - 1) < 1e-3;
+            CHECK(oriented,
+                  "build_contacts emits a box-box contact, with n from b toward a");
+        }
+
+        // 8f. End to end: a box falls under gravity and comes to rest on another
+        //     box. Half-extent 0.5 on a top face at y = 0, so it rests at 0.5.
+        {
+            std::vector<phys_body> b;
+            b.push_back(ground_plane(real(0.5), real(0)));
+            b.push_back(dynamic_box(vec3(0, real(3), 0), vec3(real(0.5), real(0.5), real(0.5)),
+                                    real(0.5), real(0)));
+            const phys_params p{ real(-9.8) };
+            real maxv = 0;
+            for (int s = 0; s < 2400; s++) maxv = physics_step(b, p, h);
+            printf("  dropped box rests at y = %.5f (expect 0.5), max |v| = %.5f\n",
+                   (double)b[1].pos[1], (double)maxv);
+            CHECK(std::fabs((double)b[1].pos[1] - 0.5) < 2e-3,
+                  "a dropped box comes to rest on the surface, not through it");
+            CHECK(maxv < real(0.02), "and settles rather than buzzing");
+        }
     }
 
     printf(fails ? "PHYSICS TESTS FAILED (%d)\n" : "ALL PHYSICS TESTS PASSED\n", fails);
