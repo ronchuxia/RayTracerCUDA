@@ -934,7 +934,7 @@ int main(int argc, char** argv) {
             total_samples += spp_per_frame;
 
             char title[96];
-            snprintf(title, sizeof(title), "RayTracingCUDA — viewer");
+            snprintf(title, sizeof(title), "RayTracerCUDA Viewer");
             SDL_SetWindowTitle(win, title);
         }
 
@@ -969,11 +969,15 @@ int main(int argc, char** argv) {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, h_rgba);
         }
 
-        // Both paths have synchronized (unmap / blocking memcpy), so the events
-        // are complete and these queries don't stall. Shown next frame.
+        // Only the portable path's blocking cudaMemcpy synchronizes the host;
+        // cudaGraphicsUnmapResources merely orders CUDA before subsequent GL
+        // work, so on the interop path the trace kernel can still be running
+        // here (cudaEventElapsedTime would return cudaErrorNotReady = 600, and
+        // checkCudaErrors exits on it). Wait on the last event in the stream --
+        // ev_tone1, recorded after ev_trace1 -- before querying any interval.
+        checkCudaErrors(cudaEventSynchronize(ev_tone1));
         if (did_accumulate) checkCudaErrors(cudaEventElapsedTime(&ms_trace, ev_trace0, ev_trace1));
         else                ms_trace = 0.0f;
-        checkCudaErrors(cudaEventSynchronize(ev_tone1));
         checkCudaErrors(cudaEventElapsedTime(&ms_tonemap, ev_tone0, ev_tone1));
 
         // draw a fullscreen textured quad (v flipped so image row 0 is on top)
