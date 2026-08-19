@@ -39,9 +39,14 @@
 // Current scope: SPHERE and BOX colliders, every pairing. Boxes are ORIENTED
 // (they carry their own axes), so a rotated box collides as itself. Sphere-sphere
 // and sphere-box have exact analytic tests; everything else goes through the
-// support-function detector in gjk.h. Angular dynamics — a box SPINNING in
-// response to an off-centre hit — is still B3, so contacts carry a normal and a
-// depth but no contact point.
+// support-function detector in gjk.h.
+//
+// SPHERES ROTATE, BOXES DO NOT YET. A sphere carries angular velocity and a
+// scalar inverse inertia, so friction spins it up and a ball ROLLS instead of
+// being scrubbed to a halt — the missing piece that made any real friction
+// coefficient over-damp. A box's inverse inertia is zero, so it neither takes
+// nor gives angular impulse; its inertia tensor, its orientation and the
+// multi-point contact manifold it needs to rest without wobbling are all B3b/B3c.
 //
 // THERE IS NO PLANE COLLIDER. Every collider is read from the scene object it is
 // attached to, and no object is an infinite plane — a bounded surface is a box
@@ -93,6 +98,38 @@ struct phys_body {
     real          mass       = real(1);   // authored; MUST be > 0. Only DYNAMIC uses it.
     real          friction   = real(0.5); // surface property; combined per contact
     real          restitution= real(0.7); // surface property; combined per contact
+    // ROLLING RESISTANCE, dimensionless, combined per contact like friction.
+    // Coulomb friction alone cannot stop a rolling ball: once it rolls, its
+    // contact point is stationary, so there is nothing left for friction to
+    // oppose and a rigid sphere coasts forever. Real balls stop because they and
+    // the surface deform, which this stands in for.
+    //
+    // A rolling sphere decelerates at (5/7) * rolling_friction * g. The 5/7 is
+    // the rolling constraint: angular momentum about the CONTACT POINT is
+    // (7/5) m v R, since contact forces have no moment arm there, so a resisting
+    // couple bleeds off velocity 7/5 more slowly than the same force applied to
+    // the centre would. The default 0.01 is rubber on concrete and gives
+    // 0.070 m/s^2 — 14 s to stop from 1 m/s, measured 14.15 s.
+    //
+    // This resists spin ORTHOGONAL to the contact normal only — the component
+    // that makes a ball travel. See spinning_friction for the rest.
+    real     rolling_friction= real(0.01);
+    // SPINNING RESISTANCE: the same idea for spin ABOUT the contact normal — a
+    // ball turning on the spot like a top, which moves nowhere. Bullet splits
+    // these two and so do we, because they have different lever arms and one
+    // coefficient over-damps the spinning one.
+    //
+    // Rolling resists through deformation over the ball's RADIUS. Spinning
+    // resists through torsion across the CONTACT PATCH, whose radius is far
+    // smaller for a stiff contact. Both are clamped here against the same
+    // `rad` (the lever arm, so the ball's radius), so the ratio of the two
+    // coefficients is what carries the ratio of the levers: the default is
+    // 0.2 * rolling_friction, taking the patch as roughly a fifth of the radius.
+    //
+    // A sphere spinning on the spot decelerates at 2.5 * spinning_friction * g / R
+    // — no linear coupling, so unlike rolling there is no 5/7. At the defaults
+    // that is 0.098 rad/s^2, against 0.49 when one coefficient covered both.
+    real     spinning_friction = real(0.002);
     collider_type shape      = COLLIDER_SPHERE;
     vec3          half       = vec3(0, 0, 0);  // COLLIDER_BOX half-extents about pos
     // COLLIDER_BOX orientation: the box's own x/y/z axes in world space (the
@@ -103,6 +140,16 @@ struct phys_body {
     // collider and the rendered pose cannot drift apart. B3's quaternion
     // becomes the authoritative orientation and these are derived from it.
     vec3          axes[3]    = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };
+    // ANGULAR VELOCITY, radians/s about each world axis. Written only by the
+    // friction impulse (see solve_sequential) and read only through the lever
+    // term, so a body whose inverse inertia is zero can never acquire spin.
+    //
+    // There is deliberately no ORIENTATION beside it. A sphere is the only shape
+    // that spins today and a sphere's shape does not depend on how it is turned,
+    // so nothing — collision or rendering — has anything to read an orientation
+    // for. Boxes need one, and that is B3c along with the inertia tensor and the
+    // quaternion path in transforms.h.
+    vec3          omega      = vec3(0, 0, 0);
 };
 
 // Convex-convex detection, DEFINED IN gjk.h, which is included at the bottom of
@@ -123,6 +170,67 @@ inline bool gjk_epa_contact(const phys_body& A, const phys_body& B, vec3& n, rea
 // quantity; switching a body back to DYNAMIC restores the mass it was given.
 inline real inv_mass(const phys_body& b) {
     return b.motion == DYNAMIC ? real(1) / b.mass : real(0);
+}
+
+// I^-1 * L — the angular counterpart of inv_mass, and the only channel through
+// which rotation reaches the solver. Same derived-not-stored discipline, and the
+// same gate: a body the solver cannot push linearly cannot be spun either.
+//
+// A solid sphere's inertia is isotropic, I = (2/5) m r^2, so its inverse is the
+// SCALAR 5 / (2 m r^2) = 2.5 * inv_mass / r^2 and no orientation is needed to
+// apply it — turning a sphere does not change how it resists being spun. That is
+// what makes spheres the cheap half of B3.
+//
+// A BOX RETURNS ZERO, so it neither receives nor responds to angular impulse.
+// That is deliberate and must stay consistent: giving a box inverse inertia
+// while nothing integrates its orientation would let it absorb spin that never
+// becomes motion, which is the same trap a DYNAMIC plane fell into (see
+// docs/plans/phase3-status.md item 4) — moved by one channel and immovable in
+// another. Box inertia arrives with box orientation in B3c, together.
+inline vec3 inv_inertia_apply(const phys_body& b, const vec3& L) {
+    if (b.shape != COLLIDER_SPHERE) return vec3(0, 0, 0);
+    const real im = inv_mass(b);
+    if (im <= real(0) || b.radius <= real(0)) return vec3(0, 0, 0);
+    return L * (real(2.5) * im / (b.radius * b.radius));
+}
+
+// The LEVER ARM: contact point minus centre of mass, for the body in slot `a`
+// (is_a) or slot `b` of a contact whose normal is `n`.
+//
+// A sphere touches along its own radius, so the contact point is exactly one
+// radius from the centre against the normal — no contact point needs to be
+// stored or estimated. Two consequences fall out of r being PARALLEL to n:
+// cross(r, n) is exactly zero, so the normal impulse exerts no torque and the
+// normal effective mass is unchanged; and only FRICTION, which acts along the
+// tangent, can spin a ball.
+//
+// Any other shape returns zero, matching inv_inertia_apply. When B3b adds
+// contact manifolds the stored contact point supersedes this, and the sphere
+// case must keep agreeing with it.
+inline vec3 contact_lever(const phys_body& b, const vec3& n, bool is_a) {
+    if (b.shape != COLLIDER_SPHERE) return vec3(0, 0, 0);
+    return is_a ? -n * b.radius : n * b.radius;
+}
+
+// Velocity of the material point of `b` currently at lever arm `r`. Rolling is
+// entirely this: the surface of a rolling ball is momentarily still, because the
+// spin term cancels the linear one.
+inline vec3 velocity_at(const phys_body& b, const vec3& r) {
+    return b.vel + cross(b.omega, r);
+}
+
+// Effective inverse mass of a contact along `dir` — how much relative velocity
+// one unit of impulse buys. The two angular terms are what rolling costs: for a
+// sphere along the TANGENT each contributes 2.5 * inv_mass, so a ball resting on
+// an immovable surface has 3.5x the effective mobility it had when it could only
+// slide, and the friction impulse that used to stop it now mostly spins it up.
+// Along the NORMAL both terms are exactly zero for spheres (r parallel to n), so
+// bouncing is untouched.
+inline real inv_effective_mass(const phys_body& A, const phys_body& B,
+                           const vec3& ra, const vec3& rb, const vec3& dir) {
+    return inv_mass(A) + inv_mass(B)
+         + dot(dir, cross(inv_inertia_apply(A, cross(ra, dir)), ra))
+         + dot(dir, cross(inv_inertia_apply(B, cross(rb, dir)), rb));
 }
 
 // How a CONTACT's coefficient is derived from the two surfaces that meet there.
@@ -185,6 +293,35 @@ inline vec3 any_perpendicular(const vec3& n) {
     vec3 a = (n[0] < real(0.9) && n[0] > real(-0.9)) ? vec3(1, 0, 0) : vec3(0, 1, 0);
     vec3 t = cross(n, a);
     return t / t.length();
+}
+
+// A unit vector in the contact's TANGENT PLANE, from the part of `v` orthogonal
+// to `n`; an arbitrary perpendicular when `v` has no such part. Both the friction
+// tangent and the rolling axis are built with this, and both are impulse
+// directions whose clamp only means what it says if they really are orthogonal
+// to the normal.
+//
+// TWO THINGS HERE ARE NOT OPTIONAL, and an absolute epsilon gets both wrong.
+// `v - n*dot(v,n)` is exactly orthogonal to n only when n is exactly unit, and a
+// float normal is unit to about 1e-7 — sphere_box_contact's n = d/dist rounds,
+// and the oriented-box path then recombines it from three axes. So the residue
+// left along n scales with |v|: measured at 1.9e-6 for a ball spinning at
+// 10 rad/s against a normal of (0, 0.99999994, 0), which is 190x an absolute
+// 1e-8 threshold. The axis came back as the NORMAL itself, and the rolling
+// impulse clamped to it then damped spin about the normal at full strength —
+// exactly the axis it is meant to leave alone.
+//   1. The "is there any tangential part" test is RELATIVE to |v|, so it scales
+//      with the residue it has to reject.
+//   2. The result is projected a SECOND time, which removes the residue that
+//      survives the first pass when the tangential part is small but real.
+inline vec3 tangent_from(const vec3& v, const vec3& n) {
+    vec3 t = v - n * dot(v, n);
+    real tl = t.length();
+    if (tl <= real(1e-4) * v.length()) return any_perpendicular(n);
+    t  = t / tl;
+    t  = t - n * dot(t, n);
+    tl = t.length();
+    return tl > real(0.5) ? t / tl : any_perpendicular(n);
 }
 
 // ---- shape queries -------------------------------------------------------
@@ -336,21 +473,46 @@ inline void solve_sequential(std::vector<phys_body>& bodies, const phys_params& 
     build_contacts(bodies, C);
     const std::size_t n = C.size();
 
-    std::vector<real> vbias(n), jn(n, real(0)), jt(n, real(0)), mu(n);
-    std::vector<vec3> tang(n);
+    std::vector<real> vbias(n), jn(n, real(0)), jt(n, real(0)), jr(n, real(0)), js(n, real(0));
+    std::vector<real> mu(n), mur(n), mus(n), rad(n);
+    std::vector<vec3> tang(n), roll(n), lev_a(n), lev_b(n);
     for (std::size_t c = 0; c < n; c++) {
         const contact& k = C[c];
-        vec3 vrel = bodies[k.a].vel - bodies[k.b].vel;
+        // Lever arms are fixed for the whole step alongside the tangent: both
+        // describe the contact's geometry, and re-deriving them mid-iteration
+        // from poses the solver is itself moving would make the accumulated
+        // impulses inconsistent with the frame they were accumulated in.
+        lev_a[c] = contact_lever(bodies[k.a], k.n, true);
+        lev_b[c] = contact_lever(bodies[k.b], k.n, false);
+        // Relative velocity AT THE CONTACT POINT, not between the centres. For a
+        // ball already rolling, the two differ completely: its centre is moving
+        // and its contact point is not.
+        vec3 vrel = velocity_at(bodies[k.a], lev_a[c]) - velocity_at(bodies[k.b], lev_b[c]);
         real vn = dot(vrel, k.n);
         real e   = combine(bodies[k.a].restitution, bodies[k.b].restitution, p.restitution_combine);
         vbias[c] = vn < -SEQ_REST_VEL ? -e * vn : real(0);
         mu[c]    = combine(bodies[k.a].friction, bodies[k.b].friction, p.friction_combine);
+        // Rolling resistance shares friction's combine rule — it is a friction
+        // coefficient, and a pair property for the same reason. Its clamp is an
+        // ANGULAR impulse, so it needs a length: the contact's own lever arm,
+        // which is the radius for a sphere and zero for anything that cannot spin.
+        mur[c]   = combine(bodies[k.a].rolling_friction, bodies[k.b].rolling_friction,
+                           p.friction_combine);
+        mus[c]   = combine(bodies[k.a].spinning_friction, bodies[k.b].spinning_friction,
+                           p.friction_combine);
+        real la = lev_a[c].length(), lb = lev_b[c].length();
+        rad[c]   = la > lb ? la : lb;
+        // The ROLLING axis, fixed for the step for the same reason the tangent
+        // is: it is the part of the relative spin ORTHOGONAL to the normal, and
+        // accumulating an impulse along an axis that rotated every iteration
+        // would make its clamp meaningless. The spinning axis needs no such
+        // treatment — it IS the contact normal, already fixed. With no rolling
+        // spin the direction is arbitrary and the impulse comes out zero.
+        roll[c]  = tangent_from(bodies[k.a].omega - bodies[k.b].omega, k.n);
         // Tangent is fixed for the whole step, taken from the sliding direction
         // at its start: accumulating jt along an axis that rotated every
         // iteration would make the cone clamp meaningless.
-        vec3 vt  = vrel - k.n * vn;
-        real vtl = vt.length();
-        tang[c]  = vtl > real(1e-8) ? vt / vtl : any_perpendicular(k.n);
+        tang[c]  = tangent_from(vrel, k.n);
     }
 
     // (1) velocity: accumulated normal + friction impulses. Mass enters ONLY as
@@ -360,29 +522,94 @@ inline void solve_sequential(std::vector<phys_body>& bodies, const phys_params& 
     for (int it = 0; it < SEQ_VEL_ITERS; it++)
         for (std::size_t c = 0; c < n; c++) {
             const contact& k = C[c];
-            real ima = inv_mass(bodies[k.a]);
-            real imb = inv_mass(bodies[k.b]);
-            real invSum = ima + imb;                    // 1/m_a + 1/m_b along n
-            if (invSum <= real(0)) continue;            // nothing here can move
+            phys_body& A = bodies[k.a];
+            phys_body& B = bodies[k.b];
+            const real ima = inv_mass(A), imb = inv_mass(B);
+            if (ima + imb <= real(0)) continue;         // nothing here can move
+            const vec3& ra = lev_a[c];
+            const vec3& rb = lev_b[c];
 
-            real vn = dot(bodies[k.a].vel - bodies[k.b].vel, k.n);
-            real dJ = (vbias[c] - vn) / invSum;
-            real jn_new = jn[c] + dJ; if (jn_new < 0) jn_new = real(0);  // no sticking
-            vec3 imp = k.n * (jn_new - jn[c]);
-            jn[c] = jn_new;
-            bodies[k.a].vel += imp * ima;
-            bodies[k.b].vel -= imp * imb;
+            // NORMAL. For spheres the two angular terms in inv_effective_mass are
+            // exactly zero (the lever arm is parallel to the normal), so this is
+            // arithmetically the same impulse it was before rotation existed —
+            // which is why a frictionless scene is unchanged to the last bit.
+            const real kn = inv_effective_mass(A, B, ra, rb, k.n);
+            if (kn > real(0)) {
+                real vn = dot(velocity_at(A, ra) - velocity_at(B, rb), k.n);
+                real jn_new = jn[c] + (vbias[c] - vn) / kn;
+                if (jn_new < 0) jn_new = real(0);       // no sticking
+                vec3 imp = k.n * (jn_new - jn[c]);
+                jn[c] = jn_new;
+                A.vel += imp * ima;   A.omega += inv_inertia_apply(A,  cross(ra, imp));
+                B.vel -= imp * imb;   B.omega -= inv_inertia_apply(B,  cross(rb, imp));
+            }
 
-            if (mu[c] > real(0)) {                      // Coulomb friction
-                real vt   = dot(bodies[k.a].vel - bodies[k.b].vel, tang[c]);
+            // FRICTION, and the only thing that can spin a ball. The impulse is
+            // unchanged in form; what changed is that it now also torques, and
+            // that the tangential effective mass includes the cost of spinning
+            // up, so most of it goes into rotation instead of into stopping.
+            const real kt = inv_effective_mass(A, B, ra, rb, tang[c]);
+            if (mu[c] > real(0) && kt > real(0)) {
+                real vt   = dot(velocity_at(A, ra) - velocity_at(B, rb), tang[c]);
                 real lim  = mu[c] * jn[c];              // cone limit from THIS contact's load
-                real jt_new = jt[c] - vt / invSum;
+                real jt_new = jt[c] - vt / kt;
                 if (jt_new >  lim) jt_new =  lim;
                 if (jt_new < -lim) jt_new = -lim;
                 vec3 impt = tang[c] * (jt_new - jt[c]);
                 jt[c] = jt_new;
-                bodies[k.a].vel += impt * ima;
-                bodies[k.b].vel -= impt * imb;
+                A.vel += impt * ima;  A.omega += inv_inertia_apply(A, cross(ra, impt));
+                B.vel -= impt * imb;  B.omega -= inv_inertia_apply(B, cross(rb, impt));
+            }
+
+            // ROLLING and SPINNING RESISTANCE. Both are PURE angular impulses —
+            // no linear component, because what is resisted is rotation itself,
+            // not sliding. Once a ball rolls its contact point is stationary and
+            // Coulomb friction has nothing left to act on, so without these a
+            // rigid sphere turns forever.
+            //
+            // TWO AXES, TWO COEFFICIENTS. Split the relative spin at the contact
+            // into the part ORTHOGONAL to the normal, which is what carries a
+            // ball along, and the part ABOUT the normal, which is a ball turning
+            // on the spot. They resist through different mechanisms over
+            // different lengths — deformation across the ball's radius against
+            // torsion across the contact patch — so one coefficient for both
+            // over-damps the spinning one.
+            //
+            // Each is clamped like friction, against the same accumulated normal
+            // load times the lever arm, so both scale with how hard the surfaces
+            // are pressed together and vanish the instant they separate. A body
+            // that cannot spin has zero angular effective mass and is skipped, so
+            // this costs nothing on scenes without rotation.
+            if (rad[c] > real(0)) {
+                const vec3 wrel = A.omega - B.omega;
+                if (mur[c] > real(0)) {                 // rolling: orthogonal to n
+                    real kw = dot(roll[c], inv_inertia_apply(A, roll[c]))
+                            + dot(roll[c], inv_inertia_apply(B, roll[c]));
+                    if (kw > real(0)) {
+                        real lim = mur[c] * jn[c] * rad[c];
+                        real jr_new = jr[c] - dot(wrel, roll[c]) / kw;
+                        if (jr_new >  lim) jr_new =  lim;
+                        if (jr_new < -lim) jr_new = -lim;
+                        vec3 impr = roll[c] * (jr_new - jr[c]);
+                        jr[c] = jr_new;
+                        A.omega += inv_inertia_apply(A, impr);
+                        B.omega -= inv_inertia_apply(B, impr);
+                    }
+                }
+                if (mus[c] > real(0)) {                 // spinning: about n
+                    real kw = dot(k.n, inv_inertia_apply(A, k.n))
+                            + dot(k.n, inv_inertia_apply(B, k.n));
+                    if (kw > real(0)) {
+                        real lim = mus[c] * jn[c] * rad[c];
+                        real js_new = js[c] - dot(wrel, k.n) / kw;
+                        if (js_new >  lim) js_new =  lim;
+                        if (js_new < -lim) js_new = -lim;
+                        vec3 imps = k.n * (js_new - js[c]);
+                        js[c] = js_new;
+                        A.omega += inv_inertia_apply(A, imps);
+                        B.omega -= inv_inertia_apply(B, imps);
+                    }
+                }
             }
         }
 
@@ -405,8 +632,8 @@ inline void solve_sequential(std::vector<phys_body>& bodies, const phys_params& 
 }
 
 // Advance the sim one fixed step `dt`: semi-implicit Euler, then the collision
-// solver. Returns the max |vel| over the movable bodies, for the caller's sleep
-// policy.
+// solver. Returns the max SURFACE SPEED over the movable bodies, for the
+// caller's sleep policy — see the note on the return value below.
 //
 // Both loops gate on inv_mass() rather than on `motion`, so THE INTEGRATOR MOVES
 // EXACTLY THE BODIES THE SOLVER CAN PUSH. That equivalence is the point: a body
@@ -421,6 +648,17 @@ inline void solve_sequential(std::vector<phys_body>& bodies, const phys_params& 
 // fight it. Both still collide — that happens in the solver. Tangential damping
 // is no longer applied here: friction is a per-contact force now, so it acts
 // only where something is actually touching.
+//
+// NO ORIENTATION IS INTEGRATED. `omega` persists between steps and drives
+// contacts through the lever term, but nothing turns because a sphere is the
+// only shape that can spin and its shape and appearance are the same whichever
+// way it is turned. B3c integrates a quaternion for boxes.
+//
+// The RETURN VALUE is a surface speed, not a centre speed: `|v|` and
+// `|omega| * radius` are both linear speeds and either can keep a body awake on
+// its own. Taking only `|v|` would let a ball spinning on the spot count as
+// asleep, and it is not — the moment it meets anything, friction converts that
+// spin into motion.
 inline real physics_step(std::vector<phys_body>& bodies, const phys_params& p, real dt) {
     for (phys_body& b : bodies) {                 // gravity (y only) + integrate
         if (inv_mass(b) <= real(0)) continue;
@@ -432,6 +670,8 @@ inline real physics_step(std::vector<phys_body>& bodies, const phys_params& p, r
     for (phys_body& b : bodies) {
         if (inv_mass(b) <= real(0)) continue;
         real v = b.vel.length();
+        real w = b.omega.length() * b.radius;     // radius is 0 for a box, which cannot spin
+        if (w > v) v = w;
         if (v > maxv) maxv = v;
     }
     return maxv;

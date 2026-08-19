@@ -90,7 +90,9 @@
 #define RT_SKY 1            // viewer lights the scene with the sky gradient
 #endif
 #ifndef VIEWER_SCENE
-#define VIEWER_SCENE 0      // 0 = primitives (editable); 1 = ball pit (roomy 1.5); 2 = ball pit (tight 1.3)
+// 0 = primitives (editable); 1 = ball pit roomy (1.5, frictionless);
+// 2 = ball pit tight (1.3, frictionless); 3 = ball pit rolling (1.5, friction 0.5)
+#define VIEWER_SCENE 0
 #endif
 
 #include "camera.h"
@@ -99,7 +101,7 @@
 #include "scenes/scene_utils.h"
 #include "viewer/physics_utils.h"           // box_collider_of: shared with the scenes
 #include "viewer/scenes/primitives.h"
-#include "viewer/scenes/ball_pit.h"          // build_ball_pit_scene (roomy) + _tight_scene
+#include "viewer/scenes/ball_pit.h"          // build_ball_pit_scene: _scene / _tight_scene / _rolling_scene
 
 // --- device tonemap: accumulator (sum of samples) -> RGBA8 -------------------
 // Per pixel, calls color.h's shared tonemap_pixel (the same routine the offline
@@ -197,7 +199,9 @@ int main(int argc, char** argv) {
     // and (physics scene) the collision wall bounds — one place per scene, no
     // scattered `#if VIEWER_SCENE`.
     scene sc;
-#if VIEWER_SCENE == 2
+#if VIEWER_SCENE == 3
+    const viewer_scene vs = build_ball_pit_rolling_scene(sc);
+#elif VIEWER_SCENE == 2
     const viewer_scene vs = build_ball_pit_tight_scene(sc);
 #elif VIEWER_SCENE == 1
     const viewer_scene vs = build_ball_pit_scene(sc);
@@ -825,6 +829,29 @@ int main(int argc, char** argv) {
                                 b.restitution = real(rest);
                                 asleep = false; still_steps = 0;
                             }
+                            // Rolling and spinning resistance are small and act
+                            // slowly, so both get a narrow range and three
+                            // decimals rather than friction's 0..2. ROLLING
+                            // resists spin across the normal — the part that
+                            // carries a ball along — at (5/7) * this * gravity.
+                            // SPINNING resists spin about the normal, a ball
+                            // turning on the spot, at 2.5 * this * gravity / r.
+                            // Either at 0 means that motion never stops.
+                            float roll = (float)b.rolling_friction;
+                            float spin = (float)b.spinning_friction;
+                            if (ImGui::SliderFloat("rolling", &roll, 0.0f, 0.1f, "%.3f")) {
+                                b.rolling_friction = real(roll);
+                                asleep = false; still_steps = 0;
+                            }
+                            if (ImGui::SliderFloat("spinning", &spin, 0.0f, 0.1f, "%.3f")) {
+                                b.spinning_friction = real(spin);
+                                asleep = false; still_steps = 0;
+                            }
+                            // Spin has no other read-out: a solid-colour sphere
+                            // looks the same however it is turned, so the panel is
+                            // the only place rotation is visible at all.
+                            if (b.shape == COLLIDER_SPHERE && inv_mass(b) > real(0))
+                                ImGui::Text("spin      %.2f rad/s", (double)b.omega.length());
                         } else {
                             ImGui::TextDisabled("not simulated");
                         }

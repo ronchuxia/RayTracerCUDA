@@ -8,19 +8,20 @@
 #include "viewer/physics_utils.h"
 #include "viewer/scenes/viewer_scene.h"
 
-// Ball pit (VIEWER_SCENE 1 = roomy, 2 = tight): a physics container (ground + 4
-// walls, open top) with a central box obstacle and BALL_N diffuse spheres.
-// The balls' initial location IS their drop-start: a loose spiral column above
-// the box (off-axis angles + staggered heights), so on Play they fall one-by-one
-// and cascade off the box. Each sphere is a UNIT prim scaled to BALL_R and
-// transform-wrapped, which is what lets the panel edit it; Stop restores every
-// body to this authored pose.
+// Ball pit (VIEWER_SCENE 1 = roomy, 2 = tight, 3 = rolling): a physics container
+// (ground + 4 walls, open top) with a central box obstacle and BALL_N diffuse
+// spheres. The balls' initial location IS their drop-start: a loose spiral column
+// above the box (off-axis angles + staggered heights), so on Play they fall
+// one-by-one and cascade off the box. Each sphere is a UNIT prim scaled to BALL_R
+// and transform-wrapped, which is what lets the panel edit it; Stop restores
+// every body to this authored pose.
 //
-// The two variants differ ONLY in the container half-width (box_half), so they
-// share build_ball_pit(): the ROOMY pit (1.5) gives the balls room to spread and
-// settle under either solver; the TIGHT pit (1.3) crowds them into a pile that
-// only the sequential solver settles.
-inline viewer_scene build_ball_pit(scene& sc, real box_half) {
+// All three variants share build_ball_pit() and differ only in its two authored
+// parameters — container half-width and surface friction:
+//   ROOMY   (1.5, mu 0)    balls spread and settle; either solver handles it.
+//   TIGHT   (1.3, mu 0)    crowded pile — only the sequential solver settles it.
+//   ROLLING (1.5, mu 0.5)  the roomy pit with real friction, so the balls ROLL.
+inline viewer_scene build_ball_pit(scene& sc, real box_half, real pit_mu) {
     sc.init();
 
     constexpr real BOX_H    = real(3.0);   // wall height
@@ -31,19 +32,24 @@ inline viewer_scene build_ball_pit(scene& sc, real box_half) {
     constexpr real OBS_HALF_Y  = OBS_TOP * real(0.5);// obstacle half-extent in y
     constexpr real DROP_H   = real(3.0);   // spawn height of the lowest ball
 
-    // Surface feel, authored rather than left at the defaults. FRICTIONLESS for
-    // now, which reproduces how the pit behaved before per-contact friction
-    // existed (the old height-gated damp never fired here — no ball in this
-    // scene ever reaches the floor).
+    // `pit_mu` is every surface in the container, authored rather than left at
+    // the default, and it is what separates the ROLLING variant from the other
+    // two. The frictionless variants are not a preference — they reproduce how
+    // the pit behaved before per-contact friction existed, which is worth keeping
+    // one of as a reference.
     //
-    // THE REASON A REAL COEFFICIENT OVER-DAMPS is the missing rolling: with no
-    // angular dynamics (B3), a sphere cannot convert sliding into rolling, so
-    // every bit of tangential friction is pure loss where a real ball would keep
-    // going. The roomy pit is quiet in 4.9 s at the default 0.5, 8.3 s at 0.
-    // The cost of 0 is that a ball slides forever once it is moving. Revisit at
-    // B3: with rolling, a physical 0.3-0.5 should read correctly.
-    constexpr real PIT_MU  = real(0.0);    // every surface in the container
+    // FRICTION USED TO OVER-DAMP THIS SCENE, because a sphere with no angular
+    // dynamics cannot convert sliding into rolling, so every bit of tangential
+    // friction was pure loss. B3a fixed that, measured on the roomy pit as time
+    // until the pile stops moving:
+    //          mu 0     mu 0.3    mu 0.5
+    //   before  5.8 s    3.8 s     4.5 s     friction made it die SOONER
+    //   after   5.9 s   10.8 s     5.3 s     it no longer costs the pit anything
+    // Rolling and spinning resistance (phys_body's defaults) are what eventually
+    // stop a ball; at 0 it would turn forever. Single runs of a chaotic pile, so
+    // read the direction rather than the second decimal.
     constexpr real BALL_E  = real(0.7);    // = the default, so every contact is 0.7
+    const real PIT_MU = pit_mu;
 
     material* ground = new_lambertian(
         make_checker(0.6, color(.2, .3, .1), color(.9, .9, .9)), sc.allocs);
@@ -120,9 +126,22 @@ inline viewer_scene build_ball_pit(scene& sc, real box_half) {
              bodies };
 }
 
-// ROOMY pit (1.5): the balls spread and settle; either solver handles it.
-inline viewer_scene build_ball_pit_scene(scene& sc)       { return build_ball_pit(sc, real(1.5)); }
-// TIGHT pit (1.3): crowded pile — only the sequential solver settles it.
-inline viewer_scene build_ball_pit_tight_scene(scene& sc) { return build_ball_pit(sc, real(1.3)); }
+// ROOMY pit: the balls spread and settle; either solver handles it.
+inline viewer_scene build_ball_pit_scene(scene& sc) {
+    return build_ball_pit(sc, real(1.5), real(0.0));
+}
+// TIGHT pit: crowded pile — only the sequential solver settles it.
+inline viewer_scene build_ball_pit_tight_scene(scene& sc) {
+    return build_ball_pit(sc, real(1.3), real(0.0));
+}
+// ROLLING pit: the roomy pit at phys_body's default friction, which is the one
+// variant where the balls actually roll. Watch a ball that lands off-centre on
+// the obstacle — it spins up as it slides off, then rolls across the floor and
+// coasts to a stop under rolling resistance instead of stopping dead. The
+// Object panel's spin read-out is the only other place that motion is visible,
+// since a solid-colour sphere looks the same however it is turned.
+inline viewer_scene build_ball_pit_rolling_scene(scene& sc) {
+    return build_ball_pit(sc, real(1.5), real(0.5));
+}
 
 #endif // VIEWER_SCENES_BALL_PIT_H

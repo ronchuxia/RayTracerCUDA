@@ -47,7 +47,7 @@ int main() {
 
     // ================= ball pit =================
     scene sc;
-    viewer_scene vs = build_ball_pit(sc, BOX_HALF);
+    viewer_scene vs = build_ball_pit(sc, BOX_HALF, real(0));   // the frictionless tight pit
     std::vector<phys_body> bodies = vs.bodies;
     std::vector<int> body_of_scene_id = index_bodies(bodies, (int)sc.objects.size());
 
@@ -178,6 +178,52 @@ int main() {
         CHECK(clear,            "no ball penetrates the turned obstacle");
     }
     sc.release();
+
+    // ================= rolling ball pit =================
+    // The roomy pit at real friction (VIEWER_SCENE 3). Frictionless pits cannot
+    // show this: with mu = 0 nothing ever torques a ball, so the whole angular
+    // path is dead code in scenes 1 and 2. This is the scene-level check that
+    // B3a is actually reached from authored geometry.
+    {
+        scene sc3;
+        viewer_scene vs3 = build_ball_pit_rolling_scene(sc3);
+        std::vector<phys_body> b = vs3.bodies;
+
+        real maxv = 0; real peak_spin = 0;
+        for (int s = 0; s < SETTLE; s++) {
+            maxv = physics_step(b, p, H);
+            for (const phys_body& q : b)
+                if (inv_mass(q) > real(0) && q.omega.length() > peak_spin)
+                    peak_spin = q.omega.length();
+        }
+        int spun = 0;
+        for (const phys_body& q : b)
+            if (inv_mass(q) > real(0) && q.omega.length() > real(0.5)) spun++;
+
+        printf("  rolling pit after 20 s: max |v| = %.4f, peak spin %.2f rad/s\n",
+               (double)maxv, (double)peak_spin);
+        CHECK(peak_spin > real(1),
+              "balls in the rolling pit actually spin up — friction reaches the angular path");
+        CHECK(maxv < real(0.1),
+              "and the rolling pit still settles: rolling resistance stops them");
+        CHECK(spun == 0,
+              "nothing is left spinning at rest");
+
+        // Every ball still ends up inside the container and above the floor —
+        // the same invariants the frictionless pit is held to, now with rolling
+        // in play, which is what would carry a ball out through a wall.
+        bool contained = true, above_ground = true;
+        for (int i = 0; i < (int)b.size(); i++) {
+            if (b[i].motion != DYNAMIC) continue;
+            vec3 gn; real gpen;
+            if (contact_between(b[i], b[0], gn, gpen) && gpen > real(0.02)) above_ground = false;
+            if (std::fabs((double)b[i].pos[0]) > 1.5 + 0.02 ||
+                std::fabs((double)b[i].pos[2]) > 1.5 + 0.02) contained = false;
+        }
+        CHECK(above_ground, "no rolling ball sinks through the ground");
+        CHECK(contained,    "no rolling ball escapes the walls");
+        sc3.release();
+    }
 
     // ================= primitives showcase =================
     // The scene decides what is simulated, so a decorative object simply has no

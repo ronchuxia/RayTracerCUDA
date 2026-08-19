@@ -288,15 +288,22 @@ int main() {
     {
         const phys_params p{ real(-9.8) };
 
-        // (a) A ball sliding on the ground decelerates at about mu*g and stops.
-        //     mu = sqrt(0.5*0.5) = 0.5 -> a = 4.9 m/s^2, so 2 m/s stops in ~0.41 s.
+        // (a) A ball sliding on the ground decelerates at about mu*g — but it does
+        //     NOT stop, it starts rolling. mu = 0.5 -> a = 4.9 m/s^2 while it
+        //     slides, and sliding ends at 5/7 of the launch speed (test 9 pins
+        //     that transition exactly). Before B3a this asserted the ball stopped,
+        //     which was the missing-rotation bug rather than a property worth
+        //     keeping: friction was scrubbing away energy a real ball puts into
+        //     spin. What stops it now is rolling resistance, over ~14 s.
         {
             std::vector<phys_body> b;
             b.push_back(ground_plane(real(0.5), real(0)));
             b.push_back(ball(0, vec3(0, real(0.5), 0), vec3(2,0,0), real(0.5), real(1), real(0.5), real(0)));
-            for (int s = 0; s < 240; s++) physics_step(b, p, h);   // 1 s
-            CHECK(std::fabs((double)b[1].vel[0]) < 0.05,
-                  "friction: a sliding ball decelerates at ~mu*g and stops");
+            b[0].rolling_friction = real(0);   // isolate friction: no rolling decay
+            b[1].rolling_friction = real(0);
+            for (int s = 0; s < 240; s++) physics_step(b, p, h);   // 1 s: sliding is long over
+            CHECK(std::fabs((double)b[1].vel[0] - 10.0/7.0) < 1e-4,
+                  "friction: a sliding ball decelerates at ~mu*g, then rolls at 5/7 of its speed");
         }
         // (b) A frictionless surface never damps it — but only under a rule with
         //     an absorbing zero, so this one names its rule instead of taking the
@@ -331,14 +338,17 @@ int main() {
                   "friction: a body touching nothing is never damped");
         }
         // (d) Friction acts wherever contact happens, not just near y=0: a ball
-        //     sliding on TOP of a box stops too (the old height test missed this).
+        //     launched on TOP of a box goes through the same slide-then-roll
+        //     transition (the old height test missed this contact entirely).
         {
             std::vector<phys_body> b;
             b.push_back(static_box(vec3(0, 0.5, 0), vec3(4, 0.5, 4), real(0.5), real(0)));  // wide slab, top y=1
             b.push_back(ball(0, vec3(0, real(1.5), 0), vec3(2,0,0), real(0.5), real(1), real(0.5), real(0)));
+            b[0].rolling_friction = real(0);
+            b[1].rolling_friction = real(0);
             for (int s = 0; s < 240; s++) physics_step(b, p, h);
-            CHECK(std::fabs((double)b[1].vel[0]) < 0.05,
-                  "friction: a ball sliding on a box stops too, not just on the ground");
+            CHECK(std::fabs((double)b[1].vel[0] - 10.0/7.0) < 1e-4,
+                  "friction: a ball on a box slides and then rolls too, not just on the ground");
         }
     }
 
@@ -579,6 +589,192 @@ int main() {
             CHECK(std::fabs((double)b[1].pos[1] - 0.5) < 2e-3,
                   "a dropped box comes to rest on the surface, not through it");
             CHECK(maxv < real(0.02), "and settles rather than buzzing");
+        }
+    }
+
+    // 9. ROTATION (B3a): spheres carry angular velocity, friction spins them up,
+    //    and a ball ROLLS instead of being scrubbed to a halt. Boxes stay
+    //    rotation-free until B3c.
+    //
+    //    Most of these have closed-form answers, because a uniform sphere on a
+    //    flat surface is one of the few rigid-body problems that does.
+    {
+        const real G = real(9.8);
+        const phys_params p{ -G };
+
+        // 9a. Inverse inertia, the angular counterpart of inv_mass. A solid
+        //     sphere is I = (2/5) m r^2, so I^-1 = 2.5 * inv_mass / r^2 — and the
+        //     same role gate applies, since a body the solver cannot push must
+        //     not be spinnable either.
+        {
+            phys_body s = ball(0, vec3(0,0,0), vec3(), real(0.5), real(2));  // m = 2, r = 0.5
+            vec3 got = inv_inertia_apply(s, vec3(1, 0, 0));
+            CHECK(std::fabs((double)got[0] - 2.5 * 0.5 / 0.25) < 1e-6,
+                  "inv_inertia: a solid sphere's is 2.5 * inv_mass / r^2");
+
+            phys_body st = s; st.motion = STATIC;
+            CHECK(inv_inertia_apply(st, vec3(1,0,0)).near_zero(),
+                  "inv_inertia: an immovable body cannot be spun, whatever its mass");
+
+            CHECK(inv_inertia_apply(static_box(vec3(0,0,0), vec3(1,1,1)), vec3(1,0,0)).near_zero() &&
+                  inv_inertia_apply(dynamic_box(vec3(0,0,0), vec3(1,1,1)), vec3(1,0,0)).near_zero(),
+                  "inv_inertia: a box is rotation-free until B3c, dynamic or not");
+        }
+
+        // 9b. A sphere's lever arm is PARALLEL to the contact normal, so the
+        //     normal impulse exerts no torque and the normal effective mass is
+        //     untouched. This is why bouncing is bit-for-bit what it was, and why
+        //     only friction can spin a ball.
+        {
+            phys_body s = ball(0, vec3(0, real(0.5), 0), vec3(), real(0.5));
+            vec3 up(0, 1, 0);
+            vec3 r = contact_lever(s, up, true);
+            phys_body none = ground_plane();
+            vec3 rb = contact_lever(none, up, false);
+            CHECK(cross(r, up).near_zero() && std::fabs((double)r[1] + 0.5) < 1e-9,
+                  "lever arm: one radius against the normal, so it exerts no torque along n");
+            CHECK(std::fabs((double)inv_effective_mass(s, none, r, rb, up) - 1.0) < 1e-9,
+                  "effective mass along the normal is unchanged by rotation (1/m exactly)");
+            // Along the tangent each spinnable side adds 2.5 * inv_mass, so a ball
+            // on an immovable floor is 3.5x as mobile as it was when it could only
+            // slide. That factor is the whole of the friction change.
+            CHECK(std::fabs((double)inv_effective_mass(s, none, r, rb, vec3(1,0,0)) - 3.5) < 1e-9,
+                  "effective mass along the tangent gains 2.5/m: the cost of spinning up");
+        }
+
+        // 9c. THE ANALYTIC CASE. A ball launched sliding at v0 on friction mu is
+        //     decelerated at mu*g while its spin builds, until the contact point
+        //     stops slipping. Conserving angular momentum about the contact point
+        //     gives rolling at exactly 5/7 of v0, reached at t = 2*v0/(7*mu*g) —
+        //     independent of mass and radius. Rolling resistance is off here so
+        //     the coast afterwards is exact.
+        {
+            const real v0 = 2, mu = real(0.5);
+            std::vector<phys_body> b;
+            b.push_back(ground_plane(mu, real(0)));
+            b.push_back(ball(0, vec3(0, real(0.5), 0), vec3(v0,0,0), real(0.5), real(1), mu, real(0)));
+            b[0].rolling_friction = real(0); b[1].rolling_friction = real(0);
+            for (int s = 0; s < 240; s++) physics_step(b, p, h);      // 1 s >> t_roll = 0.117 s
+            const double v_roll = 5.0 * (double)v0 / 7.0;
+            printf("  slide->roll: vx = %.6f (analytic %.6f), rolling error %.2e\n",
+                   (double)b[1].vel[0], v_roll,
+                   std::fabs((double)(b[1].vel[0] + b[1].omega[2] * b[1].radius)));
+            CHECK(std::fabs((double)b[1].vel[0] - v_roll) < 1e-4,
+                  "a sliding ball transitions to rolling at exactly 5/7 of its launch speed");
+            CHECK(std::fabs((double)(b[1].vel[0] + b[1].omega[2] * b[1].radius)) < 1e-6,
+                  "and rolls without slipping: the contact point is stationary");
+
+            // Coulomb friction alone can never stop it. Once the contact point is
+            // stationary there is nothing left for friction to oppose, so with
+            // rolling resistance off the ball coasts forever.
+            for (int s = 0; s < 4800; s++) physics_step(b, p, h);     // 20 more seconds
+            CHECK(std::fabs((double)b[1].vel[0] - v_roll) < 1e-4,
+                  "friction alone never stops a rolling ball — it coasts indefinitely");
+        }
+
+        // 9d. Which is what ROLLING RESISTANCE is for. A rolling sphere sheds
+        //     speed at (5/7) * mu_r * g: the resisting couple acts about the
+        //     contact point, where the ball's angular momentum is (7/5) m v R.
+        {
+            const real mur = real(0.02);
+            std::vector<phys_body> b;
+            b.push_back(ground_plane(real(0.5), real(0)));
+            b.push_back(ball(0, vec3(0, real(0.5), 0), vec3(1,0,0), real(0.5), real(1),
+                             real(0.5), real(0)));
+            b[0].rolling_friction = mur; b[1].rolling_friction = mur;
+            b[1].omega = vec3(0, 0, real(-2));                        // launched already rolling
+            int stopped = -1;
+            for (int s = 1; s <= 4800 && stopped < 0; s++) {
+                physics_step(b, p, h);
+                if (b[1].vel.length() < real(0.01)) stopped = s;
+            }
+            const double predicted = 1.0 / (5.0 / 7.0 * (double)mur * (double)G);
+            printf("  rolling resistance mu_r = %.3f: stops from 1 m/s in %.2f s (analytic %.2f s)\n",
+                   (double)mur, stopped < 0 ? -1.0 : stopped * (double)h, predicted);
+            CHECK(stopped > 0 && std::fabs(stopped * (double)h - predicted) < 0.2,
+                  "rolling resistance decelerates a rolling ball at (5/7) * mu_r * g");
+        }
+
+        // 9d2. SPINNING resistance is a separate axis from rolling. Rolling
+        //      resists the spin ORTHOGONAL to the contact normal — the part that
+        //      carries a ball along. Spinning resists the spin ABOUT it — a ball
+        //      turning on the spot, which goes nowhere.
+        //
+        //      They resist through different mechanisms across different lengths
+        //      (deformation over the ball's radius against torsion over the
+        //      contact patch), so one coefficient for both over-damps the
+        //      spinning one. With no linear coupling to slow it, top-spin decays
+        //      at 2.5 * mu_s * g / R — no 5/7, which only appears when the
+        //      rolling constraint is being maintained.
+        {
+            // Each coefficient must be UNABLE to touch the other's axis: this is
+            // what makes them two knobs rather than one with extra steps.
+            for (int which = 0; which < 2; which++) {
+                const bool spinning = (which == 0);
+                std::vector<phys_body> b;
+                b.push_back(ground_plane(real(0.5), real(0)));
+                b.push_back(ball(0, vec3(0, real(0.5), 0),
+                                 spinning ? vec3(0,0,0) : vec3(0,0,5), real(0.5), real(1),
+                                 real(0.5), real(0)));
+                // Zero the coefficient that should NOT be able to act here.
+                for (phys_body& q : b) {
+                    q.rolling_friction  = spinning ? real(0.01) : real(0);
+                    q.spinning_friction = spinning ? real(0)    : real(0.01);
+                }
+                b[1].omega = spinning ? vec3(0, 10, 0)    // about the normal
+                                      : vec3(10, 0, 0);   // across it
+                for (int s = 0; s < 240 * 120; s++) physics_step(b, p, h);
+                CHECK(b[1].omega.length() > real(5),
+                      spinning ? "rolling resistance cannot slow spin about the normal"
+                               : "spinning resistance cannot slow spin across the normal");
+            }
+
+            // And the rate on the axis that IS resisted.
+            const real mus = real(0.01);
+            std::vector<phys_body> b;
+            b.push_back(ground_plane(real(0.5), real(0)));
+            b.push_back(ball(0, vec3(0, real(0.5), 0), vec3(), real(0.5), real(1),
+                             real(0.5), real(0)));
+            for (phys_body& q : b) q.spinning_friction = mus;
+            b[1].omega = vec3(0, 10, 0);
+            int stopped = -1;
+            for (int s = 1; s <= 240 * 120 && stopped < 0; s++) {
+                physics_step(b, p, h);
+                if (b[1].omega.length() < real(0.5)) stopped = s;
+            }
+            const double predicted = 9.5 / (2.5 * (double)mus * (double)G / 0.5);
+            printf("  top-spin mu_s = %.3f: 10 -> 0.5 rad/s in %.1f s (analytic %.1f s)\n",
+                   (double)mus, stopped < 0 ? -1.0 : stopped * (double)h, predicted);
+            CHECK(stopped > 0 && std::fabs(stopped * (double)h - predicted) < 0.5,
+                  "spinning resistance decelerates a top-spinning ball at 2.5 * mu_s * g / r");
+        }
+
+        // 9e. A box takes no spin, however it is hit — the property that keeps
+        //     B3c a deliberate change rather than a discovery.
+        {
+            std::vector<phys_body> b;
+            b.push_back(ground_plane(real(0.5), real(0)));
+            b.push_back(dynamic_box(vec3(0, real(0.5), 0), vec3(real(0.5), real(0.5), real(0.5)),
+                                    real(0.5), real(0)));
+            b[1].vel = vec3(2, 0, 0);
+            for (int s = 0; s < 480; s++) physics_step(b, p, h);
+            CHECK(b[1].omega.near_zero(),
+                  "a box never acquires spin, so it cannot absorb impulse it could not express");
+            CHECK(std::fabs((double)b[1].vel[0]) < 0.05,
+                  "and so a sliding box still stops dead, as it did before B3a");
+        }
+
+        // 9f. Spin alone keeps a body awake. A ball spinning on the spot has zero
+        //     centre velocity, and reporting it as at rest would be wrong: the
+        //     moment it touches anything, friction turns that spin into motion.
+        {
+            std::vector<phys_body> b;
+            b.push_back(ball(0, vec3(0, 5, 0), vec3(), real(0.5)));
+            b[0].omega = vec3(0, 0, 4);                               // 4 rad/s, r = 0.5
+            const phys_params zero_g{ real(0) };
+            real maxv = physics_step(b, zero_g, h);
+            CHECK(std::fabs((double)maxv - 2.0) < 1e-6,
+                  "the sleep metric is a SURFACE speed: |omega| * r counts, not just |v|");
         }
     }
 
