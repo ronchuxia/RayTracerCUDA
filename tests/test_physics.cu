@@ -1,5 +1,5 @@
 // Physics module tests — call the REAL src/physics.h (physics_step /
-// solve_sequential / sphere_box_contact), not a reimplementation. The whole
+// solve_sequential / sphere_aabb_contact), not a reimplementation. The whole
 // point of extracting physics into a header was that tests exercise the
 // shipping code directly.
 //
@@ -119,7 +119,7 @@ int main() {
     {
         // (a) FACE: closest point is on the +x face -> axis-aligned normal.
         vec3 n; real pen;
-        bool hit = sphere_box_contact(vec3(1.4, 0, 0), real(0.5), bmin, bmax, n, pen);
+        bool hit = sphere_aabb_contact(vec3(1.4, 0, 0), real(0.5), bmin, bmax, n, pen);
         CHECK(hit && std::fabs((double)n[0] - 1.0) < 1e-6 &&
               std::fabs((double)pen - 0.1) < 1e-5,
               "sphere-vs-box FACE: axis normal, penetration = r - gap");
@@ -128,7 +128,7 @@ int main() {
         // (b) CORNER: past the (+,+,+) vertex along the diagonal -> diagonal normal.
         real off = real(1) + real(0.5) / std::sqrt(3.0) - real(0.05);
         vec3 n; real pen;
-        bool hit = sphere_box_contact(vec3(off, off, off), real(0.5), bmin, bmax, n, pen);
+        bool hit = sphere_aabb_contact(vec3(off, off, off), real(0.5), bmin, bmax, n, pen);
         vec3 diag = unit_vector(vec3(1,1,1));
         CHECK(hit && dot(n, diag) > real(0.999),
               "sphere-vs-box CORNER: closest point is the vertex, normal is the diagonal");
@@ -136,7 +136,7 @@ int main() {
     {
         // (c) INSIDE: centre inside the box, nearest the +x face -> ejected out +x.
         vec3 n; real pen;
-        bool hit = sphere_box_contact(vec3(0.8, 0, 0), real(0.5), bmin, bmax, n, pen);
+        bool hit = sphere_aabb_contact(vec3(0.8, 0, 0), real(0.5), bmin, bmax, n, pen);
         CHECK(hit && std::fabs((double)n[0] - 1.0) < 1e-6 &&
               std::fabs((double)pen - 0.7) < 1e-5,      // r + exit distance = 0.5 + 0.2
               "sphere-vs-box INSIDE: ejected along the nearest face");

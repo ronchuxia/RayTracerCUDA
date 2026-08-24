@@ -355,7 +355,7 @@ inline vec3 any_perpendicular(const vec3& n) {
 //
 // TWO THINGS HERE ARE NOT OPTIONAL, and an absolute epsilon gets both wrong.
 // `v - n*dot(v,n)` is exactly orthogonal to n only when n is exactly unit, and a
-// float normal is unit to about 1e-7 — sphere_box_contact's n = d/dist rounds,
+// float normal is unit to about 1e-7 — sphere_aabb_contact's n = d/dist rounds,
 // and the oriented-box path then recombines it from three axes. So the residue
 // left along n scales with |v|: measured at 1.9e-6 for a ball spinning at
 // 10 rad/s against a normal of (0, 0.99999994, 0), which is 190x an absolute
@@ -377,6 +377,26 @@ inline vec3 tangent_from(const vec3& v, const vec3& n) {
 }
 
 // ---- shape queries -------------------------------------------------------
+//
+// The closed-form contact tests. The two BODY-PAIR tests — sphere-sphere and
+// sphere-box — fill the narrow phase's contract: n unit and pointing from B
+// toward A, pen >= 0, so contact_between can dispatch to either one or to
+// gjk_epa_contact and get back the same thing. Between them sits the AABB
+// KERNEL, which is not a pair test at all: it takes bare coordinates, and exists
+// only for sphere_box_contact to reuse in the box's own frame.
+
+inline bool sphere_sphere_contact(const phys_body& A, const phys_body& B, vec3& n, real& pen) {
+    vec3 d = A.pos - B.pos;
+    real dist2 = d.length_squared();
+    real rsum = A.radius + B.radius;
+    // Concentric centres have no separating direction, so report NO contact
+    // rather than inventing one the solver would then act on at full strength.
+    if (dist2 >= rsum * rsum || dist2 < real(1e-12)) return false;
+    real dist = std::sqrt(dist2);
+    n = d / dist;
+    pen = rsum - dist;
+    return true;
+}
 
 // Sphere vs an axis-aligned box. The closest point on the box to the sphere
 // centre is the centre CLAMPED into the box, one axis at a time. If that point
@@ -387,10 +407,11 @@ inline vec3 tangent_from(const vec3& v, const vec3& n) {
 // box surface -> centre) and pen (>= 0); returns false if no hit.
 //
 // Frame-agnostic: it reads only the coordinates it is handed, so an ORIENTED box
-// reuses it by passing the sphere centre in the box's own frame (contact_between
-// below does exactly that, then rotates n back to world space).
-inline bool sphere_box_contact(const vec3& c, real r, const vec3& bmin, const vec3& bmax,
-                               vec3& n, real& pen) {
+// reuses it by passing the sphere centre in the box's own frame
+// (sphere_box_contact below does exactly that, then rotates n back to world
+// space).
+inline bool sphere_aabb_contact(const vec3& c, real r, const vec3& bmin, const vec3& bmax,
+                                vec3& n, real& pen) {
     vec3 q(clampr(c[0], bmin[0], bmax[0]),         // closest point on the box to the centre
            clampr(c[1], bmin[1], bmax[1]),
            clampr(c[2], bmin[2], bmax[2]));
@@ -411,6 +432,21 @@ inline bool sphere_box_contact(const vec3& c, real r, const vec3& bmin, const ve
         else                      { n = vec3(0, 0, ez<0?real(-1):real(1)); pen = r + az; }
     }
     return true;
+}
+
+// Sphere vs ORIENTED box: move the sphere centre into the box's own frame
+// (project the separation onto each box axis), run the axis-aligned kernel there
+// against +/-half, then rotate the normal back out. The box's axes absorb the
+// rotation, so no separate oriented-box test is needed. For an axis-aligned box
+// the axes are identity and this reduces to the kernel itself, expressed
+// relative to the box centre.
+inline bool sphere_box_contact(const phys_body& A, const phys_body& B, vec3& n, real& pen) {
+    vec3 d = A.pos - B.pos;
+    vec3 c_local(dot(d, B.axes[0]), dot(d, B.axes[1]), dot(d, B.axes[2]));
+    vec3 n_local;
+    if (!sphere_aabb_contact(c_local, A.radius, -B.half, B.half, n_local, pen)) return false;
+    n = n_local.x() * B.axes[0] + n_local.y() * B.axes[1] + n_local.z() * B.axes[2];
+    return true;   // unit: n_local is unit and the axes are orthonormal
 }
 
 // ---- contact abstraction + SEQUENTIAL-IMPULSE solver ---------------------
@@ -435,45 +471,25 @@ struct contact {
     int  mcount;
 };
 
-// Narrow phase for ONE ORDERED pair: fills n (from B toward A) and pen.
+// ---- narrow phase --------------------------------------------------------
 //
-// Sphere-sphere and sphere-box have exact closed-form answers, so they are taken
-// directly; build_contacts canonicalises the sphere into A so those two cases
-// are what an ordered pair usually is. EVERY OTHER PAIRING FALLS THROUGH TO
-// GJK/EPA, which needs nothing but each shape's support function and so is
-// already correct for box-box, for a box handed in as A with a sphere as B, and
-// for B4's convex hulls without further cases here.
+// The dispatch, and the only place that knows which implementation a pairing
+// gets. The two analytic cases above and gjk_epa_contact are INTERCHANGEABLE,
+// NOT LAYERED: all three fill the same n and pen in the same convention, and
+// tests/test_physics.cu pins the analytic pair against gjk_epa_contact on the
+// same configurations. Keeping them is a cost decision (a handful of operations
+// against an iterative search) and an exactness one, not a correctness one.
 //
-// The two paths are interchangeable, not layered: both fill the same n and pen
-// in the same convention, and tests/test_physics.cu pins them against each other
-// on the same configurations. Keeping the analytic pair is a cost decision (a
-// handful of operations against an iterative search) and an exactness one, not a
-// correctness one.
+// EVERY OTHER PAIRING FALLS THROUGH TO GJK/EPA, which needs nothing but each
+// shape's support function and so already covers box-box, a box handed in as A
+// with a sphere as B, and B4's convex hulls without further cases here.
+// build_contacts canonicalises the sphere into A, so the two analytic cases are
+// what an ordered pair usually is; the order affects COST, not correctness.
 inline bool contact_between(const phys_body& A, const phys_body& B, vec3& n, real& pen) {
-    if (A.shape == COLLIDER_SPHERE && B.shape == COLLIDER_SPHERE) {   // sphere vs sphere
-        vec3 d = A.pos - B.pos;
-        real dist2 = d.length_squared();
-        real rsum = A.radius + B.radius;
-        if (dist2 >= rsum * rsum || dist2 < real(1e-12)) return false;
-        real dist = std::sqrt(dist2);
-        n = d / dist;
-        pen = rsum - dist;
-        return true;
-    }
-    if (A.shape == COLLIDER_SPHERE && B.shape == COLLIDER_BOX) {
-        // Sphere vs ORIENTED box: move the sphere centre into the box's own
-        // frame (project the separation onto each box axis), run the
-        // axis-aligned test there against +/-half, then rotate the normal back
-        // out. The box's axes absorb the rotation, so no separate oriented-box
-        // test is needed. For an axis-aligned box the axes are identity and this
-        // reduces to the plain test, expressed relative to the box centre.
-        vec3 d = A.pos - B.pos;
-        vec3 c_local(dot(d, B.axes[0]), dot(d, B.axes[1]), dot(d, B.axes[2]));
-        vec3 n_local;
-        if (!sphere_box_contact(c_local, A.radius, -B.half, B.half, n_local, pen)) return false;
-        n = n_local.x() * B.axes[0] + n_local.y() * B.axes[1] + n_local.z() * B.axes[2];
-        return true;   // unit: n_local is unit and the axes are orthonormal
-    }
+    if (A.shape == COLLIDER_SPHERE && B.shape == COLLIDER_SPHERE)
+        return sphere_sphere_contact(A, B, n, pen);
+    if (A.shape == COLLIDER_SPHERE && B.shape == COLLIDER_BOX)
+        return sphere_box_contact(A, B, n, pen);
     return gjk_epa_contact(A, B, n, pen);
 }
 
