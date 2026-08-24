@@ -500,6 +500,7 @@ int main(int argc, char** argv) {
         transform* tr = static_cast<transform*>(sc.get(scene_id)->object);
         phys_body& b = bodies[body_of_scene_id[scene_id]];
         b.vel   = vec3(0, 0, 0);   // position-only: a dragged body shoves, it doesn't strike
+        b.omega = vec3(0, 0, 0);   // and does not keep the spin it had at its old pose
         b.baseR = tr->rotation;
         b.baseS = tr->scale;
         if (b.shape == COLLIDER_SPHERE) {
@@ -508,6 +509,7 @@ int main(int argc, char** argv) {
         } else {                   // box collider re-derived from the new pose,
                                    // rotation included (physics_utils.h)
             box_collider_of(tr, b.pos, b.half, b.axes);
+            set_orientation_from_axes(b, b.axes);   // quaternion follows the pose
         }
         asleep = false; still_steps = 0;   // a moved body disturbs the pile -> resume stepping
     };
@@ -916,7 +918,18 @@ int main(int argc, char** argv) {
                     // pose is the driver's, so writing it back would fight the drag.
                     if (b.scene_id < 0 || b.motion != DYNAMIC) continue;
                     transform* tr = static_cast<transform*>(sc.get(b.scene_id)->object);
-                    new(tr) transform(tr->child, point3(b.pos), b.baseR, b.baseS);
+                    // B3c COUPLING: a box now turns, so its rendered rotation is
+                    // the SIMULATED orientation, not the authored one. The
+                    // physics owns a quaternion and the transform owns Euler
+                    // angles (which is what the editor's fields show), so this
+                    // is the one place the two meet — see quat.h. A sphere keeps
+                    // its authored rotation: turning one changes neither its
+                    // collider nor its silhouette, so writing a spin back would
+                    // only churn the transform and reset accumulation for a
+                    // pixel-identical image.
+                    const vec3 rot = (b.shape == COLLIDER_BOX)
+                                   ? quat_to_euler_zyx_degrees(b.orient) : b.baseR;
+                    new(tr) transform(tr->child, point3(b.pos), rot, b.baseS);
                 }
                 sc.refit();
                 reset_accumulation();

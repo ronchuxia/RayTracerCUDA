@@ -121,6 +121,12 @@ inline phys_body make_box_body(scene& sc, int scene_id, motion_type motion = STA
     b.motion = motion;  b.mass = mass;
     b.shape  = COLLIDER_BOX;
     box_collider_of(tr, b.pos, b.half, b.axes);
+    // The pose arrives as a MATRIX and the body stores a quaternion, so hand the
+    // axes over rather than copying them: set_orientation_from_axes recovers the
+    // quaternion and re-derives the cache from it. Writing b.axes alone would
+    // leave orient at identity, and the first step that turned this box would
+    // snap it back to axis-aligned.
+    set_orientation_from_axes(b, b.axes);
     b.friction = friction;  b.restitution = restitution;
     return b;
 }

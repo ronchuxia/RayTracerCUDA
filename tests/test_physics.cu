@@ -567,11 +567,28 @@ int main() {
             // the pair keeps scan order. Assert the CONVENTION the solver relies
             // on instead of that order: n points from b toward a, so it agrees
             // in sign with the separation of their centres.
-            bool oriented = C.size() == 1 &&
-                            dot(C[0].n, b[C[0].a].pos - b[C[0].b].pos) > real(0) &&
-                            std::fabs((double)std::fabs((double)C[0].n[1]) - 1) < 1e-3;
+            bool oriented = C.size() >= 1;
+            for (const contact& k : C)
+                oriented = oriented && dot(k.n, b[k.a].pos - b[k.b].pos) > real(0) &&
+                           std::fabs((double)std::fabs((double)k.n[1]) - 1) < 1e-3;
             CHECK(oriented,
                   "build_contacts emits a box-box contact, with n from b toward a");
+
+            // B3b: face-on, the overlap is a SQUARE, not a point, so the pair
+            // emits one contact per corner of it. That is the whole reason a
+            // resting box stops rocking — a single point is a pivot.
+            CHECK(C.size() == 4,
+                  "a face-on box-box overlap emits a 4-point manifold");
+            bool on_face = true;
+            for (const contact& k : C) {
+                // Every point lies on the shared face (y = 1 between boxes whose
+                // faces are at y = 1 and y = 0.9) and inside the square.
+                on_face = on_face && std::fabs((double)k.p[1] - 1.0) < 0.11 &&
+                          std::fabs((double)k.p[0]) <= 1.001 && std::fabs((double)k.p[2]) <= 1.001 &&
+                          k.mcount == 4;
+                }
+            CHECK(on_face,
+                  "and each point is on the shared face, inside the overlap square");
         }
 
         // 8f. End to end: a box falls under gravity and comes to rest on another
@@ -592,9 +609,10 @@ int main() {
         }
     }
 
-    // 9. ROTATION (B3a): spheres carry angular velocity, friction spins them up,
-    //    and a ball ROLLS instead of being scrubbed to a halt. Boxes stay
-    //    rotation-free until B3c.
+    // 9. ROTATION: spheres carry angular velocity, friction spins them up, and a
+    //    ball ROLLS instead of being scrubbed to a halt (B3a). Boxes carry a
+    //    quaternion and a real inertia tensor, and take torque through their
+    //    contact manifold (B3b/B3c).
     //
     //    Most of these have closed-form answers, because a uniform sphere on a
     //    flat surface is one of the few rigid-body problems that does.
@@ -616,9 +634,40 @@ int main() {
             CHECK(inv_inertia_apply(st, vec3(1,0,0)).near_zero(),
                   "inv_inertia: an immovable body cannot be spun, whatever its mass");
 
-            CHECK(inv_inertia_apply(static_box(vec3(0,0,0), vec3(1,1,1)), vec3(1,0,0)).near_zero() &&
-                  inv_inertia_apply(dynamic_box(vec3(0,0,0), vec3(1,1,1)), vec3(1,0,0)).near_zero(),
-                  "inv_inertia: a box is rotation-free until B3c, dynamic or not");
+            // B3c: a box now has a real tensor. STATIC still returns zero — the
+            // role gate is above the shape test and outranks it.
+            CHECK(inv_inertia_apply(static_box(vec3(0,0,0), vec3(1,1,1)), vec3(1,0,0)).near_zero(),
+                  "inv_inertia: an immovable box is still rotation-free (role outranks shape)");
+
+            // A box of half-extents h has I_xx = (1/3) m (h_y^2 + h_z^2), so the
+            // inverse is 3 * inv_mass / (h_y^2 + h_z^2) — ANISOTROPIC, unlike a
+            // sphere: this one resists turning about x (the long axis) least.
+            {
+                phys_body bx = dynamic_box(vec3(0,0,0), vec3(2, 1, 1));   // m = 1
+                vec3 gx = inv_inertia_apply(bx, vec3(1, 0, 0));
+                vec3 gy = inv_inertia_apply(bx, vec3(0, 1, 0));
+                // 1e-6, not 1e-9: 3/5 is not exactly representable in binary, so
+                // the float build lands an ulp off. The sphere assertions above
+                // use the same bound for the same reason.
+                CHECK(std::fabs((double)gx[0] - 3.0 / (1.0 + 1.0)) < 1e-6,
+                      "inv_inertia: a box about its own x is 3 * inv_mass / (hy^2 + hz^2)");
+                CHECK(std::fabs((double)gy[1] - 3.0 / (4.0 + 1.0)) < 1e-6,
+                      "inv_inertia: and about y is 3 * inv_mass / (hx^2 + hz^2) — anisotropic");
+                CHECK((double)gx[0] > (double)gy[1],
+                      "inv_inertia: a long box turns most easily about its long axis");
+            }
+
+            // The tensor lives in the BODY frame: turn the box 90 degrees about
+            // y and the axis that was easy to spin about is now world z.
+            {
+                phys_body bx = dynamic_box(vec3(0,0,0), vec3(2, 1, 1));
+                phys_body rb = bx;
+                set_orientation(rb, quat_from_axis_angle(vec3(0,1,0), real(1.5707963267948966)));
+                vec3 turned = inv_inertia_apply(rb, vec3(0, 0, 1));   // world z == body x now
+                vec3 flat   = inv_inertia_apply(bx, vec3(1, 0, 0));   // body x when unturned
+                CHECK(std::fabs((double)turned[2] - (double)flat[0]) < 1e-6,
+                      "inv_inertia: the tensor rotates with the body (R I^-1 R^T)");
+            }
         }
 
         // 9b. A sphere's lever arm is PARALLEL to the contact normal, so the
@@ -628,9 +677,10 @@ int main() {
         {
             phys_body s = ball(0, vec3(0, real(0.5), 0), vec3(), real(0.5));
             vec3 up(0, 1, 0);
-            vec3 r = contact_lever(s, up, true);
+            vec3 cp(0, 0, 0);                      // the contact point, on the floor
+            vec3 r = contact_lever(s, up, cp, true);
             phys_body none = ground_plane();
-            vec3 rb = contact_lever(none, up, false);
+            vec3 rb = contact_lever(none, up, cp, false);
             CHECK(cross(r, up).near_zero() && std::fabs((double)r[1] + 0.5) < 1e-9,
                   "lever arm: one radius against the normal, so it exerts no torque along n");
             CHECK(std::fabs((double)inv_effective_mass(s, none, r, rb, up) - 1.0) < 1e-9,
@@ -749,19 +799,45 @@ int main() {
                   "spinning resistance decelerates a top-spinning ball at 2.5 * mu_s * g / r");
         }
 
-        // 9e. A box takes no spin, however it is hit — the property that keeps
-        //     B3c a deliberate change rather than a discovery.
+        // 9e. A box TAKES SPIN now (B3c), and the manifold (B3b) is what keeps
+        //     that from turning every slide into a tumble. Before this phase the
+        //     first assertion read "a box never acquires spin" — the flip is the
+        //     deliberate change the old comment was reserving.
         {
+            // A sliding box still stops dead, and stays flat while doing it. The
+            // friction impulse acts at the FLOOR, below the centre of mass, so it
+            // torques the box forward; four contact points, each free to carry
+            // its own normal load, are what resist the tip.
             std::vector<phys_body> b;
             b.push_back(ground_plane(real(0.5), real(0)));
             b.push_back(dynamic_box(vec3(0, real(0.5), 0), vec3(real(0.5), real(0.5), real(0.5)),
                                     real(0.5), real(0)));
             b[1].vel = vec3(2, 0, 0);
             for (int s = 0; s < 480; s++) physics_step(b, p, h);
-            CHECK(b[1].omega.near_zero(),
-                  "a box never acquires spin, so it cannot absorb impulse it could not express");
+            printf("  sliding box: vx = %.4f, |omega| = %.4f, up.y = %.5f\n",
+                   (double)b[1].vel[0], (double)b[1].omega.length(), (double)b[1].axes[1][1]);
             CHECK(std::fabs((double)b[1].vel[0]) < 0.05,
-                  "and so a sliding box still stops dead, as it did before B3a");
+                  "a sliding box still stops dead");
+            CHECK((double)b[1].axes[1][1] > 0.999,
+                  "and stays flat doing it: the 4-point manifold resists the friction torque");
+
+            // Off-centre load DOES turn a box: one hanging over the edge of a
+            // platform tips off it. This is the pairing B3b+B3c exists for —
+            // the manifold says WHERE the support is, the tensor turns that into
+            // rotation.
+            std::vector<phys_body> t;
+            t.push_back(static_box(vec3(0, real(0.5), 0), vec3(1, real(0.5), 1),
+                                   real(0.8), real(0)));            // platform, top at y = 1
+            t.push_back(dynamic_box(vec3(real(1.3), real(1.5), 0),  // overhanging its +x edge
+                                    vec3(real(0.5), real(0.5), real(0.5)), real(0.8), real(0)));
+            // Half a second — while it is still ON the platform. Left to run it
+            // slides off and free-falls, which would satisfy any "did it turn"
+            // test for the wrong reason.
+            for (int s = 0; s < 120; s++) physics_step(t, p, h);
+            printf("  overhanging box after 0.5 s: up.y = %.4f, |omega| = %.4f\n",
+                   (double)t[1].axes[1][1], (double)t[1].omega.length());
+            CHECK(t[1].omega.length() > real(0.1) && (double)t[1].axes[1][1] < 0.999,
+                  "a box supported off-centre tips: the manifold's geometry becomes torque");
         }
 
         // 9f. Spin alone keeps a body awake. A ball spinning on the spot has zero
