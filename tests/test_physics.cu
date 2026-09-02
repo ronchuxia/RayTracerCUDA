@@ -23,14 +23,14 @@
 // and no scene object is an infinite plane. A box top gives the same contact
 // normal and penetration a plane did, so the assertions below are unchanged.
 static phys_body ground_plane(real friction = real(0.5), real restitution = real(0.7)) {
-    phys_body g{ -1, vec3(0, -100, 0), vec3(0,0,0), real(0), vec3(), vec3() };
+    phys_body g{ -1, vec3(0, -100, 0), vec3(0,0,0), vec3(), vec3() };
     g.motion = STATIC; g.shape = COLLIDER_BOX; g.half = vec3(1000, 100, 1000);
     g.friction = friction; g.restitution = restitution;
     return g;
 }
 static phys_body static_box(const vec3& centre, const vec3& half,
                             real friction = real(0.5), real restitution = real(0.7)) {
-    phys_body b{ -1, centre, vec3(0,0,0), real(0), vec3(), vec3() };
+    phys_body b{ -1, centre, vec3(0,0,0), vec3(), vec3() };
     b.motion = STATIC; b.shape = COLLIDER_BOX; b.half = half;
     b.friction = friction; b.restitution = restitution;
     return b;
@@ -60,7 +60,8 @@ static phys_body rotated_box_y(const vec3& centre, const vec3& half, real deg) {
 static phys_body ball(int scene_id, const vec3& pos, const vec3& vel, real r,
                       real m = real(1), real friction = real(0.5),
                       real restitution = real(0.7)) {
-    phys_body b{ scene_id, pos, vel, r, vec3(), vec3() };
+    phys_body b{ scene_id, pos, vel, vec3(), vec3() };
+    b.radius = r;
     b.mass = m; b.friction = friction; b.restitution = restitution;
     return b;
 }
@@ -413,7 +414,7 @@ int main() {
               "combine: the rule reaches the solver (bouncy ball on a dead floor)");
     }
 
-    // 8. CONVEX-CONVEX (B2): support functions + GJK/EPA, in src/gjk.h. These
+    // 8. CONVEX-CONVEX (B2): support functions + GJK/EPA, in src/physics/gjk.h. These
     //    are what let ANY pair of convex colliders collide from one code path,
     //    where before every pair needed its own analytic test and box-box
     //    silently had none.
@@ -503,7 +504,7 @@ int main() {
                   "epa: two boxes sharing a centre exactly report the shallowest way out");
         }
 
-        // 8d. The two paths must agree. contact_between takes the analytic
+        // 8d. The two paths must agree. contact_detect takes the analytic
         //     sphere-box test; gjk_epa_contact takes the general one. Same
         //     configuration, same answer — that is what makes the fast path a
         //     cost decision rather than a second implementation to keep in sync.
@@ -512,7 +513,7 @@ int main() {
         //     tolerance is on DISTANCE, which bounds the ANGLE only to
         //     sqrt(2*TOL/r) on a curved surface. Measured worst case here is
         //     0.0063 rad (0.36 degrees), identical in float and double. See the
-        //     table at EPA_TOL in src/gjk.h.
+        //     table at EPA_TOL in src/physics/gjk.h.
         {
             double worst_n = 0, worst_pen = 0, worst_swapped = 0;
             int disagreements = 0, touching = 0;
@@ -524,7 +525,7 @@ int main() {
                 phys_body B = rotated_box_y(vec3(0,0,0), vec3(1, real(0.6), real(0.8)), real(30));
 
                 vec3 n1, n2; real p1, p2;
-                bool h1 = contact_between(S, B, n1, p1);      // analytic fast path
+                bool h1 = contact_detect(S, B, n1, p1);      // analytic fast path
                 bool h2 = gjk_epa_contact(S, B, n2, p2);      // general path
                 if (h1 != h2) { disagreements++; continue; }
                 if (!h1) continue;
@@ -538,7 +539,7 @@ int main() {
                 // there is no analytic test for it, so it goes through GJK/EPA.
                 // The answer must be the same collision with the normal flipped.
                 vec3 n3; real p3;
-                if (contact_between(B, S, n3, p3)) {
+                if (contact_detect(B, S, n3, p3)) {
                     double d = (double)(n1 + n3).length() + std::fabs((double)p1 - (double)p3);
                     if (d > worst_swapped) worst_swapped = d;
                 } else disagreements++;
@@ -554,7 +555,7 @@ int main() {
                   "the pair order does not change the collision, only the normal's sign");
         }
 
-        // 8e. The narrow phase emits box-box now. Before B2 contact_between
+        // 8e. The narrow phase emits box-box now. Before B2 contact_detect
         //     returned false for any pair without a sphere, so two overlapping
         //     boxes produced NO contact and passed through each other.
         {
@@ -626,17 +627,17 @@ int main() {
         //     not be spinnable either.
         {
             phys_body s = ball(0, vec3(0,0,0), vec3(), real(0.5), real(2));  // m = 2, r = 0.5
-            vec3 got = inv_inertia_apply(s, vec3(1, 0, 0));
+            vec3 got = delta_omega(s, vec3(1, 0, 0));
             CHECK(std::fabs((double)got[0] - 2.5 * 0.5 / 0.25) < 1e-6,
                   "inv_inertia: a solid sphere's is 2.5 * inv_mass / r^2");
 
             phys_body st = s; st.motion = STATIC;
-            CHECK(inv_inertia_apply(st, vec3(1,0,0)).near_zero(),
+            CHECK(delta_omega(st, vec3(1,0,0)).near_zero(),
                   "inv_inertia: an immovable body cannot be spun, whatever its mass");
 
             // B3c: a box now has a real tensor. STATIC still returns zero — the
             // role gate is above the shape test and outranks it.
-            CHECK(inv_inertia_apply(static_box(vec3(0,0,0), vec3(1,1,1)), vec3(1,0,0)).near_zero(),
+            CHECK(delta_omega(static_box(vec3(0,0,0), vec3(1,1,1)), vec3(1,0,0)).near_zero(),
                   "inv_inertia: an immovable box is still rotation-free (role outranks shape)");
 
             // A box of half-extents h has I_xx = (1/3) m (h_y^2 + h_z^2), so the
@@ -644,8 +645,8 @@ int main() {
             // sphere: this one resists turning about x (the long axis) least.
             {
                 phys_body bx = dynamic_box(vec3(0,0,0), vec3(2, 1, 1));   // m = 1
-                vec3 gx = inv_inertia_apply(bx, vec3(1, 0, 0));
-                vec3 gy = inv_inertia_apply(bx, vec3(0, 1, 0));
+                vec3 gx = delta_omega(bx, vec3(1, 0, 0));
+                vec3 gy = delta_omega(bx, vec3(0, 1, 0));
                 // 1e-6, not 1e-9: 3/5 is not exactly representable in binary, so
                 // the float build lands an ulp off. The sphere assertions above
                 // use the same bound for the same reason.
@@ -663,8 +664,8 @@ int main() {
                 phys_body bx = dynamic_box(vec3(0,0,0), vec3(2, 1, 1));
                 phys_body rb = bx;
                 set_orientation(rb, quat_from_axis_angle(vec3(0,1,0), real(1.5707963267948966)));
-                vec3 turned = inv_inertia_apply(rb, vec3(0, 0, 1));   // world z == body x now
-                vec3 flat   = inv_inertia_apply(bx, vec3(1, 0, 0));   // body x when unturned
+                vec3 turned = delta_omega(rb, vec3(0, 0, 1));   // world z == body x now
+                vec3 flat   = delta_omega(bx, vec3(1, 0, 0));   // body x when unturned
                 CHECK(std::fabs((double)turned[2] - (double)flat[0]) < 1e-6,
                       "inv_inertia: the tensor rotates with the body (R I^-1 R^T)");
             }

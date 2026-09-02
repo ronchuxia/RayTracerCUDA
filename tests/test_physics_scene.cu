@@ -88,12 +88,12 @@ int main() {
         for (int i = 0; i < (int)b.size(); i++) {
             if (b[i].motion != DYNAMIC) continue;          // the balls
             vec3 gn; real gpen;                       // the ground is a sphere now, so
-            if (contact_between(b[i], b[0], gn, gpen) && gpen > real(0.02))
+            if (contact_detect(b[i], b[0], gn, gpen) && gpen > real(0.02))
                 above_ground = false;                 // ask the narrow phase, not y > r
             if (std::fabs((double)b[i].pos[0]) > (double)BOX_HALF + 0.02 ||
                 std::fabs((double)b[i].pos[2]) > (double)BOX_HALF + 0.02) inside_walls = false;
             vec3 n; real pen;
-            if (contact_between(b[i], b[box_i], n, pen) && pen > real(0.02)) clear_of_box = false;
+            if (contact_detect(b[i], b[box_i], n, pen) && pen > real(0.02)) clear_of_box = false;
             for (int j = i + 1; j < (int)b.size(); j++) {
                 if (b[j].motion != DYNAMIC) continue;
                 if ((b[i].pos - b[j].pos).length() < b[i].radius + b[j].radius - real(0.02))
@@ -128,7 +128,7 @@ int main() {
             if (b[i].motion != DYNAMIC) continue;          // the balls
             if ((b[i].pos - before[i]).length() > real(0.15)) pushed++;
             vec3 n; real pen;
-            if (contact_between(b[i], box, n, pen) && pen > real(0.05)) clear = false;
+            if (contact_detect(b[i], box, n, pen) && pen > real(0.05)) clear = false;
         }
         CHECK((box.pos - to).length() < real(1e-6),
               "a dragged KINEMATIC body holds exactly the pose it was given");
@@ -171,7 +171,7 @@ int main() {
         for (int i = 0; i < (int)b.size(); i++) {
             if (b[i].motion != DYNAMIC) continue;          // the balls
             vec3 n; real pen;
-            if (contact_between(b[i], b[box_i], n, pen) && pen > real(0.02)) clear = false;
+            if (contact_detect(b[i], b[box_i], n, pen) && pen > real(0.02)) clear = false;
         }
         printf("  turned obstacle after 20 s: max |v| = %.4f\n", (double)maxv);
         CHECK(maxv < real(0.1), "the pit settles with the obstacle turned 45 degrees");
@@ -216,7 +216,7 @@ int main() {
         for (int i = 0; i < (int)b.size(); i++) {
             if (b[i].motion != DYNAMIC) continue;
             vec3 gn; real gpen;
-            if (contact_between(b[i], b[0], gn, gpen) && gpen > real(0.02)) above_ground = false;
+            if (contact_detect(b[i], b[0], gn, gpen) && gpen > real(0.02)) above_ground = false;
             if (std::fabs((double)b[i].pos[0]) > 1.5 + 0.02 ||
                 std::fabs((double)b[i].pos[2]) > 1.5 + 0.02) contained = false;
         }

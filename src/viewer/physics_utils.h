@@ -7,7 +7,7 @@
 #include "hittable.h"
 #include "hittables/sphere.h"
 #include "hittables/transforms.h"
-#include "physics.h"
+#include "physics/body.h"
 #include "scene.h"
 
 // Host-only physics-construction helpers: the factories a scene uses to author
@@ -76,7 +76,8 @@ inline phys_body make_sphere_body(scene& sc, int scene_id, motion_type motion = 
     }
     sphere* sp = static_cast<sphere*>(tr->child->object);
     phys_body b{ scene_id, tr->translation, vec3(0,0,0),
-                 sp->radius * tr->scale.y(), tr->rotation, tr->scale };
+                 tr->rotation, tr->scale };
+    b.radius = sp->radius * tr->scale.y();
     b.motion = motion;  b.mass = mass;
     b.friction = friction;  b.restitution = restitution;
     return b;
@@ -91,7 +92,7 @@ inline phys_body make_sphere_body(scene& sc, int scene_id, motion_type motion = 
 // a 45-degree turn about y inflates a unit box's footprint by 41% — so a
 // collider read from it would stop balls short of the visible surface. Nothing
 // here is a new collision test: the rotation goes into `axes` and
-// `contact_between` transforms into that frame.
+// `contact_detect` transforms into that frame.
 //
 // One derivation, two callers: the scene authors a body with make_box_body, and
 // the viewer re-runs this after a drag. They cannot disagree.
@@ -117,7 +118,7 @@ inline phys_body make_box_body(scene& sc, int scene_id, motion_type motion = STA
                                real mass = real(1),
                                real friction = real(0.5), real restitution = real(0.7)) {
     transform* tr = get_body_transform(sc, scene_id);
-    phys_body b{ scene_id, vec3(0,0,0), vec3(0,0,0), real(0), tr->rotation, tr->scale };
+    phys_body b{ scene_id, vec3(0,0,0), vec3(0,0,0), tr->rotation, tr->scale };
     b.motion = motion;  b.mass = mass;
     b.shape  = COLLIDER_BOX;
     box_collider_of(tr, b.pos, b.half, b.axes);

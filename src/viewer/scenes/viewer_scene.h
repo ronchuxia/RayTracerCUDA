@@ -3,7 +3,7 @@
 
 #include <vector>
 
-#include "physics.h"
+#include "physics/body.h"
 #include "vec3.h"
 
 // Per-scene config the viewer needs beyond the geometry: the initial camera and

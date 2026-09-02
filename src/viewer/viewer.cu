@@ -891,15 +891,11 @@ int main(int argc, char** argv) {
 
         if (camera_dirty) rebuild_camera();   // recompute view + reset accumulation
 
-        // D (physics): the wall-clock accumulator DRIVES the fixed-step
-        // integrator (physics.h::physics_step); this loop is the driver + the
-        // coupling. Wall dt is clamped to PHYS_MAX_STEPS (spiral-of-death guard);
-        // each stepped frame rewrites every body's transform (B5 mutation
-        // protocol) and restarts accumulation; when ALL bodies stay slow for
-        // SLEEP_STEPS the sim sleeps (stops resetting) so the image converges.
+        // step physics
         if (animating && !asleep && !bodies.empty()) {
             const phys_params pp{ real(gravity), (combine_mode)friction_combine,
                                                  (combine_mode)restitution_combine };
+            // advance timeline
             phys_accum += ImGui::GetIO().DeltaTime;
             const double cap = PHYS_DT * PHYS_MAX_STEPS;
             if (phys_accum > cap) phys_accum = cap;     // spiral-of-death clamp
