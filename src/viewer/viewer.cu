@@ -280,6 +280,7 @@ int main() {
     const int    SLEEP_STEPS = 60;
 
     std::vector<phys_body>& bodies = sc.bodies;
+    const std::vector<phys_body> initial_bodies = bodies;   // authored snapshot for reset
 
     std::vector<int> body_of_scene_id((size_t)sc.objects.size(), -1);
     for (int i = 0; i < (int)bodies.size(); i++)
@@ -347,13 +348,14 @@ int main() {
 
     // reset simulation
     auto reset_sim = [&]() {
-        for (phys_body& b : bodies) {
-            if (b.scene_id < 0) continue;
-            const init_trs& in = initial_trs[b.scene_id];
-            transform* tr = static_cast<transform*>(sc.get(b.scene_id)->object);
+        // reset scene object transforms
+        for (int id = 0; id < (int)sc.objects.size(); id++) {
+            const init_trs& in = initial_trs[id];
+            transform* tr = static_cast<transform*>(sc.get(id)->object);
             new(tr) transform(tr->child, in.t, in.r, in.s);
-            sync_body_from_transform(b.scene_id);
         }
+        // reset physics bodies
+        bodies = initial_bodies;
         sc.refit();
         reset_accumulation();
         phys_accum = 0.0; still_steps = 0; asleep = false; playing = false;
