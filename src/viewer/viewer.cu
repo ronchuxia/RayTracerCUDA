@@ -559,84 +559,78 @@ int main() {
                 if (selected_id >= 0) {
                     ImGui::Text("selected  id %d", selected_id);
 
-                    hittable* h = sc.get(selected_id);
-                    if (h->type == TRANSFORM) {
-                        // transform
-                        transform* tr = static_cast<transform*>(h->object);
-                        float t[3] = {(float)tr->translation.x(), (float)tr->translation.y(), (float)tr->translation.z()};
-                        float r[3] = {(float)tr->rotation.x(),    (float)tr->rotation.y(),    (float)tr->rotation.z()};
-                        float s[3] = {(float)tr->scale.x(),       (float)tr->scale.y(),       (float)tr->scale.z()};
-                        bool edited = false;
-                        edited |= ImGui::DragFloat3("translate", t, 0.05f);
-                        edited |= ImGui::DragFloat3("rotate",    r, 1.0f);
-                        edited |= ImGui::DragFloat3("scale",     s, 0.02f, 0.01f, 100.0f);
-                        if (edited) {
-                            for (int c = 0; c < 3; c++) s[c] = fmaxf(s[c], 0.01f);
-                            new(tr) transform(tr->child, point3(t[0], t[1], t[2]), vec3(r[0], r[1], r[2]), vec3(s[0], s[1], s[2]));
-                            sc.refit();
-                            reset_accumulation();
-                            sync_body_from_transform(selected_id);
-                        }
-                        if (ImGui::Button("Reset transform")) {
-                            const init_trs& in = initial_trs[selected_id];
-                            new(tr) transform(tr->child, in.t, in.r, in.s);
-                            sc.refit();
-                            reset_accumulation();
-                            sync_body_from_transform(selected_id);
-                        }
+                    transform* tr = static_cast<transform*>(sc.get(selected_id)->object);
+                    float t[3] = {(float)tr->translation.x(), (float)tr->translation.y(), (float)tr->translation.z()};
+                    float r[3] = {(float)tr->rotation.x(),    (float)tr->rotation.y(),    (float)tr->rotation.z()};
+                    float s[3] = {(float)tr->scale.x(),       (float)tr->scale.y(),       (float)tr->scale.z()};
+                    bool edited = false;
+                    edited |= ImGui::DragFloat3("translate", t, 0.05f);
+                    edited |= ImGui::DragFloat3("rotate",    r, 1.0f);
+                    edited |= ImGui::DragFloat3("scale",     s, 0.02f, 0.01f, 100.0f);
+                    if (edited) {
+                        for (int c = 0; c < 3; c++) s[c] = fmaxf(s[c], 0.01f);
+                        new(tr) transform(tr->child, point3(t[0], t[1], t[2]), vec3(r[0], r[1], r[2]), vec3(s[0], s[1], s[2]));
+                        sc.refit();
+                        reset_accumulation();
+                        sync_body_from_transform(selected_id);
+                    }
+                    if (ImGui::Button("Reset transform")) {
+                        const init_trs& in = initial_trs[selected_id];
+                        new(tr) transform(tr->child, in.t, in.r, in.s);
+                        sc.refit();
+                        reset_accumulation();
+                        sync_body_from_transform(selected_id);
+                    }
 
-                        // collision type and motion type
-                        int bi = body_of_scene_id[selected_id];
-                        if (bi >= 0) {
-                            phys_body& b = bodies[bi];
-                            ImGui::Spacing();
-                            // collision type
-                            if (ImGui::Checkbox("collidable", &b.collidable)) {
-                                asleep = false; still_steps = 0;
-                            }
-                            // motion type
-                            static const char* kMotion[] = { "static", "kinematic", "dynamic" };
-                            int m = (int)b.motion;
-                            if (ImGui::Combo("motion", &m, kMotion, IM_ARRAYSIZE(kMotion))) {
-                                b.motion = (motion_type)m;
-                                if (b.motion != DYNAMIC) b.vel = vec3(0, 0, 0);
-                                asleep = false; still_steps = 0;
-                            }
-                            // mass of dynamic object
-                            if (b.motion == DYNAMIC) {
-                                float mass_f = (float)b.mass;
-                                if (ImGui::DragFloat("mass", &mass_f, 0.05f, 0.01f, 1000.0f, "%.2f")) {
-                                    b.mass = real(fmaxf(mass_f, 0.01f));
-                                    asleep = false; still_steps = 0;
-                                }
-                            }
-                            // surface properties
-                            float fr = (float)b.friction, rest = (float)b.restitution;
-                            if (ImGui::SliderFloat("friction", &fr, 0.0f, 2.0f, "%.2f")) {
-                                b.friction = real(fr);
-                                asleep = false; still_steps = 0;
-                            }
-                            if (ImGui::SliderFloat("restitution", &rest, 0.0f, 1.0f, "%.2f")) {
-                                b.restitution = real(rest);
-                                asleep = false; still_steps = 0;
-                            }
-                            float roll = (float)b.rolling_friction;
-                            float spin = (float)b.spinning_friction;
-                            if (ImGui::SliderFloat("rolling", &roll, 0.0f, 0.1f, "%.3f")) {
-                                b.rolling_friction = real(roll);
-                                asleep = false; still_steps = 0;
-                            }
-                            if (ImGui::SliderFloat("spinning", &spin, 0.0f, 0.1f, "%.3f")) {
-                                b.spinning_friction = real(spin);
-                                asleep = false; still_steps = 0;
-                            }
-                            if (b.shape == COLLIDER_SPHERE && inv_mass(b) > real(0))
-                                ImGui::Text("spin      %.2f rad/s", (double)b.omega.length());
-                        } else {
-                            ImGui::TextDisabled("not simulated");
+                    // collision type and motion type
+                    int bi = body_of_scene_id[selected_id];
+                    if (bi >= 0) {
+                        phys_body& b = bodies[bi];
+                        ImGui::Spacing();
+                        // collision type
+                        if (ImGui::Checkbox("collidable", &b.collidable)) {
+                            asleep = false; still_steps = 0;
                         }
+                        // motion type
+                        static const char* kMotion[] = { "static", "kinematic", "dynamic" };
+                        int m = (int)b.motion;
+                        if (ImGui::Combo("motion", &m, kMotion, IM_ARRAYSIZE(kMotion))) {
+                            b.motion = (motion_type)m;
+                            if (b.motion != DYNAMIC) b.vel = vec3(0, 0, 0);
+                            asleep = false; still_steps = 0;
+                        }
+                        // mass of dynamic object
+                        if (b.motion == DYNAMIC) {
+                            float mass_f = (float)b.mass;
+                            if (ImGui::DragFloat("mass", &mass_f, 0.05f, 0.01f, 1000.0f, "%.2f")) {
+                                b.mass = real(fmaxf(mass_f, 0.01f));
+                                asleep = false; still_steps = 0;
+                            }
+                        }
+                        // surface properties
+                        float fr = (float)b.friction, rest = (float)b.restitution;
+                        if (ImGui::SliderFloat("friction", &fr, 0.0f, 2.0f, "%.2f")) {
+                            b.friction = real(fr);
+                            asleep = false; still_steps = 0;
+                        }
+                        if (ImGui::SliderFloat("restitution", &rest, 0.0f, 1.0f, "%.2f")) {
+                            b.restitution = real(rest);
+                            asleep = false; still_steps = 0;
+                        }
+                        float roll = (float)b.rolling_friction;
+                        float spin = (float)b.spinning_friction;
+                        if (ImGui::SliderFloat("rolling", &roll, 0.0f, 0.1f, "%.3f")) {
+                            b.rolling_friction = real(roll);
+                            asleep = false; still_steps = 0;
+                        }
+                        if (ImGui::SliderFloat("spinning", &spin, 0.0f, 0.1f, "%.3f")) {
+                            b.spinning_friction = real(spin);
+                            asleep = false; still_steps = 0;
+                        }
+                        if (b.shape == COLLIDER_SPHERE && inv_mass(b) > real(0))
+                            ImGui::Text("spin      %.2f rad/s", (double)b.omega.length());
                     } else {
-                        ImGui::TextDisabled("not editable");
+                        ImGui::TextDisabled("not simulated");
                     }
                 } else {
                     ImGui::Text("selected  none");

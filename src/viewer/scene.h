@@ -1,6 +1,8 @@
 #ifndef VIEWER_SCENE_H
 #define VIEWER_SCENE_H
 
+#include <cstdlib>
+#include <iostream>
 #include <vector>
 
 #include "cuda_helper.h"
@@ -44,6 +46,10 @@ struct scene {
 
     // register a scene object
     int add(hittable* h) {
+        if (h->type != TRANSFORM) {
+            std::cerr << "scene object is not transform-wrapped\n";
+            std::exit(1);
+        }
         int id = (int)objects.size();
         h->id = id; // assign scene object id
         world->add(h);

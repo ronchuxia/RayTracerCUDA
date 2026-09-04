@@ -69,7 +69,8 @@ static void build_repro_scene(scene& sc) {
     material* box_mat = new_lambertian(color(0.2, 0.4, 0.7), sc.allocs);
     material* tri_mat = new_lambertian(color(0.9, 0.75, 0.2), sc.allocs);
 
-    sc.add(make_sphere(point3(0, -1000, 0), 1000, ground, sc.allocs));
+    sc.add(new_transform(make_sphere(point3(0,0,0), 1000, ground, sc.allocs),
+                         vec3(0,-1000,0), vec3(0,0,0), vec3(1,1,1), sc.allocs));
     sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, diffuse, sc.allocs),
                          vec3(-4,1,0), vec3(0,0,0), vec3(1,1,1), sc.allocs));
     sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, glass, sc.allocs),

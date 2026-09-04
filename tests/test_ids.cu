@@ -1,12 +1,14 @@
 // Scene-id foundation test (mutable scene + stable ids):
 //  1. ids registered via scene::add() are stamped into hit_record.id by the
-//     OUTERMOST tagged wrapper — a box hit through translate(rotate_y(box))
-//     reports the transform chain's id, not an interior quad;
+//     OUTERMOST tagged wrapper — a box hit through transform(box) reports the
+//     transform's id, not an interior quad;
 //  2. flat-list and BVH traversal stamp the same ids;
 //  3. the mutate -> restore-bbox -> refit() -> re-pick loop works: after
-//     moving a sphere through its id, picking finds it at the new position
-//     and misses at the old one. This is the exact loop B4 picking and
+//     moving a sphere's transform through its id, picking finds it at the new
+//     position and misses at the old one. This is the exact loop B4 picking and
 //     workstream C (dynamic scenes) build on.
+// scene::add() requires every object to be transform-wrapped (the viewer's
+// invariant), so each object here is one transform over a bare shape.
 #include <cstdio>
 #include <vector>
 
@@ -33,11 +35,13 @@ int main() {
 
     material* m = new_lambertian(color(0.5, 0.5, 0.5), sc.allocs);
 
-    int id_ground = sc.add(make_sphere(point3(0, -1000, 0), 1000, m, sc.allocs));
-    int id_ball   = sc.add(make_sphere(point3(0, 1, 0), 0.5, m, sc.allocs));
+    const vec3 no_rot(0, 0, 0), unit(1, 1, 1);
+    int id_ground = sc.add(new_transform(make_sphere(point3(0, 0, 0), 1000, m, sc.allocs),
+                                         vec3(0, -1000, 0), no_rot, unit, sc.allocs));
+    int id_ball   = sc.add(new_transform(make_sphere(point3(0, 0, 0), 0.5, m, sc.allocs),
+                                         vec3(0, 1, 0), no_rot, unit, sc.allocs));
     hittable* box = new_box(point3(-1, 0, -1), point3(1, 2, 1), m, sc.allocs, sc.list_dtors);
-    int id_box    = sc.add(new_translate(new_rotate_y(box, 45, sc.allocs),
-                                         vec3(4, 0, 0), sc.allocs));
+    int id_box    = sc.add(new_transform(box, vec3(4, 0, 0), vec3(0, 45, 0), unit, sc.allocs));
     sc.build();
 
     const int N = 4;
@@ -61,10 +65,10 @@ int main() {
     CHECK(out[0] == id_ball && out[1] == id_box && out[2] == id_ground && out[3] == -1,
           "flat-list traversal stamps the same ids");
 
-    // Mutate through the registry: move the ball, restore its bbox invariant
-    // (placement-new recomputes it), refit the BVH, and pick again.
-    sphere* s = static_cast<sphere*>(sc.get(id_ball)->object);
-    new(s) sphere(point3(2, 1, 0), 0.5, m);
+    // Mutate through the registry: move the ball's transform, restore its bbox
+    // invariant (placement-new recomputes it), refit the BVH, and pick again.
+    transform* tr = static_cast<transform*>(sc.get(id_ball)->object);
+    new(tr) transform(tr->child, vec3(2, 1, 0), no_rot, unit);
     sc.refit();
 
     rays[0] = ray(point3(0, 1, -5), vec3(0, 0, 1));    // old spot -> now empty
