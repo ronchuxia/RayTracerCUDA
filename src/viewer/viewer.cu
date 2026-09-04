@@ -271,6 +271,7 @@ int main() {
 
     // simulation configs
     bool   playing     = false;
+    bool   show_bodies = false;   // collider wireframe overlay
     bool   asleep      = false;
     int    still_steps = 0;
     double phys_accum   = 0.0;
@@ -506,6 +507,7 @@ int main() {
                 if (ImGui::Button("Pause")) playing = false;
                 ImGui::SameLine();
                 if (ImGui::Button("Stop"))  reset_sim();
+                ImGui::Checkbox("show bodies", &show_bodies);
                 if (ImGui::SliderFloat("gravity", &gravity, -30.0f, 0.0f, "%.1f"))
                     { asleep = false; still_steps = 0; }
                 static const char* kCombine[] = { "multiply", "min", "geometric", "average", "max" };
@@ -670,7 +672,17 @@ int main() {
             }
         }
 
-        // draw selected object's bbox
+        // overlays: world-space line segments projected through the camera
+        auto draw_line = [&](const point3& a, const point3& b, ImU32 col, float width) {
+            real ax, ay, bx, by;
+            if (cam->world_to_pixel(a, ax, ay) && cam->world_to_pixel(b, bx, by))
+                ImGui::GetForegroundDrawList()->AddLine(ImVec2((float)ax, (float)ay),
+                                                        ImVec2((float)bx, (float)by), col, width);
+        };
+        static const int edge[12][2] = {{0,1},{0,2},{0,4},{1,3},{1,5},{2,3},
+                                        {2,6},{3,7},{4,5},{4,6},{5,7},{6,7}};
+
+        // selected object's bbox
         if (selected_id >= 0) {
             aabb bb = sc.get(selected_id)->bounding_box();
             point3 corner[8];
@@ -678,15 +690,36 @@ int main() {
                 corner[k] = point3(k & 1 ? bb.x.max : bb.x.min,
                                    k & 2 ? bb.y.max : bb.y.min,
                                    k & 4 ? bb.z.max : bb.z.min);
-            static const int edge[12][2] = {{0,1},{0,2},{0,4},{1,3},{1,5},{2,3},
-                                            {2,6},{3,7},{4,5},{4,6},{5,7},{6,7}};
-            ImDrawList* dl = ImGui::GetForegroundDrawList();
-            for (int k = 0; k < 12; k++) {
-                real ax, ay, bx, by;
-                if (cam->world_to_pixel(corner[edge[k][0]], ax, ay) &&
-                    cam->world_to_pixel(corner[edge[k][1]], bx, by))
-                    dl->AddLine(ImVec2((float)ax, (float)ay), ImVec2((float)bx, (float)by),
-                                IM_COL32(255, 220, 0, 255), 1.5f);
+            for (int k = 0; k < 12; k++)
+                draw_line(corner[edge[k][0]], corner[edge[k][1]], IM_COL32(255, 220, 0, 255), 1.5f);
+        }
+
+        // physics bodies
+        if (show_bodies) {
+            const ImU32 col = IM_COL32(80, 220, 120, 255);
+            for (const phys_body& b : bodies) {
+                if (b.shape == COLLIDER_BOX) {
+                    point3 corner[8];
+                    for (int k = 0; k < 8; k++)
+                        corner[k] = b.pos + b.axes[0] * (k & 1 ? b.half.x() : -b.half.x())
+                                          + b.axes[1] * (k & 2 ? b.half.y() : -b.half.y())
+                                          + b.axes[2] * (k & 4 ? b.half.z() : -b.half.z());
+                    for (int k = 0; k < 12; k++)
+                        draw_line(corner[edge[k][0]], corner[edge[k][1]], col, 1.0f);
+                } else {
+                    const int N = 32;
+                    for (int i = 0; i < 3; i++) {
+                        const vec3& u = b.axes[(i + 1) % 3];
+                        const vec3& v = b.axes[(i + 2) % 3];
+                        point3 prev = b.pos + u * b.radius;
+                        for (int k = 1; k <= N; k++) {
+                            real t = real(2) * real(3.14159265358979323846) * real(k) / real(N);
+                            point3 p = b.pos + (u * cos(t) + v * sin(t)) * b.radius;
+                            draw_line(prev, p, col, 1.0f);
+                            prev = p;
+                        }
+                    }
+                }
             }
         }
 
