@@ -645,26 +645,6 @@ int main() {
         }
         ImGui::End();
 
-        // draw selected object's bbox
-        if (selected_id >= 0) {
-            aabb bb = sc.get(selected_id)->bounding_box();
-            point3 corner[8];
-            for (int k = 0; k < 8; k++)
-                corner[k] = point3(k & 1 ? bb.x.max : bb.x.min,
-                                   k & 2 ? bb.y.max : bb.y.min,
-                                   k & 4 ? bb.z.max : bb.z.min);
-            static const int edge[12][2] = {{0,1},{0,2},{0,4},{1,3},{1,5},{2,3},
-                                            {2,6},{3,7},{4,5},{4,6},{5,7},{6,7}};
-            ImDrawList* dl = ImGui::GetForegroundDrawList();
-            for (int k = 0; k < 12; k++) {
-                real ax, ay, bx, by;
-                if (cam->world_to_pixel(corner[edge[k][0]], ax, ay) &&
-                    cam->world_to_pixel(corner[edge[k][1]], bx, by))
-                    dl->AddLine(ImVec2((float)ax, (float)ay), ImVec2((float)bx, (float)by),
-                                IM_COL32(255, 220, 0, 255), 1.5f);
-            }
-        }
-
         if (camera_dirty) rebuild_camera();
 
         // step physics
@@ -691,6 +671,26 @@ int main() {
                 }
                 sc.refit();
                 reset_accumulation();
+            }
+        }
+
+        // draw selected object's bbox
+        if (selected_id >= 0) {
+            aabb bb = sc.get(selected_id)->bounding_box();
+            point3 corner[8];
+            for (int k = 0; k < 8; k++)
+                corner[k] = point3(k & 1 ? bb.x.max : bb.x.min,
+                                   k & 2 ? bb.y.max : bb.y.min,
+                                   k & 4 ? bb.z.max : bb.z.min);
+            static const int edge[12][2] = {{0,1},{0,2},{0,4},{1,3},{1,5},{2,3},
+                                            {2,6},{3,7},{4,5},{4,6},{5,7},{6,7}};
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            for (int k = 0; k < 12; k++) {
+                real ax, ay, bx, by;
+                if (cam->world_to_pixel(corner[edge[k][0]], ax, ay) &&
+                    cam->world_to_pixel(corner[edge[k][1]], bx, by))
+                    dl->AddLine(ImVec2((float)ax, (float)ay), ImVec2((float)bx, (float)by),
+                                IM_COL32(255, 220, 0, 255), 1.5f);
             }
         }
 
