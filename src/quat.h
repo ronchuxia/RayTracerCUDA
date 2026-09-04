@@ -14,9 +14,10 @@
 //
 // Convention: (x, y, z) is the vector part, w the scalar, and the matrix built
 // below is the one whose COLUMNS are the body's own axes in world space —
-// matching transforms.h's `apply_R(e_i)`, which is where box_collider_of reads a
-// box's axes from. The two representations are checked against each other by
-// tests/test_physics.cu.
+// matching transforms.h's `apply_R(e_i)`. The Euler pair below is the ONLY
+// bridge between a transform's rotation and a body's orientation, in both
+// directions; tests/test_physics_scene.cu checks it against the transform's
+// matrix.
 struct quat {
     real x, y, z, w;
 
@@ -69,37 +70,15 @@ __host__ __device__ inline quat quat_from_axis_angle(const vec3& axis, real angl
     return quat(axis[0]*s, axis[1]*s, axis[2]*s, std::cos(h));
 }
 
-// Recover a quaternion from three orthonormal axes (the COLUMNS of R), so a body
-// authored as a matrix — which is how transforms.h expresses a pose — can hand
-// its orientation over without the caller knowing this convention.
-//
-// Shepperd's method: build from whichever of the four components is largest, so
-// the divisor is never near zero. Taking the trace branch alone loses all
-// precision at a 180-degree turn, where w -> 0.
-__host__ __device__ inline quat quat_from_axes(const vec3 a[3]) {
-    // m[row][col], with column c = a[c].
-    const real m00 = a[0][0], m01 = a[1][0], m02 = a[2][0];
-    const real m10 = a[0][1], m11 = a[1][1], m12 = a[2][1];
-    const real m20 = a[0][2], m21 = a[1][2], m22 = a[2][2];
-    const real tr = m00 + m11 + m22;
-    if (tr > real(0)) {
-        real s = std::sqrt(tr + real(1)) * real(2);          // s = 4w
-        return normalize(quat((m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s,
-                              real(0.25) * s));
-    }
-    if (m00 > m11 && m00 > m22) {
-        real s = std::sqrt(real(1) + m00 - m11 - m22) * real(2);   // s = 4x
-        return normalize(quat(real(0.25) * s, (m01 + m10) / s, (m02 + m20) / s,
-                              (m21 - m12) / s));
-    }
-    if (m11 > m22) {
-        real s = std::sqrt(real(1) + m11 - m00 - m22) * real(2);   // s = 4y
-        return normalize(quat((m01 + m10) / s, real(0.25) * s, (m12 + m21) / s,
-                              (m02 - m20) / s));
-    }
-    real s = std::sqrt(real(1) + m22 - m00 - m11) * real(2);       // s = 4z
-    return normalize(quat((m02 + m20) / s, (m12 + m21) / s, real(0.25) * s,
-                          (m10 - m01) / s));
+// Euler angles in DEGREES, transforms.h's convention R = Rz(g)*Ry(b)*Rx(a)
+// (Tait-Bryan ZYX): apply x, then y, then z. The Hamilton product above is
+// "b followed by a", hence qz * qy * qx. Exact inverse of
+// quat_to_euler_zyx_degrees away from gimbal lock.
+__host__ __device__ inline quat quat_from_euler_zyx_degrees(const vec3& deg) {
+    const real to_rad = real(0.017453292519943295769);
+    return quat_from_axis_angle(vec3(0, 0, 1), deg.z() * to_rad)
+         * quat_from_axis_angle(vec3(0, 1, 0), deg.y() * to_rad)
+         * quat_from_axis_angle(vec3(1, 0, 0), deg.x() * to_rad);
 }
 
 // One integration step of q under angular velocity `omega` (world frame,

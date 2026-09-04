@@ -27,7 +27,7 @@ inline real physics_step(std::vector<phys_body>& bodies, const phys_params& p, r
         b.pos    += b.vel * dt;
         // integrate orientation
         if (b.omega.length_squared() > real(0))
-            set_box_orientation(b, quat_integrate(b.orient, b.omega, dt));
+            set_orientation(b, quat_integrate(b.orient, b.omega, dt));
     }
 
     solve_sequential(bodies, p);

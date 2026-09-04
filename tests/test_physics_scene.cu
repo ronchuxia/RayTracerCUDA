@@ -145,11 +145,9 @@ int main() {
         new(tr) transform(tr->child, tr->translation, vec3(0, 45, 0), tr->scale);
         sc.refit();
         std::vector<phys_body> b = bodies;
-        vec3 pos, half, axes[3];
-        box_collider_of(tr, pos, half, axes);
-        b[box_i].pos = pos;
-        b[box_i].half = half;
-        set_box_orientation_from_box_axes(b[box_i], axes);
+        quat orient;
+        box_collider_of(tr, b[box_i].pos, b[box_i].half, orient);
+        set_orientation(b[box_i], orient);
 
         const real rt = real(std::sqrt(0.5));
         CHECK(std::fabs((double)b[box_i].half[0] - 0.5) < 1e-3 &&

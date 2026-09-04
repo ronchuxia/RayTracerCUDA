@@ -23,14 +23,14 @@
 // and no scene object is an infinite plane. A box top gives the same contact
 // normal and penetration a plane did, so the assertions below are unchanged.
 static phys_body ground_plane(real friction = real(0.5), real restitution = real(0.7)) {
-    phys_body g{ -1, vec3(0, -100, 0), vec3(0,0,0), vec3(), vec3() };
+    phys_body g{ -1, vec3(0, -100, 0), vec3(0,0,0), vec3() };
     g.motion = STATIC; g.shape = COLLIDER_BOX; g.half = vec3(1000, 100, 1000);
     g.friction = friction; g.restitution = restitution;
     return g;
 }
 static phys_body static_box(const vec3& centre, const vec3& half,
                             real friction = real(0.5), real restitution = real(0.7)) {
-    phys_body b{ -1, centre, vec3(0,0,0), vec3(), vec3() };
+    phys_body b{ -1, centre, vec3(0,0,0), vec3() };
     b.motion = STATIC; b.shape = COLLIDER_BOX; b.half = half;
     b.friction = friction; b.restitution = restitution;
     return b;
@@ -44,23 +44,17 @@ static phys_body dynamic_box(const vec3& centre, const vec3& half,
     b.motion = DYNAMIC;
     return b;
 }
-// The same box turned `deg` degrees about y. physics.h reads the box's axes, not
-// an angle, so the test writes them directly — it has no dependency on
-// transforms.h. These are the columns of Ry(deg), matching the axes derived
-// from the transform rotation when a box body is initialized.
+// The same box turned `deg` degrees about y, through the one orientation write
+// path — the viewer seeds bodies from a transform's Euler angles the same way.
 static phys_body rotated_box_y(const vec3& centre, const vec3& half, real deg) {
     phys_body b = static_box(centre, half);
-    double t = (double)deg * 3.14159265358979323846 / 180.0;
-    real c = real(std::cos(t)), s = real(std::sin(t));
-    b.axes[0] = vec3(c, 0, -s);
-    b.axes[1] = vec3(0, 1,  0);
-    b.axes[2] = vec3(s, 0,  c);
+    set_orientation(b, quat_from_euler_zyx_degrees(vec3(0, deg, 0)));
     return b;
 }
 static phys_body ball(int scene_id, const vec3& pos, const vec3& vel, real r,
                       real m = real(1), real friction = real(0.5),
                       real restitution = real(0.7)) {
-    phys_body b{ scene_id, pos, vel, vec3(), vec3() };
+    phys_body b{ scene_id, pos, vel, vec3() };
     b.radius = r;
     b.mass = m; b.friction = friction; b.restitution = restitution;
     return b;
@@ -663,11 +657,20 @@ int main() {
             {
                 phys_body bx = dynamic_box(vec3(0,0,0), vec3(2, 1, 1));
                 phys_body rb = bx;
-                set_box_orientation(rb, quat_from_axis_angle(vec3(0,1,0), real(1.5707963267948966)));
+                set_orientation(rb, quat_from_axis_angle(vec3(0,1,0), real(1.5707963267948966)));
                 vec3 turned = delta_omega(rb, vec3(0, 0, 1));   // world z == body x now
                 vec3 flat   = delta_omega(bx, vec3(1, 0, 0));   // body x when unturned
                 CHECK(std::fabs((double)turned[2] - (double)flat[0]) < 1e-6,
                       "inv_inertia: the tensor rotates with the body (R I^-1 R^T)");
+            }
+
+            // The Euler pair is an exact inverse: what the viewer seeds from is
+            // what the write-back hands back to the transform.
+            {
+                const vec3 e(10, 20, 30);
+                const vec3 back = quat_to_euler_zyx_degrees(quat_from_euler_zyx_degrees(e));
+                CHECK((back - e).length() < real(1e-4),
+                      "euler -> quat -> euler round-trips (10, 20, 30) degrees");
             }
         }
 
