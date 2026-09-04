@@ -40,26 +40,30 @@
 #include "camera.h"
 #include "physics.h"
 #include "viewer/scene.h"
+#include "viewer/gbuffer.h"
 #include "scenes/scene_utils.h"
 #include "viewer/physics_utils.h"
 #include "viewer/scenes/primitives.h"
 #include "viewer/scenes/ball_pit.h"
 #include "viewer/scenes/spin.h"
 
-// color -> RGBA8
-__global__ void tonemap_frame(const color* accum, uchar4* out, int w, int h, int samples) {
+// color/gbuffer -> RGBA8
+__global__ void tonemap_frame(const color* accum, gbuffer gb, int view, uchar4* out, int w, int h, int samples) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= w || j >= h) return;
     int idx = j * w + i;
+    color c = view == 0 ? accum[idx]    // beauty
+            : view == 1 ? gb.albedo[idx]    // albedo
+            : real(0.5) * (gb.normal[idx] + real(samples) * vec3(1, 1, 1)); // normal
     unsigned char r, g, b;
-    tonemap_pixel(accum[idx], samples, r, g, b);
+    tonemap_pixel(c, samples, r, g, b);
     out[idx] = make_uchar4(r, g, b, 255);
 }
 
 // frame accumulation
 __global__ void accumulate_frame(const camera& cam, int max_depth, const hittable& world,
-                                 color* accum, curandState* rand_states, int spp) {
+                                 color* accum, gbuffer gb, curandState* rand_states, int spp) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= cam.image_width || j >= cam.image_height) return;
@@ -69,7 +73,10 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
 
     for (int sample = 0; sample < spp; ++sample) {
         ray r = cam.get_ray(i, j, rand_state);
-        accum[pixel_index] += cam.ray_color(r, world, max_depth, rand_state);
+        camera::first_hit fh;
+        accum[pixel_index] += cam.ray_color(r, world, max_depth, rand_state, &fh);
+        gb.albedo[pixel_index] += fh.albedo;
+        gb.normal[pixel_index] += fh.normal;
     }
 }
 
@@ -166,6 +173,7 @@ int main() {
     uchar4* d_rgba = nullptr;                // CPU readback path
     uchar4* h_rgba = nullptr;
     color* accum = nullptr;                  // accumulation buffer
+    gbuffer gb;                              // denoiser guides
     curandState* rand_states = nullptr;
     dim3 threads(16, 16), blocks;
 
@@ -175,6 +183,7 @@ int main() {
     int spp_per_frame = RT_SAMPLES;
     int total_samples = 0;
     int target_samples = RT_TARGET_SAMPLES;
+    int view = 0;                            // displayed buffer: 0 beauty, 1 albedo, 2 normal
     unsigned long rng_seed = (cam->seed < 0) ? (unsigned long)time(0) : (unsigned long)cam->seed;
 
     auto resize_frame = [&](int w, int h) {
@@ -218,6 +227,7 @@ int main() {
         // accumulation buffer
         checkCudaErrors(cudaMalloc(&accum, (size_t)W * H * sizeof(color)));
         checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
+        gb.allocate(W, H);
         total_samples = 0;
 
         // rng
@@ -267,7 +277,7 @@ int main() {
     float ms_trace = 0.0f;
 
     // panel visibility
-    bool show_performance = true, show_rendering = true, show_camera = true, show_object = true, show_physics = true;
+    bool show_performance = true, show_rendering = true, show_display = true, show_camera = true, show_object = true, show_physics = true;
 
     // simulation configs
     bool   playing     = false;
@@ -319,6 +329,7 @@ int main() {
 
     auto reset_accumulation = [&]() {
         checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
+        gb.clear();
         total_samples = 0;
     };
 
@@ -444,6 +455,7 @@ int main() {
             if (ImGui::BeginMenu("View")) {
                 ImGui::MenuItem("Performance", nullptr, &show_performance);
                 ImGui::MenuItem("Rendering",   nullptr, &show_rendering);
+                ImGui::MenuItem("Display",     nullptr, &show_display);
                 ImGui::MenuItem("Physics",     nullptr, &show_physics);
                 ImGui::MenuItem("Camera",      nullptr, &show_camera);
                 ImGui::MenuItem("Object",      nullptr, &show_object);
@@ -493,6 +505,11 @@ int main() {
                     if (cam->max_depth != max_depth0) camera_dirty = true;
                     cam->max_depth = max_depth0;
                 }
+            }
+
+            if (show_display) {
+                section_break();
+                ImGui::Combo("view", &view, "beauty\0albedo\0normal\0");
             }
 
             if (show_physics) {
@@ -730,7 +747,7 @@ int main() {
         bool did_accumulate = false;
         if (total_samples < target_samples) {
             checkCudaErrors(cudaEventRecord(ev_trace0));
-            accumulate_frame<<<blocks, threads>>>(*cam, cam->max_depth, world, accum, rand_states, spp_per_frame);
+            accumulate_frame<<<blocks, threads>>>(*cam, cam->max_depth, world, accum, gb, rand_states, spp_per_frame);
             checkCudaErrors(cudaEventRecord(ev_trace1));
             did_accumulate = true;
             total_samples += spp_per_frame;
@@ -743,7 +760,7 @@ int main() {
             size_t nbytes = 0;
             checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo, 0));
             checkCudaErrors(cudaGraphicsResourceGetMappedPointer((void**)&dptr, &nbytes, cuda_pbo));
-            tonemap_frame<<<blocks, threads>>>(accum, dptr, W, H, total_samples);
+            tonemap_frame<<<blocks, threads>>>(accum, gb, view, dptr, W, H, total_samples);
             checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo, 0));   // syncs the stream
 
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
@@ -752,7 +769,7 @@ int main() {
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         } else {    
             // CPU readback
-            tonemap_frame<<<blocks, threads>>>(accum, d_rgba, W, H, total_samples);
+            tonemap_frame<<<blocks, threads>>>(accum, gb, view, d_rgba, W, H, total_samples);
             checkCudaErrors(cudaMemcpy(h_rgba, d_rgba, frame_bytes, cudaMemcpyDeviceToHost));
 
             glBindTexture(GL_TEXTURE_2D, tex);
@@ -798,6 +815,7 @@ int main() {
     if (d_rgba) cudaFree(d_rgba);
     if (h_rgba) cudaFreeHost(h_rgba);
     cudaFree(accum);
+    gb.release();
     cudaFree(rand_states);
     cudaFree(cam);
     sc.release();

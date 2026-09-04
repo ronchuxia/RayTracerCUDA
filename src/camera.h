@@ -159,7 +159,16 @@ struct camera {
             return true;
         }
 
-        __device__ color ray_color(ray r, const hittable& world, int max_depth, curandState* state) const {
+        // optional out-parameter of ray_color
+        struct first_hit {
+            color albedo;
+            vec3  normal;
+            real  t;
+            int   id;
+        };
+
+        __device__ color ray_color(ray r, const hittable& world, int max_depth, curandState* state,
+                                   first_hit* first = nullptr) const {
             ray current_ray = r;
             color current_color = color(0,0,0); // Total color until now
             color throughput = color(1,1,1);    // Total attenuation until now
@@ -173,15 +182,17 @@ struct camera {
 
                     if (rec.mat->scatter(current_ray, rec, attenuation, scattered, state)) {
                         // If material scatters, accumulate attenuation, add emitted light and continue
+                        if (first && i == 0) *first = { attenuation, rec.normal, rec.t, rec.id };
                         throughput *= attenuation;
                         current_color += throughput * emit;
                         current_ray = scattered;
                     }
                     else {
                         // If material doesn't scatter, add emitted light and terminate
+                        if (first && i == 0) *first = { color(1,1,1), rec.normal, rec.t, rec.id };
                         current_color += throughput * emit;
                         break;
-                    }  
+                    }
                 }
                 else {
                     // If no hit, add background color and terminate
@@ -192,6 +203,7 @@ struct camera {
 #else
                     color background = color(0,0,0);
 #endif
+                    if (first && i == 0) *first = { background, vec3(0,0,0), infinity, -1 };
                     current_color += throughput * background;
                     break;
                 }
