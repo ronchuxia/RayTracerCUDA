@@ -123,13 +123,13 @@ int main() {
     cam->defocus_angle = 0;
     cam->focus_dist    = 10.0;
     cam->initialize();
-    const int W = cam->image_width, H = cam->image_height;
+    int W = cam->image_width, H = cam->image_height;
 
     // SDL window and GL context
-    GLuint tex = 0;
     SDL_Window* win = SDL_CreateWindow(
         "RayTracingCUDA Viewer",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H, SDL_WINDOW_OPENGL);
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H,
+        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     if (!win) { fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError()); return 1; }
     SDL_GLContext gl = SDL_GL_CreateContext(win);
     if (!gl) { fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError()); return 1; }
@@ -149,53 +149,22 @@ int main() {
     ImGui_ImplOpenGL2_Init();
 
     // GL texture
+    GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
 
-    // present path: CUDA-GL interop or CPU readback
-    const size_t frame_bytes = (size_t)W * H * 4;
-    GLuint pbo = 0;
+    // frame resources
+    size_t frame_bytes = 0;
+    GLuint pbo = 0;                          // CUDA-GL interop path
     cudaGraphicsResource* cuda_pbo = nullptr;
     bool use_interop = false;
-
-    glGenBuffers(1, &pbo);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-    glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)frame_bytes, 0, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-    cudaError_t err = cudaGraphicsGLRegisterBuffer(&cuda_pbo, pbo, cudaGraphicsMapFlagsWriteDiscard);
-    if (err == cudaSuccess) {
-        use_interop = true;
-    } else {
-        cudaGetLastError();
-        fprintf(stderr, "viewer: CUDA-GL interop unavailable (%s), using CPU readback.\n", cudaGetErrorString(err));
-        glDeleteBuffers(1, &pbo);
-        pbo = 0;
-    }
-
-    // readback buffers
-    uchar4* d_rgba = nullptr;
+    uchar4* d_rgba = nullptr;                // CPU readback path
     uchar4* h_rgba = nullptr;
-    if (!use_interop) {
-        checkCudaErrors(cudaMalloc(&d_rgba, frame_bytes));
-        checkCudaErrors(cudaMallocHost(&h_rgba, frame_bytes));
-    }
-
-    // accumulation buffers
-    color* accum;
-    checkCudaErrors(cudaMalloc(&accum,       (size_t)W * H * sizeof(color)));
-    checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
-
-    // initialize rng
-    curandState* rand_states;
-    checkCudaErrors(cudaMalloc(&rand_states, (size_t)W * H * sizeof(curandState)));
-
-    unsigned long rng_seed = (cam->seed < 0) ? (unsigned long)time(0) : (unsigned long)cam->seed;
-    initialize_rand<<<(W * H + 255) / 256, 256>>>(*cam, rand_states, rng_seed);
-    checkCudaErrors(cudaDeviceSynchronize());
+    color* accum = nullptr;                  // accumulation buffer
+    curandState* rand_states = nullptr;
+    dim3 threads(16, 16), blocks;
 
     // rendering configs
     checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
@@ -203,15 +172,64 @@ int main() {
     int spp_per_frame = RT_SAMPLES;
     int total_samples = 0;
     int target_samples = RT_TARGET_SAMPLES;
+    unsigned long rng_seed = (cam->seed < 0) ? (unsigned long)time(0) : (unsigned long)cam->seed;
+
+    auto resize_frame = [&](int w, int h) {
+        // release stale frame resources
+        checkCudaErrors(cudaDeviceSynchronize());
+        if (cuda_pbo) { checkCudaErrors(cudaGraphicsUnregisterResource(cuda_pbo)); cuda_pbo = nullptr; }
+        glDeleteBuffers(1, &pbo); pbo = 0;
+        if (d_rgba) { checkCudaErrors(cudaFree(d_rgba)); d_rgba = nullptr; }
+        if (h_rgba) { checkCudaErrors(cudaFreeHost(h_rgba)); h_rgba = nullptr; }
+        checkCudaErrors(cudaFree(accum));
+        checkCudaErrors(cudaFree(rand_states));
+
+        W = w; H = h;
+        cam->image_width  = w;
+        cam->aspect_ratio = real(w) / (real(h) + real(0.5));
+        cam->initialize();
+        frame_bytes = (size_t)W * H * 4;
+        blocks = dim3((W + threads.x - 1) / threads.x, (H + threads.y - 1) / threads.y);
+        glViewport(0, 0, W, H);
+
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+
+        // present path
+        glGenBuffers(1, &pbo);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)frame_bytes, 0, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+        cudaError_t err = cudaGraphicsGLRegisterBuffer(&cuda_pbo, pbo, cudaGraphicsMapFlagsWriteDiscard);
+        use_interop = (err == cudaSuccess);
+        if (!use_interop) {
+            cudaGetLastError();
+            fprintf(stderr, "viewer: CUDA-GL interop unavailable (%s), using CPU readback.\n", cudaGetErrorString(err));
+            glDeleteBuffers(1, &pbo);
+            pbo = 0;
+            checkCudaErrors(cudaMalloc(&d_rgba, frame_bytes));
+            checkCudaErrors(cudaMallocHost(&h_rgba, frame_bytes));
+        }
+
+        // accumulation buffer
+        checkCudaErrors(cudaMalloc(&accum, (size_t)W * H * sizeof(color)));
+        checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
+        total_samples = 0;
+
+        // rng
+        checkCudaErrors(cudaMalloc(&rand_states, (size_t)W * H * sizeof(curandState)));
+        initialize_rand<<<(W * H + 255) / 256, 256>>>(*cam, rand_states, rng_seed);
+        checkCudaErrors(cudaDeviceSynchronize());
+    };
+    
+    resize_frame(W, H);
 
     fprintf(stderr, "viewer: rendering: %dx%d, %d spp/frame (target %d), depth %d\n",
             W, H, spp_per_frame, target_samples, cam->max_depth);
     fprintf(stderr, "viewer: presentation: %s\n",
             use_interop ? "CUDA-GL interop" : "CPU readback");
     fprintf(stderr, "viewer: controls: drag orbit, scroll zoom, shift-drag pan, R reset, ESC quit\n");
-
-    dim3 threads(16, 16);
-    dim3 blocks((W + threads.x - 1) / threads.x, (H + threads.y - 1) / threads.y);
 
     // camera orbit state
     point3 target    = cam->lookat;
@@ -362,6 +380,10 @@ int main() {
             ImGui_ImplSDL2_ProcessEvent(&e);
             ImGuiIO& io = ImGui::GetIO();
             if (e.type == SDL_QUIT) running = false;
+            else if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                if (e.window.data1 != W || e.window.data2 != H)
+                    resize_frame(e.window.data1, e.window.data2);
+            }
             else if (io.WantCaptureKeyboard && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP)) {
                 // typing in the UI
             }
