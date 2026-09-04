@@ -749,6 +749,37 @@ int main() {
                   "rolling resistance decelerates a rolling ball at (5/7) * mu_r * g");
         }
 
+        // 9d1. The resistance lever is the ROLLING body's radius. The viewer's
+        //      floors are radius-1000 spheres; taking the larger radius of the
+        //      pair made the clamp 2000x too strong and pinned every ball's spin
+        //      to zero, so balls slid to a stop like blocks. Same run as 9d on a
+        //      sphere floor. The floor curves away under the ball, adding a
+        //      downhill push (5/7) g x/R, so with u = mu_r R - x the motion is
+        //      u'' = w^2 u, w = sqrt((5/7) g / R): the ball stops at
+        //      t = atanh(v0 / (mu_r R w)) / w, 8.24 s instead of the flat 7.14 s.
+        {
+            const real mur = real(0.02), Rf = real(1000);
+            std::vector<phys_body> b;
+            b.push_back(ball(-1, vec3(0, -Rf, 0), vec3(0,0,0), Rf, real(1),
+                             real(0.5), real(0)));
+            b[0].motion = STATIC;
+            b.push_back(ball(0, vec3(0, real(0.5), 0), vec3(1,0,0), real(0.5), real(1),
+                             real(0.5), real(0)));
+            b[0].rolling_friction = mur; b[1].rolling_friction = mur;
+            b[1].omega = vec3(0, 0, real(-2));
+            int stopped = -1;
+            for (int s = 1; s <= 4800 && stopped < 0; s++) {
+                physics_step(b, p, h);
+                if (b[1].vel.length() < real(0.01)) stopped = s;
+            }
+            const double w = std::sqrt(5.0 / 7.0 * (double)G / (double)Rf);
+            const double predicted = std::atanh(1.0 / ((double)mur * (double)Rf * w)) / w;
+            printf("  on a radius-1000 sphere floor: stops in %.2f s (analytic %.2f s)\n",
+                   stopped < 0 ? -1.0 : stopped * (double)h, predicted);
+            CHECK(stopped > 0 && std::fabs(stopped * (double)h - predicted) < 0.2,
+                  "rolling resistance uses the rolling ball's radius, not a sphere floor's");
+        }
+
         // 9d2. SPINNING resistance is a separate axis from rolling. Rolling
         //      resists the spin ORTHOGONAL to the contact normal — the part that
         //      carries a ball along. Spinning resists the spin ABOUT it — a ball

@@ -62,9 +62,9 @@ inline void solve_sequential(std::vector<phys_body>& bodies, const phys_params& 
                            p.friction_combine);
         // rolling radius
         rad[c]   = real(0);
-        if (bodies[k.a].shape == COLLIDER_SPHERE) 
+        if (bodies[k.a].shape == COLLIDER_SPHERE)
             rad[c] = bodies[k.a].radius;
-        if (bodies[k.b].shape == COLLIDER_SPHERE && bodies[k.b].radius > rad[c])
+        if (bodies[k.b].shape == COLLIDER_SPHERE && (rad[c] <= real(0) || bodies[k.b].radius < rad[c]))
             rad[c] = bodies[k.b].radius;
         // rolling axis
         roll[c]  = tangent_from(bodies[k.a].omega - bodies[k.b].omega, k.n);
