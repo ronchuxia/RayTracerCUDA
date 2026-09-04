@@ -505,7 +505,8 @@ int main() {
                 if (ImGui::Button("Pause")) playing = false;
                 ImGui::SameLine();
                 if (ImGui::Button("Stop"))  reset_sim();
-                ImGui::SliderFloat("gravity", &gravity, -30.0f, 0.0f, "%.1f");
+                if (ImGui::SliderFloat("gravity", &gravity, -30.0f, 0.0f, "%.1f"))
+                    { asleep = false; still_steps = 0; }
                 static const char* kCombine[] = { "multiply", "min", "geometric", "average", "max" };
                 if (ImGui::Combo("friction mix", &friction_combine, kCombine, IM_ARRAYSIZE(kCombine)))
                     { asleep = false; still_steps = 0; }
