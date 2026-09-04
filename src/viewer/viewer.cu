@@ -596,7 +596,7 @@ int main() {
                         int m = (int)b.motion;
                         if (ImGui::Combo("motion", &m, kMotion, IM_ARRAYSIZE(kMotion))) {
                             b.motion = (motion_type)m;
-                            if (b.motion != DYNAMIC) b.vel = vec3(0, 0, 0);
+                            if (b.motion != DYNAMIC) { b.vel = vec3(0, 0, 0); b.omega = vec3(0, 0, 0); }
                             asleep = false; still_steps = 0;
                         }
                         // mass of dynamic object
