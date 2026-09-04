@@ -33,7 +33,7 @@
 #include <vector>
 
 #include "camera.h"
-#include "scene.h"
+#include "viewer/scene.h"
 #include "scenes/scene_utils.h"
 
 #define SPP 8

@@ -1,84 +1,28 @@
-// viewer.cu — interactive real-time viewer (roadmap workstreams B1–B3).
-//
-// A separate executable/translation unit from the offline renderer (main.cu):
-// it opens a window, builds a persistent scene, renders it on the GPU, and
-// presents it through one of two paths:
-//   - CUDA<->GL interop (fast path): a Pixel Buffer Object shared between CUDA
-//     and GL; requires the GL context to live on the same NVIDIA GPU as CUDA.
-//   - CPU readback (portable path): tonemap into a device buffer, cudaMemcpy to
-//     pinned host memory, glTexSubImage2D from the host pointer. Works on any
-//     GL context — including software GL (llvmpipe) over VNC / `ssh -X`, where
-//     interop registration fails because GL isn't on the NVIDIA GPU.
-// The path is chosen at startup: interop is attempted and, if registration
-// fails (e.g. software GL over VNC), the viewer falls back to readback.
-//
-// `./build/viewer --headless` skips SDL/GL entirely: it accumulates the same
-// image through the readback pipeline and writes build/viewer_headless.ppm, so
-// the full CUDA path can run (and be verified) on a box with no display at all.
-// Runtime flags: --spp N (samples added per frame, default RT_SAMPLES) and
-// --frames N (headless: frames to accumulate, default RT_FRAMES).
-// The offline path and tests are untouched.
-//
-// B1 was the display + render loop; B2 adds progressive accumulation: each
-// loop iteration adds a few samples per pixel into a persistent accumulator
-// and presents the running average, so the image refines over time while the
-// app stays responsive. R resets the accumulation; past RT_TARGET_SAMPLES the
-// viewer stops adding and just presents. Because each pixel's cuRAND state
-// persists across launches, K frames of M spp consume the same RNG stream —
-// and add in the same order — as one K*M-spp render, so the accumulated image
-// is byte-identical to the single-shot one (tests/run_tests.sh stage [7/7]).
-//
-// B3 makes the camera interactive: an orbit/arcball model around a target
-// point — left-drag orbits (azimuth/elevation), scroll wheel zooms (radius),
-// shift-left-drag pans the target. Any camera change re-runs camera::initialize()
-// and resets the accumulation (reusing B2's reset), so the view re-converges
-// from the new angle. Headless mode uses the default camera (no input).
-//
-// A Dear ImGui panel (vendored v1.92.8, SDL2 + fixed-function GL2 backends)
-// adds live controls on top: spp/frame and target-spp sliders (pacing only —
-// no reset), max-depth and vfov sliders (change what's rendered — restart
-// accumulation), restart/reset-camera buttons, and fps/spp/path readouts.
-// When the panel has the mouse or keyboard (io.WantCapture*), viewer input
-// (orbit/zoom/pan/hotkeys) is suppressed so the two never fight.
-//
-// Needs a display (local, VNC, or X-forward) plus SDL2 + GLEW + OpenGL dev libs.
-// Build (match -arch to your GPU; see scripts/build_viewer.sh):
-//   nvcc src/viewer/viewer.cu -o build/viewer -std=c++14 -arch=sm_86 -Isrc \
-//        -lSDL2 -lGLEW -lGL
-//   ./build/viewer            # ESC or close the window to quit
+// interactive real-time viewer
 
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
 #include <cuda_gl_interop.h>
-#include <nvml.h>       // per-process VRAM query (links -lnvidia-ml)
+#include <nvml.h>       // per-process VRAM query
 #include <unistd.h>     // getpid()
 
-// Dear ImGui (vendored in src/external/imgui, pinned v1.92.8): UI panel with
-// live render controls. SDL2 + fixed-function GL2 backends — the GL2 one
-// matches the GL 2.1 compatibility context this viewer creates.
+// Dear ImGui v1.92.8
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_opengl2.h"
 
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <ctime>
 #include <vector>
 
-// Viewer defaults (all -D-overridable). Low sample count for interactivity;
-// sky background so the classic book scene is lit without an emitter.
 #ifndef RT_IMAGE_WIDTH
 #define RT_IMAGE_WIDTH 800
 #endif
 #ifndef RT_SAMPLES
-#define RT_SAMPLES 2        // samples added per frame (the accumulation step)
-#endif
-#ifndef RT_FRAMES
-#define RT_FRAMES 8         // --headless: frames to accumulate (8 x 2 = 16 spp default)
+#define RT_SAMPLES 2
 #endif
 #ifndef RT_TARGET_SAMPLES
-#define RT_TARGET_SAMPLES 8192   // windowed: stop accumulating past this many spp
+#define RT_TARGET_SAMPLES 8192
 #endif
 #ifndef RT_MAX_DEPTH
 #define RT_MAX_DEPTH 12
@@ -87,25 +31,21 @@
 #define RT_SEED 42
 #endif
 #ifndef RT_SKY
-#define RT_SKY 1            // viewer lights the scene with the sky gradient
+#define RT_SKY 1
 #endif
 #ifndef VIEWER_SCENE
-// 0 = primitives (editable); 1 = ball pit roomy (1.5, frictionless);
-// 2 = ball pit tight (1.3, frictionless); 3 = ball pit rolling (1.5, friction 0.5)
 #define VIEWER_SCENE 0
 #endif
 
 #include "camera.h"
 #include "physics.h"
-#include "scene.h"
+#include "viewer/scene.h"
 #include "scenes/scene_utils.h"
-#include "viewer/physics_utils.h"           // box_collider_of: shared with the scenes
+#include "viewer/physics_utils.h"
 #include "viewer/scenes/primitives.h"
-#include "viewer/scenes/ball_pit.h"          // build_ball_pit_scene: _scene / _tight_scene / _rolling_scene
+#include "viewer/scenes/ball_pit.h"
 
-// --- device tonemap: accumulator (sum of samples) -> RGBA8 -------------------
-// Per pixel, calls color.h's shared tonemap_pixel (the same routine the offline
-// PPM writer uses), so a viewer pixel is byte-identical to the offline one.
+// color -> RGBA8
 __global__ void tonemap_frame(const color* accum, uchar4* out, int w, int h, int samples) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -116,12 +56,7 @@ __global__ void tonemap_frame(const color* accum, uchar4* out, int w, int h, int
     out[idx] = make_uchar4(r, g, b, 255);
 }
 
-// --- B2 accumulation pass: add `spp` fresh samples per pixel -----------------
-// The same per-sample pattern as camera.h::render_pixel, but WITHOUT the
-// initial clear, so consecutive launches extend the running sum in accum.
-// Each pixel's cuRAND state advances across launches and the += order matches
-// render_pixel's, so K launches of M spp produce an accumulator byte-identical
-// to a single K*M-spp launch.
+// frame accumulation
 __global__ void accumulate_frame(const camera& cam, int max_depth, const hittable& world,
                                  color* accum, curandState* rand_states, int spp) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -137,12 +72,7 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
     }
 }
 
-// --- B4 object picking ---------------------------------------------------
-// On click, one thread casts the deterministic ray through the clicked pixel
-// center (camera::get_ray_through_pixel) and reports hit_record.id — the stable
-// scene-object id stamped by the outermost tagged wrapper. The pick uses a
-// DEDICATED cuRAND state: hitting a stochastic hittable (constant_medium)
-// must never consume the render states, or accumulation determinism breaks.
+// object picking
 __global__ void pick(const camera& cam, const hittable& world, int px, int py,
                      curandState* state, int* out_id) {
     ray r = cam.get_ray_through_pixel(px, py);
@@ -154,227 +84,136 @@ __global__ void initialize_rand_pick(curandState* state, unsigned long seed) {
     curand_init(seed, 0, 0, state);
 }
 
-int main(int argc, char** argv) {
-    bool headless = false;
-    int frames = RT_FRAMES;          // --frames N: headless accumulation count
-    int spp_per_frame = RT_SAMPLES;  // --spp N: samples added per frame
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--headless") == 0) headless = true;
-        else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) frames = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--spp") == 0 && i + 1 < argc) spp_per_frame = atoi(argv[++i]);
+int main() {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SDL_Init(SDL_INIT_VIDEO) failed: %s\n", SDL_GetError());
+        return 1;
     }
-    if (frames < 1) frames = 1;
-    if (spp_per_frame < 1) spp_per_frame = 1;
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
-    // ---- window + GL context (skipped entirely in --headless mode) ----
-    SDL_Window* win = nullptr;
-    SDL_GLContext gl = nullptr;
-    if (headless) {
-        fprintf(stderr, "viewer: headless mode — accumulating %d frame(s) x %d spp to build/viewer_headless.ppm\n",
-                frames, spp_per_frame);
-    } else {
-        if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-            fprintf(stderr,
-                    "SDL_Init(VIDEO) failed: %s\n"
-                    "The viewer needs a display. On a headless box, run it over VNC or\n"
-                    "an X-forwarded session (ssh -X) so DISPLAY is set — or use --headless\n"
-                    "to render a PPM frame with no display.\n",
-                    SDL_GetError());
-            return 1;
-        }
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);   // compatibility profile:
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);   // immediate-mode fullscreen quad
-        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    }
+    // scene
+    scene sc;
+#if VIEWER_SCENE == 3
+    build_ball_pit_rolling_scene(sc);
+#elif VIEWER_SCENE == 2
+    build_ball_pit_tight_scene(sc);
+#elif VIEWER_SCENE == 1
+    build_ball_pit_scene(sc);
+#else
+    build_primitives_scene(sc);
+#endif
+    hittable& world = sc.root();
 
-    // ---- camera: compute image_height before sizing the window/buffers ----
-    // In MANAGED memory, like the offline scenes: the render kernels take the
-    // camera by reference (i.e. by pointer), so the device dereferences it —
-    // a host-stack camera would be an illegal address on the GPU.
+    // camera
     camera* cam;
     checkCudaErrors(cudaMallocManaged((void**)&cam, sizeof(camera)));
     new(cam) camera();
 
-    // Build the scene first: its viewer_scene config supplies the initial camera
-    // and (physics scene) the collision wall bounds — one place per scene, no
-    // scattered `#if VIEWER_SCENE`.
-    scene sc;
-#if VIEWER_SCENE == 3
-    const viewer_scene vs = build_ball_pit_rolling_scene(sc);
-#elif VIEWER_SCENE == 2
-    const viewer_scene vs = build_ball_pit_tight_scene(sc);
-#elif VIEWER_SCENE == 1
-    const viewer_scene vs = build_ball_pit_scene(sc);
-#else
-    const viewer_scene vs = build_primitives_scene(sc);
-#endif
-    hittable& world = sc.root();
-
     cam->aspect_ratio      = 16.0 / 9.0;
     cam->image_width       = RT_IMAGE_WIDTH;
-    cam->samples_per_pixel = spp_per_frame;   // per accumulation pass (B2)
+    cam->samples_per_pixel = RT_SAMPLES;
     cam->max_depth         = RT_MAX_DEPTH;
     cam->seed              = RT_SEED;
-    cam->vfov     = vs.vfov;
-    cam->lookfrom = vs.lookfrom;
-    cam->lookat   = vs.lookat;
+    cam->vfov     = sc.vfov;
+    cam->lookfrom = sc.lookfrom;
+    cam->lookat   = sc.lookat;
     cam->vup      = vec3(0, 1, 0);
     cam->defocus_angle = 0;
     cam->focus_dist    = 10.0;
-    cam->initialize();                   // fills image_height + camera frame
+    cam->initialize();
     const int W = cam->image_width, H = cam->image_height;
 
+    // SDL window and GL context
     GLuint tex = 0;
-    if (!headless) {
-        win = SDL_CreateWindow(
-            "RayTracingCUDA — viewer",
-            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H, SDL_WINDOW_OPENGL);
-        if (!win) { fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError()); return 1; }
-        gl = SDL_GL_CreateContext(win);
-        if (!gl) { fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError()); return 1; }
+    SDL_Window* win = SDL_CreateWindow(
+        "RayTracingCUDA Viewer",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H, SDL_WINDOW_OPENGL);
+    if (!win) { fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError()); return 1; }
+    SDL_GLContext gl = SDL_GL_CreateContext(win);
+    if (!gl) { fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError()); return 1; }
 
-        glewExperimental = GL_TRUE;
-        GLenum ge = glewInit();
-        if (ge != GLEW_OK) { fprintf(stderr, "glewInit failed: %s\n", glewGetErrorString(ge)); return 1; }
+    glewExperimental = GL_TRUE;
+    GLenum ge = glewInit();
+    if (ge != GLEW_OK) { fprintf(stderr, "glewInit failed: %s\n", glewGetErrorString(ge)); return 1; }
 
-        // Which GPU (or software rasterizer) is serving this GL context? Over
-        // VNC/`ssh -X` this is typically llvmpipe/Mesa — the tell that CUDA-GL
-        // interop can't work and the readback path will be used.
-        fprintf(stderr, "viewer: GL vendor: %s | renderer: %s\n",
-                (const char*)glGetString(GL_VENDOR), (const char*)glGetString(GL_RENDERER));
+    fprintf(stderr, "viewer: GL vendor: %s\n", (const char*)glGetString(GL_VENDOR));
+    fprintf(stderr, "viewer: renderer: %s\n", (const char*)glGetString(GL_RENDERER));
 
-        // ---- Dear ImGui: context + SDL2/GL2 backends ----
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGui::StyleColorsDark();
-        ImGui_ImplSDL2_InitForOpenGL(win, gl);
-        ImGui_ImplOpenGL2_Init();
+    // Dear ImGui
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGui_ImplSDL2_InitForOpenGL(win, gl);
+    ImGui_ImplOpenGL2_Init();
 
-        // ---- GL texture (both present paths upload into this) ----
-        glGenTextures(1, &tex);
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
-    }
+    // GL texture
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
 
-    // ---- choose the present path: CUDA-GL interop, else CPU readback ----
-    // Try interop first; on failure (or in headless mode, which has no GL) fall
-    // back to the readback pipeline.
+    // present path: CUDA-GL interop or CPU readback
     const size_t frame_bytes = (size_t)W * H * 4;
     GLuint pbo = 0;
     cudaGraphicsResource* cuda_pbo = nullptr;
     bool use_interop = false;
 
-    if (!headless) {
-        glGenBuffers(1, &pbo);
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-        glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)frame_bytes, 0, GL_DYNAMIC_DRAW);
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glGenBuffers(1, &pbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)frame_bytes, 0, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-        // Attempt registration WITHOUT checkCudaErrors: failure here is an
-        // expected condition (GL context not on the NVIDIA GPU), not a bug.
-        cudaError_t err = cudaGraphicsGLRegisterBuffer(&cuda_pbo, pbo, cudaGraphicsMapFlagsWriteDiscard);
-        if (err == cudaSuccess) {
-            use_interop = true;
-        } else {
-            cudaGetLastError();   // clear the error so later CUDA calls aren't poisoned
-            fprintf(stderr, "viewer: CUDA-GL interop unavailable (%s) — the GL context "
-                            "is probably not on the NVIDIA GPU; using CPU readback.\n",
-                    cudaGetErrorString(err));
-            glDeleteBuffers(1, &pbo);
-            pbo = 0;
-        }
+    cudaError_t err = cudaGraphicsGLRegisterBuffer(&cuda_pbo, pbo, cudaGraphicsMapFlagsWriteDiscard);
+    if (err == cudaSuccess) {
+        use_interop = true;
+    } else {
+        cudaGetLastError();
+        fprintf(stderr, "viewer: CUDA-GL interop unavailable (%s), using CPU readback.\n", cudaGetErrorString(err));
+        glDeleteBuffers(1, &pbo);
+        pbo = 0;
     }
 
-    // Readback staging buffers: device tonemap target + pinned host copy.
+    // readback buffers
     uchar4* d_rgba = nullptr;
     uchar4* h_rgba = nullptr;
     if (!use_interop) {
-        if (!headless) fprintf(stderr, "viewer: using CPU-readback present path.\n");
         checkCudaErrors(cudaMalloc(&d_rgba, frame_bytes));
         checkCudaErrors(cudaMallocHost(&h_rgba, frame_bytes));
     }
 
-    // ---- accumulation buffers ----
-    // Raise the device stack limit like the offline scenes do: the recursive
-    // hittable dispatch (world BVH → shapes) can exceed the 1 KB default. (The
-    // scene itself was already built above, to source the camera from it.)
-    checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
-
-    // Snapshot each editable object's initial T/R/S so the Selection panel's
-    // "Reset transform" button (B5) can restore it. Indexed by scene id; a
-    // non-transform object records editable=false. Host-side only — the initial
-    // pose is editor state, kept out of the device `transform` struct.
-    struct init_trs { bool editable; vec3 t, r, s; };
-    std::vector<init_trs> initial_trs;
-    for (int id = 0; id < (int)sc.objects.size(); id++) {
-        hittable* h = sc.get(id);
-        if (h && h->type == TRANSFORM) {
-            transform* tr = static_cast<transform*>(h->object);
-            initial_trs.push_back({true, tr->translation, tr->rotation, tr->scale});
-        } else {
-            initial_trs.push_back({false, vec3(), vec3(), vec3()});
-        }
-    }
-
-    curandState* rand_states;
+    // accumulation buffers
     color* accum;
-    checkCudaErrors(cudaMalloc(&rand_states, (size_t)W * H * sizeof(curandState)));
     checkCudaErrors(cudaMalloc(&accum,       (size_t)W * H * sizeof(color)));
+    checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
+
+    // initialize rng
+    curandState* rand_states;
+    checkCudaErrors(cudaMalloc(&rand_states, (size_t)W * H * sizeof(curandState)));
 
     unsigned long rng_seed = (cam->seed < 0) ? (unsigned long)time(0) : (unsigned long)cam->seed;
     initialize_rand<<<(W * H + 255) / 256, 256>>>(*cam, rand_states, rng_seed);
     checkCudaErrors(cudaDeviceSynchronize());
 
-    // B2: the accumulator starts at zero; every accumulate_frame launch adds
-    // spp_per_frame samples per pixel on top of it.
-    checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
-    long long total_samples = 0;                 // per-pixel samples accumulated so far
-    int target_samples = RT_TARGET_SAMPLES;      // runtime-adjustable in the UI panel
+    // rendering configs
+    checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
+
+    int spp_per_frame = RT_SAMPLES;
+    int total_samples = 0;
+    int target_samples = RT_TARGET_SAMPLES;
+
+    fprintf(stderr, "viewer: rendering: %dx%d, %d spp/frame (target %d), depth %d\n",
+            W, H, spp_per_frame, target_samples, cam->max_depth);
+    fprintf(stderr, "viewer: presentation: %s\n",
+            use_interop ? "CUDA-GL interop" : "CPU readback");
+    fprintf(stderr, "viewer: controls: drag orbit, scroll zoom, shift-drag pan, R reset, ESC quit\n");
 
     dim3 threads(16, 16);
     dim3 blocks((W + threads.x - 1) / threads.x, (H + threads.y - 1) / threads.y);
 
-    fprintf(stderr, "viewer: %dx%d, %d spp/frame (target %d), depth %d — present: %s\n",
-            W, H, spp_per_frame, target_samples, cam->max_depth,
-            headless    ? "headless PPM dump"
-          : use_interop ? "CUDA-GL interop — drag orbit, scroll zoom, shift-left-drag pan, R reset, ESC quit"
-                        : "CPU readback — drag orbit, scroll zoom, shift-left-drag pan, R reset, ESC quit");
-
-    // ---- headless: accumulate `frames` passes, tonemap, write PPM, exit ----
-    if (headless) {
-        for (int f = 0; f < frames; f++)
-            accumulate_frame<<<blocks, threads>>>(*cam, cam->max_depth, world, accum, rand_states, spp_per_frame);
-        checkCudaErrors(cudaDeviceSynchronize());
-        total_samples = (long long)frames * spp_per_frame;
-
-        tonemap_frame<<<blocks, threads>>>(accum, d_rgba, W, H, (int)total_samples);
-        checkCudaErrors(cudaMemcpy(h_rgba, d_rgba, frame_bytes, cudaMemcpyDeviceToHost));
-
-        const char* out_path = "build/viewer_headless.ppm";
-        FILE* f = fopen(out_path, "w");
-        if (!f) { fprintf(stderr, "viewer: cannot open %s for writing\n", out_path); return 1; }
-        fprintf(f, "P3\n%d %d\n255\n", W, H);
-        for (int j = 0; j < H; j++)
-            for (int i = 0; i < W; i++) {
-                uchar4 p = h_rgba[j * W + i];
-                fprintf(f, "%d %d %d\n", p.x, p.y, p.z);
-            }
-        fclose(f);
-        fprintf(stderr, "viewer: wrote %s\n", out_path);
-
-        cudaFree(d_rgba);
-        cudaFreeHost(h_rgba);
-        cudaFree(accum);
-        cudaFree(rand_states);
-        cudaFree(cam);
-        sc.release();
-        return 0;
-    }
-
-    // ---- B3: orbit-camera state (spherical coords around a target point) ----
-    // offset = lookfrom - target = radius * (cosφ cosθ, sinφ, cosφ sinθ).
+    // camera orbit state
     point3 target    = cam->lookat;
     vec3   offset    = cam->lookfrom - target;
     double radius    = offset.length();
@@ -382,93 +221,68 @@ int main(int argc, char** argv) {
     double elevation = asin(offset.y() / radius);
     const vec3 world_up = cam->vup;
 
-    // Initial view, restored by the UI panel's "Reset camera" button.
-    const point3 target0 = target;
-    const double radius0 = radius, azimuth0 = azimuth, elevation0 = elevation;
-    const double vfov0 = cam->vfov;
+    // store each object's initial T/R/S
+    struct init_trs { vec3 t, r, s; };
+    std::vector<init_trs> initial_trs;
+    for (int id = 0; id < (int)sc.objects.size(); id++) {
+        transform* tr = static_cast<transform*>(sc.get(id)->object);
+        initial_trs.push_back({tr->translation, tr->rotation, tr->scale});
+    }
 
-    // Launch config, restored by the UI panel's "Reset rendering" button (vfov by "Reset camera").
+    // store inital rendering configs
     const int spp_per_frame0  = spp_per_frame;
     const int target_samples0 = target_samples;
     const int max_depth0      = cam->max_depth;
 
-    // Per-stage GPU timings for the UI panel. Kernel launches are async, so
-    // wall-clock timers around them would misattribute the cost to whatever
-    // syncs next; CUDA events timestamp the GPU's own timeline instead.
-    // The values shown are from the previous frame (the panel is built before
-    // this frame's kernels run).
-    cudaEvent_t ev_trace0, ev_trace1, ev_tone0, ev_tone1;
+    // store initial camera orbit state
+    const point3 target0 = target;
+    const double radius0 = radius, azimuth0 = azimuth, elevation0 = elevation;
+    const double vfov0 = cam->vfov;
+
+    // ray-tracing GPU timing events
+    cudaEvent_t ev_trace0, ev_trace1;
     checkCudaErrors(cudaEventCreate(&ev_trace0));
     checkCudaErrors(cudaEventCreate(&ev_trace1));
-    checkCudaErrors(cudaEventCreate(&ev_tone0));
-    checkCudaErrors(cudaEventCreate(&ev_tone1));
-    float ms_trace = 0.0f, ms_tonemap = 0.0f;
+    float ms_trace = 0.0f;
 
-    // Which sections of the Renderer panel are visible (toggled in View menu).
-    bool show_performance = true, show_rendering = true, show_camera = true;
-    bool show_object = true, show_physics = true;
+    // panel visibility
+    bool show_performance = true, show_rendering = true, show_camera = true, show_object = true, show_physics = true;
 
-    // ---- C/D: dynamic scene — physics-simulated bodies ----
-    // Every transform-wrapped sphere is a rigid body that falls under gravity,
-    // bounces on the ground plane (y=0), and collides sphere-sphere with the
-    // others. Each simulated frame rewrites all bodies' transforms via the B5
-    // mutation protocol (placement-new -> refit -> reset accumulation). The
-    // integrator steps a FIXED dt (accumulator-paced against wall time), so
-    // behaviour is frame-rate-independent. When ALL bodies stay slow for a
-    // spell the whole sim SLEEPS, stopping the accumulation reset so the image
-    // converges. (Box/triangle are static decor — no collider yet; that's the
-    // convex-hull/GJK work in Phase 3.)
-    std::vector<phys_body> bodies;   // built below from the transform-wrapped spheres
-    bool   animating   = false;   // Play/Pause/Stop transport (Stop resets to the drop pose)
-    bool   asleep      = false;   // all settled -> stop stepping + resetting accumulation
-    int    still_steps = 0;       // consecutive fixed steps with every body slow
-    double phys_accum   = 0.0;     // fixed-step time accumulator (real seconds)
-    float  gravity     = -9.8f;   // world units / s^2 (negative = down)
-    // How a contact's friction/restitution are derived from its two surfaces.
-    // Sim-wide policy, not a surface property, so these live here and in the
-    // Physics panel; the coefficients themselves are per-body (Object panel).
-    int    friction_combine    = (int)COMBINE_AVERAGE;   // PhysX's default
+    // simulation configs
+    bool   playing     = false;
+    bool   asleep      = false;
+    int    still_steps = 0;
+    double phys_accum   = 0.0;
+    float  gravity     = -9.8f;
+    int    friction_combine    = (int)COMBINE_AVERAGE;
     int    restitution_combine = (int)COMBINE_AVERAGE;
-    const double PHYS_DT = 1.0 / 240.0;  // fixed integration step
-    const int    PHYS_MAX_STEPS = 8;    // per-frame substep cap (spiral-of-death guard)
-    const real   SLEEP_VEL   = real(0.1);// per-body speed under which a body is "still"
-    const int    SLEEP_STEPS = 60;       // all-still for this many steps (~0.25s) => sleep
+    const double PHYS_DT = 1.0 / 240.0;
+    const int    PHYS_MAX_STEPS = 8;
+    const real   SLEEP_VEL   = real(0.1);
+    const int    SLEEP_STEPS = 60;
 
-    // The scene AUTHORS its physics bodies (viewer/physics_utils.h) — the viewer
-    // derives nothing, because only the scene knows which sphere is meant to fall
-    // and whether a triangle collides at all. We just take the list and index it.
-    bodies = vs.bodies;
+    std::vector<phys_body>& bodies = sc.bodies;
 
-    // Scene-object id -> index into `bodies` (-1 = not simulated). Unlinked
-    // bodies carry scene_id < 0 and so never appear in this table at all. One
-    // lookup table serves both the edit->body sync and the panel's role editor.
-    // The two int spaces are deliberately spelled apart: the KEY is a scene id,
-    // the VALUE is an index into `bodies`, which is also what contact.a/.b hold.
     std::vector<int> body_of_scene_id((size_t)sc.objects.size(), -1);
     for (int i = 0; i < (int)bodies.size(); i++)
         if (bodies[i].scene_id >= 0) body_of_scene_id[bodies[i].scene_id] = i;
 
-    // ---- B4 picking state ----
-    // A click (press+release with ≤2 px of motion) picks; a drag orbits.
+    // object picking state
     int selected_id = -1;
     int press_x = 0, press_y = 0;
     bool maybe_click = false;
 
-    // Dedicated pick RNG (never touches the render states), seeded once.
+    // object picking rng
     curandState* pick_state;
     checkCudaErrors(cudaMalloc(&pick_state, sizeof(curandState)));
     initialize_rand_pick<<<1, 1>>>(pick_state, rng_seed + 1);
     checkCudaErrors(cudaDeviceSynchronize());
 
-    // The pick kernel's answer, in managed memory so the host can read it back.
+    // object picking result
     int* pick_result;
     checkCudaErrors(cudaMallocManaged(&pick_result, sizeof(int)));
 
-    // ---- NVML: this process's VRAM on the SAME physical GPU CUDA is using ----
-    // cudaMemGetInfo is device-wide (counts other apps); NVML per-process is our
-    // own footprint, matching nvidia-smi. Bind NVML by the CUDA device's PCI bus
-    // id — device indices need not match on a multi-GPU box. Polled every ~30
-    // frames (the process-list query is heavier than a memory read).
+    // NVML
     nvmlDevice_t nvml_dev;
     bool nvml_ok = (nvmlInit() == NVML_SUCCESS);
     if (nvml_ok) {
@@ -477,61 +291,57 @@ int main(int argc, char** argv) {
         nvml_ok = (nvmlDeviceGetHandleByPciBusId(pci, &nvml_dev) == NVML_SUCCESS);
     }
     const unsigned int my_pid = (unsigned int)getpid();
-    int vram_used_mb = -1;   // cached poll result (-1 = unknown)
+    int vram_used_mb = -1;
     int vram_poll = 0;
 
-    // Throw away accumulated samples and start converging afresh. Anything that
-    // changes what is rendered calls this: camera motion (below) and B5 object
-    // edits — mixing samples from different scenes would be wrong.
     auto reset_accumulation = [&]() {
         checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
         total_samples = 0;
     };
 
-    // B5 + physics: after a transform edit, push the new pose into the object's
-    // physics body (if it has one) so the edit isn't overwritten by the next sim
-    // step (physics owns bodies and rewrites transforms from them), AND wake the
-    // sim: a settled pile goes asleep (stops stepping so the image converges), so
-    // a moved body must re-activate it or it just floats in place. No-op for
-    // objects that aren't simulated bodies. Radius tracks the scale, mirroring the
-    // body scan.
-    auto sync_body_to_transform = [&](int scene_id) {
-        if (scene_id < 0 || body_of_scene_id[scene_id] < 0) return;   // not simulated
+    auto sync_body_from_transform = [&](int scene_id) {
+        if (scene_id < 0 || body_of_scene_id[scene_id] < 0) return; // not simulated
         transform* tr = static_cast<transform*>(sc.get(scene_id)->object);
         phys_body& b = bodies[body_of_scene_id[scene_id]];
-        b.vel   = vec3(0, 0, 0);   // position-only: a dragged body shoves, it doesn't strike
-        b.omega = vec3(0, 0, 0);   // and does not keep the spin it had at its old pose
+        b.vel   = vec3(0, 0, 0);
+        b.omega = vec3(0, 0, 0);
         b.baseR = tr->rotation;
         b.baseS = tr->scale;
         if (b.shape == COLLIDER_SPHERE) {
             b.pos    = tr->translation;
             b.radius = static_cast<sphere*>(tr->child->object)->radius * tr->scale.y();
-        } else {                   // box collider re-derived from the new pose,
-                                   // rotation included (physics_utils.h)
-            box_collider_of(tr, b.pos, b.half, b.axes);
-            set_orientation_from_axes(b, b.axes);   // quaternion follows the pose
+        } else {
+            vec3 pos, half, axes[3];
+            box_collider_of(tr, pos, half, axes);
+            b.pos = pos;
+            b.half = half;
+            set_box_orientation_from_box_axes(b, axes);
         }
         asleep = false; still_steps = 0;   // a moved body disturbs the pile -> resume stepping
     };
 
-    // Stop: reset every simulated body to its authored drop pose (position,
-    // orientation, scale, zero velocity), rewrite its transform, and pause. The
-    // scene authors the balls at their drop pose, so this is also the initial pose.
+    auto sync_transform_from_body = [&](const phys_body& b) {
+        transform* tr = static_cast<transform*>(sc.get(b.scene_id)->object);
+        const vec3 rot = (b.shape == COLLIDER_BOX)
+                       ? quat_to_euler_zyx_degrees(b.orient) : b.baseR;
+        new(tr) transform(tr->child, point3(b.pos), rot, b.baseS);
+    };
+
+    // reset simulation
     auto reset_sim = [&]() {
         for (phys_body& b : bodies) {
-            if (b.scene_id < 0) continue;           // unlinked: no scene pose to restore
+            if (b.scene_id < 0) continue;
             const init_trs& in = initial_trs[b.scene_id];
             transform* tr = static_cast<transform*>(sc.get(b.scene_id)->object);
             new(tr) transform(tr->child, in.t, in.r, in.s);
-            sync_body_to_transform(b.scene_id);     // re-derive pos + collider from the restored pose
+            sync_body_from_transform(b.scene_id);
         }
         sc.refit();
         reset_accumulation();
-        phys_accum = 0.0; still_steps = 0; asleep = false; animating = false;
+        phys_accum = 0.0; still_steps = 0; asleep = false; playing = false;
     };
 
-    // Rebuild the camera from the orbit state and reset accumulation. Called
-    // whenever the view changes (drag / scroll / pan / R).
+    // rebuild the camera from the camera orbit state
     auto rebuild_camera = [&]() {
         double ce = cos(elevation), se = sin(elevation);
         double ca = cos(azimuth),   sa = sin(azimuth);
@@ -541,20 +351,22 @@ int main(int argc, char** argv) {
         reset_accumulation();
     };
 
-    // ---- present loop: accumulate a few spp, then present the running average ----
+    // presentation loop
     bool running = true;
     while (running) {
         bool camera_dirty = false;
+
+        // mouse and keyboard events
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
-            ImGui_ImplSDL2_ProcessEvent(&e);   // the UI sees every event first
+            ImGui_ImplSDL2_ProcessEvent(&e);
             ImGuiIO& io = ImGui::GetIO();
             if (e.type == SDL_QUIT) running = false;
             else if (io.WantCaptureKeyboard && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP)) {
-                // typing in the UI — don't treat as viewer hotkeys
+                // typing in the UI
             }
             else if (io.WantCaptureMouse && e.type != SDL_KEYDOWN && e.type != SDL_KEYUP) {
-                // hovering/dragging the UI — don't orbit/zoom/pan the camera
+                // hovering/dragging the UI
             }
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_r) camera_dirty = true;
@@ -563,31 +375,33 @@ int main(int argc, char** argv) {
                 maybe_click = true;
             }
             else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) {
-                // B4: a release near the press point is a pick, not a drag.
+                // picking
                 if (maybe_click && abs(e.button.x - press_x) <= 2 && abs(e.button.y - press_y) <= 2) {
                     pick<<<1, 1>>>(*cam, world, e.button.x, e.button.y, pick_state, pick_result);
                     checkCudaErrors(cudaDeviceSynchronize());
-                    selected_id = *pick_result;   // -1 on miss = deselect
+                    selected_id = *pick_result;
                 }
                 maybe_click = false;
             }
-            else if (e.type == SDL_MOUSEWHEEL) {
-                radius *= pow(0.9, e.wheel.y);          // wheel up = zoom in
+            else if (e.type == SDL_MOUSEWHEEL) {    
+                // zooming
+                radius *= pow(0.9, e.wheel.y);
                 if (radius < 0.1) radius = 0.1;
                 camera_dirty = true;
             }
             else if (e.type == SDL_MOUSEMOTION && (e.motion.state & SDL_BUTTON_LMASK)
-                     && !(SDL_GetModState() & KMOD_SHIFT)) {
+                     && !(SDL_GetModState() & KMOD_SHIFT)) {    
+                // orbitting
                 azimuth   += e.motion.xrel * 0.005;
                 elevation += e.motion.yrel * 0.005;
-                const double lim = 1.55;                // ~89°, avoid the poles
+                const double lim = 1.55;    // ~89°, avoid the poles
                 if (elevation >  lim) elevation =  lim;
                 if (elevation < -lim) elevation = -lim;
                 camera_dirty = true;
             }
-            else if (e.type == SDL_MOUSEMOTION
-                     && (e.motion.state & SDL_BUTTON_LMASK) && (SDL_GetModState() & KMOD_SHIFT)) {
-                // pan: slide the target in the camera's screen plane
+            else if (e.type == SDL_MOUSEMOTION && (e.motion.state & SDL_BUTTON_LMASK)
+                     && (SDL_GetModState() & KMOD_SHIFT)) { 
+                // panning
                 vec3 fwd   = unit_vector(cam->lookat - cam->lookfrom);
                 vec3 right = unit_vector(cross(fwd, world_up));
                 vec3 up    = cross(right, fwd);
@@ -597,15 +411,12 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ---- UI panel (Dear ImGui). Built every frame; widgets that change
-        // what is being rendered set camera_dirty so accumulation restarts —
-        // mixing samples taken under different settings would be wrong.
-        // spp/frame and the target only change pacing, so they don't reset.
+        // UI
         ImGui_ImplOpenGL2_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        // Top menu bar: File (quit) and View (toggle panel sections).
+        // top menu bar
         if (ImGui::BeginMainMenuBar()) {
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Quit", "Esc")) running = false;
@@ -622,31 +433,25 @@ int main(int argc, char** argv) {
             ImGui::EndMainMenuBar();
         }
 
-        ImGui::SetNextWindowPos(ImVec2(10, 30), ImGuiCond_FirstUseEver);  // below the menu bar
+        // panels
+        ImGui::SetNextWindowPos(ImVec2(10, 30), ImGuiCond_FirstUseEver);
         ImGui::Begin("Renderer");
         {
             ImGuiIO& io = ImGui::GetIO();
-            // Emit a separator between consecutive *visible* sections only.
+            
             bool any_section = false;
             auto section_break = [&]() { if (any_section) ImGui::Separator(); any_section = true; };
 
             if (show_performance) {
                 section_break();
                 ImGui::Text("%.0f fps", io.Framerate);
-                // Per-stage breakdown of the last frame: trace/tonemap from CUDA
-                // events; present = the rest of the frame (GL upload, quad, UI,
-                // swap, event polling), derived from the frame delta.
+                ImGui::Text("frame   %6.2f ms", io.DeltaTime * 1000.0f);
                 ImGui::Text("trace   %6.2f ms", ms_trace);
-                ImGui::Text("tonemap %6.2f ms", ms_tonemap);
-                ImGui::Text("present %6.2f ms",
-                            fmaxf(0.0f, io.DeltaTime * 1000.0f - ms_trace - ms_tonemap));
-                // This process's VRAM (NVML, matching nvidia-smi), re-polled
-                // every 30 frames; the value persists between polls.
                 if (nvml_ok && vram_poll++ % 30 == 0) {
                     unsigned int n = 64;
                     nvmlProcessInfo_t procs[64];
                     if (nvmlDeviceGetComputeRunningProcesses(nvml_dev, &n, procs) == NVML_SUCCESS) {
-                        vram_used_mb = 0;   // our pid absent from the list = 0 MB
+                        vram_used_mb = 0;
                         for (unsigned int k = 0; k < n; k++)
                             if (procs[k].pid == my_pid)
                                 vram_used_mb = (int)(procs[k].usedGpuMemory / (1024 * 1024));
@@ -658,7 +463,7 @@ int main(int argc, char** argv) {
 
             if (show_rendering) {
                 section_break();
-                ImGui::Text("%lld spp", total_samples);
+                ImGui::Text("%d spp", total_samples);
                 ImGui::SliderInt("spp", &spp_per_frame, 1, 64);
                 ImGui::SliderInt("target spp", &target_samples, 16, 65536, "%d",
                                  ImGuiSliderFlags_Logarithmic);
@@ -666,23 +471,19 @@ int main(int argc, char** argv) {
                 if (ImGui::Button("Reset rendering")) {
                     spp_per_frame  = spp_per_frame0;
                     target_samples = target_samples0;
-                    if (cam->max_depth != max_depth0) camera_dirty = true;  // max depth changes the render
+                    if (cam->max_depth != max_depth0) camera_dirty = true;
                     cam->max_depth = max_depth0;
                 }
             }
 
             if (show_physics) {
                 section_break();
-                // Transport: Play runs/resumes, Pause freezes in place, Stop
-                // resets every body to its drop pose and pauses.
-                if (ImGui::Button("Play"))  animating = true;
+                if (ImGui::Button("Play"))  playing = true;
                 ImGui::SameLine();
-                if (ImGui::Button("Pause")) animating = false;
+                if (ImGui::Button("Pause")) playing = false;
                 ImGui::SameLine();
                 if (ImGui::Button("Stop"))  reset_sim();
                 ImGui::SliderFloat("gravity", &gravity, -30.0f, 0.0f, "%.1f");
-                // Must stay in combine_mode order — the combos write their index
-                // straight back as the enum. Listed deadest -> bounciest.
                 static const char* kCombine[] = { "multiply", "min", "geometric", "average", "max" };
                 if (ImGui::Combo("friction mix", &friction_combine, kCombine, IM_ARRAYSIZE(kCombine)))
                     { asleep = false; still_steps = 0; }
@@ -692,30 +493,24 @@ int main(int argc, char** argv) {
 
             if (show_camera) {
                 section_break();
-                // Editable orbit camera: cam moves the whole rig (rigid translate,
-                // target follows); target re-aims (eye stays, aims at the new point);
-                // r dollies along the view direction. lookfrom is derived from
-                // target + radius + angles, so cam/target edits update those.
                 float pos[3] = {(float)cam->lookfrom.x(), (float)cam->lookfrom.y(), (float)cam->lookfrom.z()};
                 if (ImGui::DragFloat3("cam", pos, 0.05f)) {
-                    // rigid translate: move the whole rig, so moving the eye doesn't
-                    // re-aim it — shift the pivot by the same delta the eye moved.
+                    // rigid translate
                     target = target + (point3(pos[0], pos[1], pos[2]) - cam->lookfrom);
                     camera_dirty = true;
                 }
                 float tgt[3] = {(float)target.x(), (float)target.y(), (float)target.z()};
                 if (ImGui::DragFloat3("target", tgt, 0.05f)) {
-                    // re-aim: the eye stays put and aims at the new target; recompute
-                    // the orbit offset (radius + angles) from the fixed eye to it.
+                    // re-aim
                     point3 nt(tgt[0], tgt[1], tgt[2]);
                     vec3 off = cam->lookfrom - nt;
                     target = nt;
                     radius = off.length();
                     if (radius < 0.1) radius = 0.1;
                     azimuth = atan2(off.z(), off.x());
-                    double s = off.y() / radius;                 // clamp asin's domain against fp error
+                    double s = off.y() / radius;
                     elevation = asin(s < -1.0 ? -1.0 : (s > 1.0 ? 1.0 : s));
-                    if (elevation >  1.55) elevation =  1.55;    // match the orbit-drag pole clamp
+                    if (elevation >  1.55) elevation =  1.55;
                     if (elevation < -1.55) elevation = -1.55;
                     camera_dirty = true;
                 }
@@ -742,14 +537,9 @@ int main(int argc, char** argv) {
                 if (selected_id >= 0) {
                     ImGui::Text("selected  id %d", selected_id);
 
-                    // B5 object manipulation: edit the selected object's full
-                    // TRS, then run the mutation protocol — placement-new the
-                    // transform (rewrites params AND recomputes matrices + bbox)
-                    // -> refit() -> restart accumulation. Generic over prim type:
-                    // every editable object is a transform(prim). The bbox
-                    // highlight follows via bounding_box().
                     hittable* h = sc.get(selected_id);
                     if (h->type == TRANSFORM) {
+                        // transform
                         transform* tr = static_cast<transform*>(h->object);
                         float t[3] = {(float)tr->translation.x(), (float)tr->translation.y(), (float)tr->translation.z()};
                         float r[3] = {(float)tr->rotation.x(),    (float)tr->rotation.y(),    (float)tr->rotation.z()};
@@ -759,69 +549,46 @@ int main(int argc, char** argv) {
                         edited |= ImGui::DragFloat3("rotate",    r, 1.0f);
                         edited |= ImGui::DragFloat3("scale",     s, 0.02f, 0.01f, 100.0f);
                         if (edited) {
-                            for (int c = 0; c < 3; c++) s[c] = fmaxf(s[c], 0.01f);  // scale must stay positive
-                            new(tr) transform(tr->child, point3(t[0], t[1], t[2]),
-                                              vec3(r[0], r[1], r[2]), vec3(s[0], s[1], s[2]));
+                            for (int c = 0; c < 3; c++) s[c] = fmaxf(s[c], 0.01f);
+                            new(tr) transform(tr->child, point3(t[0], t[1], t[2]), vec3(r[0], r[1], r[2]), vec3(s[0], s[1], s[2]));
                             sc.refit();
                             reset_accumulation();
-                            sync_body_to_transform(selected_id);  // so the edit sticks under sim
+                            sync_body_from_transform(selected_id);
                         }
-                        // Restore the object's initial pose (same mutation protocol).
-                        // The drag fields re-read tr next frame, so the UI follows.
                         if (ImGui::Button("Reset transform")) {
                             const init_trs& in = initial_trs[selected_id];
                             new(tr) transform(tr->child, in.t, in.r, in.s);
                             sc.refit();
                             reset_accumulation();
-                            sync_body_to_transform(selected_id);
+                            sync_body_from_transform(selected_id);
                         }
 
-                        // A3: the object's PHYSICS ROLE — how it moves (motion),
-                        // whether it collides at all, and its mass. None of these
-                        // change the image, so no accumulation reset; they do
-                        // change the dynamics, so each edit WAKES a settled sim
-                        // (otherwise the change would sit inert until something
-                        // else disturbed the pile). Authoring only — Stop resets
-                        // the pose, never the role.
+                        // collision type and motion type
                         int bi = body_of_scene_id[selected_id];
                         if (bi >= 0) {
                             phys_body& b = bodies[bi];
                             ImGui::Spacing();
-                            // Ordered as the two questions nest: does it collide
-                            // at all, and if it moves, how?
+                            // collision type
                             if (ImGui::Checkbox("collidable", &b.collidable)) {
                                 asleep = false; still_steps = 0;
                             }
-                            // Must stay in motion_type order — the combo writes
-                            // its index straight back as the enum value.
+                            // motion type
                             static const char* kMotion[] = { "static", "kinematic", "dynamic" };
                             int m = (int)b.motion;
                             if (ImGui::Combo("motion", &m, kMotion, IM_ARRAYSIZE(kMotion))) {
                                 b.motion = (motion_type)m;
-                                // A stale velocity on an immovable body would still
-                                // be read as approach speed at its contacts, so it
-                                // would shove things while standing still.
                                 if (b.motion != DYNAMIC) b.vel = vec3(0, 0, 0);
                                 asleep = false; still_steps = 0;
                             }
-                            // Mass only means anything for a DYNAMIC body —
-                            // inv_mass() discards it otherwise — so the field is
-                            // hidden rather than shown inert. The authored value
-                            // still lives in b.mass, so making the body dynamic
-                            // again brings the field back with its old value.
+                            // mass of dynamic object
                             if (b.motion == DYNAMIC) {
-                                float mass_f = (float)b.mass;   // must stay > 0: inv_mass() divides by it
+                                float mass_f = (float)b.mass;
                                 if (ImGui::DragFloat("mass", &mass_f, 0.05f, 0.01f, 1000.0f, "%.2f")) {
                                     b.mass = real(fmaxf(mass_f, 0.01f));
                                     asleep = false; still_steps = 0;
                                 }
                             }
-                            // Surface properties. Unlike mass these apply to
-                            // IMMOVABLE bodies too — a static floor's friction
-                            // and bounce are exactly what make it slippery or
-                            // springy — so they show for every role. Each is
-                            // combined with the other surface's value per
-                            // contact, by the rule set in the Physics panel.
+                            // surface properties
                             float fr = (float)b.friction, rest = (float)b.restitution;
                             if (ImGui::SliderFloat("friction", &fr, 0.0f, 2.0f, "%.2f")) {
                                 b.friction = real(fr);
@@ -831,14 +598,6 @@ int main(int argc, char** argv) {
                                 b.restitution = real(rest);
                                 asleep = false; still_steps = 0;
                             }
-                            // Rolling and spinning resistance are small and act
-                            // slowly, so both get a narrow range and three
-                            // decimals rather than friction's 0..2. ROLLING
-                            // resists spin across the normal — the part that
-                            // carries a ball along — at (5/7) * this * gravity.
-                            // SPINNING resists spin about the normal, a ball
-                            // turning on the spot, at 2.5 * this * gravity / r.
-                            // Either at 0 means that motion never stops.
                             float roll = (float)b.rolling_friction;
                             float spin = (float)b.spinning_friction;
                             if (ImGui::SliderFloat("rolling", &roll, 0.0f, 0.1f, "%.3f")) {
@@ -849,9 +608,6 @@ int main(int argc, char** argv) {
                                 b.spinning_friction = real(spin);
                                 asleep = false; still_steps = 0;
                             }
-                            // Spin has no other read-out: a solid-colour sphere
-                            // looks the same however it is turned, so the panel is
-                            // the only place rotation is visible at all.
                             if (b.shape == COLLIDER_SPHERE && inv_mass(b) > real(0))
                                 ImGui::Text("spin      %.2f rad/s", (double)b.omega.length());
                         } else {
@@ -867,9 +623,7 @@ int main(int argc, char** argv) {
         }
         ImGui::End();
 
-        // B4 highlight: project the selected object's bbox and outline it as a
-        // 2D overlay — the render itself is untouched, so no accumulation
-        // reset, and the outline follows camera moves via reprojection.
+        // draw selected object's bbox
         if (selected_id >= 0) {
             aabb bb = sc.get(selected_id)->bounding_box();
             point3 corner[8];
@@ -889,10 +643,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (camera_dirty) rebuild_camera();   // recompute view + reset accumulation
+        if (camera_dirty) rebuild_camera();
 
         // step physics
-        if (animating && !asleep && !bodies.empty()) {
+        if (playing && !asleep && !bodies.empty()) {
             const phys_params pp{ real(gravity), (combine_mode)friction_combine,
                                                  (combine_mode)restitution_combine };
             // advance timeline
@@ -907,33 +661,18 @@ int main(int argc, char** argv) {
                 stepped = true;
             }
             if (still_steps > SLEEP_STEPS) asleep = true;
-            if (stepped) {   // apply all poses -> refit -> restart accumulation
+            // update transform of scene objects
+            if (stepped) {
                 for (phys_body& b : bodies) {
-                    // An unlinked body has no transform to write into, and only
-                    // DYNAMIC bodies are moved BY the sim — a kinematic body's
-                    // pose is the driver's, so writing it back would fight the drag.
                     if (b.scene_id < 0 || b.motion != DYNAMIC) continue;
-                    transform* tr = static_cast<transform*>(sc.get(b.scene_id)->object);
-                    // B3c COUPLING: a box now turns, so its rendered rotation is
-                    // the SIMULATED orientation, not the authored one. The
-                    // physics owns a quaternion and the transform owns Euler
-                    // angles (which is what the editor's fields show), so this
-                    // is the one place the two meet — see quat.h. A sphere keeps
-                    // its authored rotation: turning one changes neither its
-                    // collider nor its silhouette, so writing a spin back would
-                    // only churn the transform and reset accumulation for a
-                    // pixel-identical image.
-                    const vec3 rot = (b.shape == COLLIDER_BOX)
-                                   ? quat_to_euler_zyx_degrees(b.orient) : b.baseR;
-                    new(tr) transform(tr->child, point3(b.pos), rot, b.baseS);
+                    sync_transform_from_body(b);
                 }
                 sc.refit();
                 reset_accumulation();
             }
         }
 
-        // B2: add spp_per_frame fresh samples per pixel until the target is
-        // reached; after that just keep presenting the converged image.
+        // frame accumulation
         bool did_accumulate = false;
         if (total_samples < target_samples) {
             checkCudaErrors(cudaEventRecord(ev_trace0));
@@ -941,55 +680,39 @@ int main(int argc, char** argv) {
             checkCudaErrors(cudaEventRecord(ev_trace1));
             did_accumulate = true;
             total_samples += spp_per_frame;
-
-            char title[96];
-            snprintf(title, sizeof(title), "RayTracerCUDA Viewer");
-            SDL_SetWindowTitle(win, title);
         }
 
-        const int denom = total_samples > 0 ? (int)total_samples : 1;  // tonemap divisor
-
-        if (use_interop) {
-            // Fast path: CUDA writes RGBA8 straight into the mapped PBO,
-            // then PBO -> texture entirely on the GPU.
+        // presentation
+        if (use_interop) {  
+            // CUDA-GL interop
             uchar4* dptr = nullptr;
             size_t nbytes = 0;
             checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo, 0));
             checkCudaErrors(cudaGraphicsResourceGetMappedPointer((void**)&dptr, &nbytes, cuda_pbo));
-            checkCudaErrors(cudaEventRecord(ev_tone0));
-            tonemap_frame<<<blocks, threads>>>(accum, dptr, W, H, denom);
-            checkCudaErrors(cudaEventRecord(ev_tone1));
+            tonemap_frame<<<blocks, threads>>>(accum, dptr, W, H, total_samples);
             checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo, 0));   // syncs the stream
 
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
             glBindTexture(GL_TEXTURE_2D, tex);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, 0);
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-        } else {
-            // Portable path: tonemap into a device buffer, copy to pinned host
-            // memory (the memcpy also synchronizes the kernel), upload from the
-            // host pointer. ~1.4 MB/frame at 800x450 — negligible next to VNC.
-            checkCudaErrors(cudaEventRecord(ev_tone0));
-            tonemap_frame<<<blocks, threads>>>(accum, d_rgba, W, H, denom);
+        } else {    
+            // CPU readback
+            tonemap_frame<<<blocks, threads>>>(accum, d_rgba, W, H, total_samples);
             checkCudaErrors(cudaMemcpy(h_rgba, d_rgba, frame_bytes, cudaMemcpyDeviceToHost));
-            checkCudaErrors(cudaEventRecord(ev_tone1));   // after the copy: tonemap+copy together
 
             glBindTexture(GL_TEXTURE_2D, tex);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, h_rgba);
         }
 
-        // Only the portable path's blocking cudaMemcpy synchronizes the host;
-        // cudaGraphicsUnmapResources merely orders CUDA before subsequent GL
-        // work, so on the interop path the trace kernel can still be running
-        // here (cudaEventElapsedTime would return cudaErrorNotReady = 600, and
-        // checkCudaErrors exits on it). Wait on the last event in the stream --
-        // ev_tone1, recorded after ev_trace1 -- before querying any interval.
-        checkCudaErrors(cudaEventSynchronize(ev_tone1));
-        if (did_accumulate) checkCudaErrors(cudaEventElapsedTime(&ms_trace, ev_trace0, ev_trace1));
-        else                ms_trace = 0.0f;
-        checkCudaErrors(cudaEventElapsedTime(&ms_tonemap, ev_tone0, ev_tone1));
+        if (did_accumulate) {
+            checkCudaErrors(cudaEventSynchronize(ev_trace1));
+            checkCudaErrors(cudaEventElapsedTime(&ms_trace, ev_trace0, ev_trace1));
+        } else {
+            ms_trace = 0.0f;
+        }
 
-        // draw a fullscreen textured quad (v flipped so image row 0 is on top)
+        // draw a fullscreen textured quad
         glClear(GL_COLOR_BUFFER_BIT);
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, tex);
@@ -1001,31 +724,30 @@ int main(int argc, char** argv) {
         glEnd();
         glDisable(GL_TEXTURE_2D);
 
-        // UI on top of the rendered frame
+        // UI
         ImGui::Render();
         ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
 
+        // present the rendered back buffer to the window
         SDL_GL_SwapWindow(win);
     }
 
-    // ---- cleanup ----
+    // cleanup
     if (nvml_ok) nvmlShutdown();
     cudaFree(pick_state);
     cudaFree(pick_result);
     cudaEventDestroy(ev_trace0);
     cudaEventDestroy(ev_trace1);
-    cudaEventDestroy(ev_tone0);
-    cudaEventDestroy(ev_tone1);
     ImGui_ImplOpenGL2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
-    if (use_interop) cudaGraphicsUnregisterResource(cuda_pbo);
     if (d_rgba) cudaFree(d_rgba);
     if (h_rgba) cudaFreeHost(h_rgba);
     cudaFree(accum);
     cudaFree(rand_states);
     cudaFree(cam);
     sc.release();
+    if (cuda_pbo) cudaGraphicsUnregisterResource(cuda_pbo);
     if (pbo) glDeleteBuffers(1, &pbo);
     glDeleteTextures(1, &tex);
     SDL_GL_DeleteContext(gl);

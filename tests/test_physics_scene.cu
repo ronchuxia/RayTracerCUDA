@@ -20,7 +20,7 @@
 
 #include "camera.h"
 #include "physics.h"
-#include "scene.h"
+#include "viewer/scene.h"
 #include "scenes/scene_utils.h"
 #include "viewer/physics_utils.h"
 #include "viewer/scenes/ball_pit.h"
@@ -47,8 +47,8 @@ int main() {
 
     // ================= ball pit =================
     scene sc;
-    viewer_scene vs = build_ball_pit(sc, BOX_HALF, real(0));   // the frictionless tight pit
-    std::vector<phys_body> bodies = vs.bodies;
+    build_ball_pit(sc, BOX_HALF, real(0));   // the frictionless tight pit
+    std::vector<phys_body> bodies = sc.bodies;
     std::vector<int> body_of_scene_id = index_bodies(bodies, (int)sc.objects.size());
 
     int boxes = 0, spheres = 0, unlinked = 0, box_i = -1, box_id = -1;
@@ -145,7 +145,11 @@ int main() {
         new(tr) transform(tr->child, tr->translation, vec3(0, 45, 0), tr->scale);
         sc.refit();
         std::vector<phys_body> b = bodies;
-        box_collider_of(tr, b[box_i].pos, b[box_i].half, b[box_i].axes);
+        vec3 pos, half, axes[3];
+        box_collider_of(tr, pos, half, axes);
+        b[box_i].pos = pos;
+        b[box_i].half = half;
+        set_box_orientation_from_box_axes(b[box_i], axes);
 
         const real rt = real(std::sqrt(0.5));
         CHECK(std::fabs((double)b[box_i].half[0] - 0.5) < 1e-3 &&
@@ -186,8 +190,8 @@ int main() {
     // B3a is actually reached from authored geometry.
     {
         scene sc3;
-        viewer_scene vs3 = build_ball_pit_rolling_scene(sc3);
-        std::vector<phys_body> b = vs3.bodies;
+        build_ball_pit_rolling_scene(sc3);
+        std::vector<phys_body> b = sc3.bodies;
 
         real maxv = 0; real peak_spin = 0;
         for (int s = 0; s < SETTLE; s++) {
@@ -231,14 +235,14 @@ int main() {
     // triangle a box collider nobody asked for.
     {
         scene sc2;
-        viewer_scene vs2 = build_primitives_scene(sc2);
-        std::vector<int> idx = index_bodies(vs2.bodies, (int)sc2.objects.size());
+        build_primitives_scene(sc2);
+        std::vector<int> idx = index_bodies(sc2.bodies, (int)sc2.objects.size());
         int linked = 0, unlinked = 0;
-        for (const phys_body& b : vs2.bodies) (b.scene_id >= 0 ? linked : unlinked)++;
+        for (const phys_body& b : sc2.bodies) (b.scene_id >= 0 ? linked : unlinked)++;
         int without_body = 0;
         for (int id = 0; id < (int)sc2.objects.size(); id++) if (idx[id] < 0) without_body++;
 
-        CHECK(vs2.bodies.size() == 5 && linked == 5 && unlinked == 0,
+        CHECK(sc2.bodies.size() == 5 && linked == 5 && unlinked == 0,
               "showcase authors 5 bodies, all linked to their objects");
         CHECK((int)sc2.objects.size() == 6 && without_body == 1,
               "6 objects, 1 with no body: the decorative triangle");

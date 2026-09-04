@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <vector>
 
-#include "scene.h"
+#include "viewer/scene.h"
 #include "scenes/scene_utils.h"
 
 __global__ void pick(const hittable* root, const ray* rays, int n, int* out_ids) {

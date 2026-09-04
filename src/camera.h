@@ -88,10 +88,6 @@ struct camera {
             checkCudaErrors(cudaFree(pixel_colors));
         }
 
-        // Compute derived camera state — image_height + the u/v/w frame — from the
-        // public config fields. render() calls this itself; it is public so an
-        // external driver (the interactive viewer) can size its window/buffers from
-        // image_height and launch initialize_rand / render_pixel on its own.
         __host__ void initialize() {
             image_height = static_cast<int>(image_width / aspect_ratio);
             image_height = (image_height < 1) ? 1 : image_height;
@@ -139,10 +135,8 @@ struct camera {
             return ray(ray_origin, ray_direction);
         }
 
-        // Deterministic ray through the CENTER of pixel (i, j): no jitter, no
-        // defocus sampling, no RNG consumed — the same pixel always yields the
-        // same ray. Used by the viewer's object picking (B4).
         __host__ __device__ ray get_ray_through_pixel(int i, int j) const {
+            // Get a deterministic camera ray through the center of the pixel at location i,j
             auto pixel_center = pixel00_loc + (i * pixel_delta_u) + (j * pixel_delta_v);
             return ray(center, pixel_center - center);
         }
@@ -220,10 +214,9 @@ struct camera {
 };
 
 __global__ void initialize_rand(const camera& cam, curandState* state, unsigned long seed) {
-    // same seed, different sequence
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= cam.image_width * cam.image_height) return;
-    curand_init(seed, idx, 0, &state[idx]);
+    curand_init(seed, idx, 0, &state[idx]); // same seed, different sequence number
 }
 
 // The default translation of the color function results in a stack overflow since it can call 

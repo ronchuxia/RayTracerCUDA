@@ -46,8 +46,8 @@ static phys_body dynamic_box(const vec3& centre, const vec3& half,
 }
 // The same box turned `deg` degrees about y. physics.h reads the box's axes, not
 // an angle, so the test writes them directly — it has no dependency on
-// transforms.h. These are the columns of Ry(deg), matching what
-// physics_utils.h's box_collider_of() hands over from transform::apply_R.
+// transforms.h. These are the columns of Ry(deg), matching the axes derived
+// from the transform rotation when a box body is initialized.
 static phys_body rotated_box_y(const vec3& centre, const vec3& half, real deg) {
     phys_body b = static_box(centre, half);
     double t = (double)deg * 3.14159265358979323846 / 180.0;
@@ -663,7 +663,7 @@ int main() {
             {
                 phys_body bx = dynamic_box(vec3(0,0,0), vec3(2, 1, 1));
                 phys_body rb = bx;
-                set_orientation(rb, quat_from_axis_angle(vec3(0,1,0), real(1.5707963267948966)));
+                set_box_orientation(rb, quat_from_axis_angle(vec3(0,1,0), real(1.5707963267948966)));
                 vec3 turned = delta_omega(rb, vec3(0, 0, 1));   // world z == body x now
                 vec3 flat   = delta_omega(bx, vec3(1, 0, 0));   // body x when unturned
                 CHECK(std::fabs((double)turned[2] - (double)flat[0]) < 1e-6,

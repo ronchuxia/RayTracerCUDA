@@ -9,7 +9,7 @@
 
 #include "hittable.h"
 #include "material.h"
-#include "scene.h"
+#include "viewer/scene.h"
 #include "scenes/scene_utils.h"
 
 // Fire one ray at a hittable; report hit + t + point + normal.

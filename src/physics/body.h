@@ -41,16 +41,16 @@ struct phys_body {
 };
 
 // set the box's orientation and derive its x/y/z axes in world space
-inline void set_orientation(phys_body& b, const quat& q) {
+inline void set_box_orientation(phys_body& b, const quat& q) {
     b.orient  = normalize(q);
     b.axes[0] = quat_axis(b.orient, 0);
     b.axes[1] = quat_axis(b.orient, 1);
     b.axes[2] = quat_axis(b.orient, 2);
 }
 
-inline void set_orientation_from_axes(phys_body& b, const vec3 axes[3]) {
+inline void set_box_orientation_from_box_axes(phys_body& b, const vec3 axes[3]) {
     quat q = quat_from_axes(axes);  // normalize
-    set_orientation(b, q);
+    set_box_orientation(b, q);
 }
 
 #endif // PHYSICS_BODY_H

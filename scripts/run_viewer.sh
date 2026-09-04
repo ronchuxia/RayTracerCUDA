@@ -50,4 +50,4 @@ if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     echo "Run over VNC or 'ssh -X'."
 fi
 
-exec "./$BIN" "$@"
+exec "./$BIN"

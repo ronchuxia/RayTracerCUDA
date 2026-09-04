@@ -86,7 +86,7 @@ inline material* new_isotropic(const texture& albedo, std::vector<void*>& allocs
 
 // make_* creators build the shape + wrapper WITHOUT adding it to a world —
 // callers either world->add() it themselves (the add_* helpers below) or
-// register it with a scene (scene.h), which assigns the wrapper's stable id.
+// register it with a scene (viewer/scene.h), which assigns the wrapper's stable id.
 
 inline hittable* make_sphere(const point3& center, double radius,
                              material* mat, std::vector<void*>& allocs) {
