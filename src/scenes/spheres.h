@@ -15,7 +15,7 @@
 // main.cu, included before this header.
 
 #ifndef RT_EARTH_IMG
-#define RT_EARTH_IMG "references/RayTracing/images/earthmap.jpg"   // root-relative
+#define RT_EARTH_IMG "assets/earthmap.jpg"   // root-relative
 #endif
 inline void spheres() {
     auto start = std::chrono::system_clock::now();

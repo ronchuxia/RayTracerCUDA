@@ -10,6 +10,7 @@
 #   1       ball pit, roomy 1.5, frictionless       build/viewer_pit
 #   2       ball pit, tight 1.3, frictionless       build/viewer_tight
 #   3       ball pit, roomy 1.5, friction 0.5       build/viewer_rolling
+#   4       spinning earth balls, friction 0.5      build/viewer_spin
 #
 # Needs SDL2 + GLEW + OpenGL dev libraries; no display required to build.
 # Full output (incl. nvcc/ptxas warnings) is teed to build/build_viewer.log
@@ -51,7 +52,8 @@ case "$SCENE" in
     1) NAME=viewer_pit ;;
     2) NAME=viewer_tight ;;
     3) NAME=viewer_rolling ;;
-    *) echo "error: unknown SCENE=$SCENE (0 primitives, 1 pit, 2 tight, 3 rolling)" >&2
+    4) NAME=viewer_spin ;;
+    *) echo "error: unknown SCENE=$SCENE (0 primitives, 1 pit, 2 tight, 3 rolling, 4 spin)" >&2
        exit 1 ;;
 esac
 

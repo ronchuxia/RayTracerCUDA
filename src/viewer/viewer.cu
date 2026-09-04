@@ -44,6 +44,7 @@
 #include "viewer/physics_utils.h"
 #include "viewer/scenes/primitives.h"
 #include "viewer/scenes/ball_pit.h"
+#include "viewer/scenes/spin.h"
 
 // color -> RGBA8
 __global__ void tonemap_frame(const color* accum, uchar4* out, int w, int h, int samples) {
@@ -95,7 +96,9 @@ int main() {
 
     // scene
     scene sc;
-#if VIEWER_SCENE == 3
+#if VIEWER_SCENE == 4
+    build_spin_scene(sc);
+#elif VIEWER_SCENE == 3
     build_ball_pit_rolling_scene(sc);
 #elif VIEWER_SCENE == 2
     build_ball_pit_tight_scene(sc);
