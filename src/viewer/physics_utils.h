@@ -28,6 +28,10 @@ inline phys_body make_sphere_body(scene& sc, int scene_id, motion_type motion = 
         std::cerr << "scene object " << scene_id << " does not wrap a sphere\n";
         std::exit(1);
     }
+    if (tr->scale.x() != tr->scale.y() || tr->scale.y() != tr->scale.z()) {
+        std::cerr << "scene object " << scene_id << " needs uniform scale\n";
+        std::exit(1);
+    }
     phys_body b{ scene_id, tr->translation, vec3(0,0,0), tr->scale };
     b.motion = motion;  b.mass = mass;
     b.shape  = COLLIDER_SPHERE;

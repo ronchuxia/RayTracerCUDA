@@ -570,7 +570,16 @@ int main() {
                     bool edited = false;
                     edited |= ImGui::DragFloat3("translate", t, 0.05f);
                     edited |= ImGui::DragFloat3("rotate",    r, 1.0f);
-                    edited |= ImGui::DragFloat3("scale",     s, 0.02f, 0.01f, 100.0f);
+                    int bi = body_of_scene_id[selected_id];
+                    if (bi >= 0 && bodies[bi].shape == COLLIDER_SPHERE) {
+                        // a sphere collider needs uniform scale
+                        if (ImGui::DragFloat("scale", &s[0], 0.02f, 0.01f, 100.0f)) {
+                            s[1] = s[2] = s[0];
+                            edited = true;
+                        }
+                    } else {
+                        edited |= ImGui::DragFloat3("scale", s, 0.02f, 0.01f, 100.0f);
+                    }
                     if (edited) {
                         for (int c = 0; c < 3; c++) s[c] = fmaxf(s[c], 0.01f);
                         new(tr) transform(tr->child, point3(t[0], t[1], t[2]), vec3(r[0], r[1], r[2]), vec3(s[0], s[1], s[2]));
@@ -587,7 +596,6 @@ int main() {
                     }
 
                     // collision type and motion type
-                    int bi = body_of_scene_id[selected_id];
                     if (bi >= 0) {
                         phys_body& b = bodies[bi];
                         ImGui::Spacing();
