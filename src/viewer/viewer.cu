@@ -329,21 +329,16 @@ int main() {
         b.vel   = vec3(0, 0, 0);
         b.omega = vec3(0, 0, 0);
         b.scale = tr->scale;
-        if (b.shape == COLLIDER_SPHERE) {
-            b.pos    = tr->translation;
-            b.radius = static_cast<sphere*>(tr->child->object)->radius * tr->scale.y();
-            set_orientation(b, quat_from_euler_zyx_degrees(tr->rotation));
-        } else {
-            quat orient;
-            box_collider_of(tr, b.pos, b.half, orient);
-            set_orientation(b, orient);
-        }
+        quat orient;
+        if (b.shape == COLLIDER_SPHERE) sphere_collider_of(tr, b.pos, b.radius, orient, b.offset);
+        else                            box_collider_of(tr, b.pos, b.half, orient, b.offset);
+        set_orientation(b, orient);
         asleep = false; still_steps = 0;   // a moved body disturbs the pile -> resume stepping
     };
 
     auto sync_transform_from_body = [&](const phys_body& b) {
         transform* tr = static_cast<transform*>(sc.get(b.scene_id)->object);
-        new(tr) transform(tr->child, b.pos, quat_to_euler_zyx_degrees(b.orient), b.scale);
+        new(tr) transform(tr->child, transform_translation_of(b), quat_to_euler_zyx_degrees(b.orient), b.scale);
     };
 
     // reset simulation

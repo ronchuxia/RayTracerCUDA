@@ -19,6 +19,14 @@ inline transform* get_body_transform(scene& sc, int scene_id) {
     return static_cast<transform*>(h->object);
 }
 
+inline void sphere_collider_of(const transform* tr, vec3& pos, real& radius, quat& orient, vec3& offset) {
+    const sphere* sp = static_cast<const sphere*>(tr->child->object);
+    radius = sp->radius * tr->scale.y();
+    offset = sp->center * tr->scale;
+    pos    = tr->apply_R(offset) + tr->translation;
+    orient = quat_from_euler_zyx_degrees(tr->rotation);
+}
+
 // make a sphere body from a sphere object
 inline phys_body make_sphere_body(scene& sc, int scene_id, motion_type motion = DYNAMIC,
                                   real mass = real(1),
@@ -32,23 +40,30 @@ inline phys_body make_sphere_body(scene& sc, int scene_id, motion_type motion = 
         std::cerr << "scene object " << scene_id << " needs uniform scale\n";
         std::exit(1);
     }
-    phys_body b{ scene_id, tr->translation, vec3(0,0,0), tr->scale };
+    phys_body b{ scene_id, vec3(0,0,0), vec3(0,0,0), tr->scale };
     b.motion = motion;  b.mass = mass;
     b.shape  = COLLIDER_SPHERE;
     b.friction = friction;  b.restitution = restitution;
     // derive the sphere collider from the object
-    sphere* sp = static_cast<sphere*>(tr->child->object);
-    b.radius = sp->radius * tr->scale.y();
-    set_orientation(b, quat_from_euler_zyx_degrees(tr->rotation));
+    quat orient;
+    sphere_collider_of(tr, b.pos, b.radius, orient, b.offset);
+    set_orientation(b, orient);
     return b;
 }
 
-inline void box_collider_of(const transform* tr, vec3& pos, vec3& half, quat& orient) {
+inline void box_collider_of(const transform* tr, vec3& pos, vec3& half, quat& orient, vec3& offset) {
     aabb c = tr->child->bounding_box();                     // child's local bounding box
     vec3 lo(c.x.min, c.y.min, c.z.min), hi(c.x.max, c.y.max, c.z.max);
     half   = (hi - lo) * real(0.5) * tr->scale;
-    pos    = tr->apply_R((lo + hi) * real(0.5) * tr->scale) + tr->translation;
+    offset = (lo + hi) * real(0.5) * tr->scale;
+    pos    = tr->apply_R(offset) + tr->translation;
     orient = quat_from_euler_zyx_degrees(tr->rotation);
+}
+
+// inverse of the centre map above with the body's CURRENT orientation:
+// T = pos - R(orient)·offset
+inline vec3 transform_translation_of(const phys_body& b) {
+    return b.pos - (b.axes[0] * b.offset.x() + b.axes[1] * b.offset.y() + b.axes[2] * b.offset.z());
 }
 
 // make a box body from ANY object
@@ -62,7 +77,7 @@ inline phys_body make_box_body(scene& sc, int scene_id, motion_type motion = STA
     b.friction = friction;  b.restitution = restitution;
     // derive the box collider from the object
     quat orient;
-    box_collider_of(tr, b.pos, b.half, orient);
+    box_collider_of(tr, b.pos, b.half, orient, b.offset);
     set_orientation(b, orient);
     return b;
 }

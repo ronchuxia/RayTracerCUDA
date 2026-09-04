@@ -13,9 +13,11 @@ enum collider_type { COLLIDER_SPHERE, COLLIDER_BOX };
 
 struct phys_body {
     int  scene_id;
-    vec3 pos, vel;
+    vec3 pos;                       // collider center from world's origin, in world's axes
+    vec3 vel;
     vec3 scale;
     quat orient;
+    vec3 offset = vec3(0, 0, 0);    // collider center from transform's origin, in transform's axes, scaled
 
     // orient in matrix form, a derived cache of a box's x/y/z axes in world space
     vec3          axes[3]    = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };

@@ -146,7 +146,7 @@ int main() {
         sc.refit();
         std::vector<phys_body> b = bodies;
         quat orient;
-        box_collider_of(tr, b[box_i].pos, b[box_i].half, orient);
+        box_collider_of(tr, b[box_i].pos, b[box_i].half, orient, b[box_i].offset);
         set_orientation(b[box_i], orient);
 
         const real rt = real(std::sqrt(0.5));
@@ -245,6 +245,45 @@ int main() {
         CHECK((int)sc2.objects.size() == 6 && without_body == 1,
               "6 objects, 1 with no body: the decorative triangle");
         sc2.release();
+    }
+
+    // ================= off-centre colliders =================
+    // A child whose centre is not the transform's origin: the collider sits at
+    // R·(c·S) + T, and the write-back must recover T from the simulated pos with
+    // the body's CURRENT orientation — the object swings about its collider
+    // centre, not about its authoring origin.
+    {
+        scene sc3; sc3.init();
+        material* m = new_lambertian(color(0.5, 0.5, 0.5), sc3.allocs);
+        const vec3 T_box(2, 0, 0), T_sph(0, 3, 0), S(1, 2, 1);
+        int box_id = sc3.add(new_transform(new_box(point3(0,0,0), point3(1,1,1), m, sc3.allocs, sc3.list_dtors),
+                                           T_box, vec3(0, 45, 0), S, sc3.allocs));
+        int sph_id = sc3.add(new_transform(make_sphere(point3(1, 0, 0), 0.5, m, sc3.allocs),
+                                           T_sph, vec3(0, 90, 0), vec3(1,1,1), sc3.allocs));
+        phys_body bb = make_box_body(sc3, box_id, DYNAMIC);
+        phys_body bs = make_sphere_body(sc3, sph_id, DYNAMIC);
+        transform* tb = static_cast<transform*>(sc3.get(box_id)->object);
+        transform* ts = static_cast<transform*>(sc3.get(sph_id)->object);
+
+        CHECK((bb.pos - (tb->apply_R(vec3(0.5, 0.5, 0.5) * S) + T_box)).length() < real(1e-6),
+              "a box collider sits at the child's centre mapped through T·R·S");
+        CHECK((bs.pos - (ts->apply_R(vec3(1, 0, 0)) + T_sph)).length() < real(1e-6),
+              "a sphere collider sits at the child's centre mapped through T·R·S");
+        CHECK((transform_translation_of(bb) - T_box).length() < real(1e-6) &&
+              (transform_translation_of(bs) - T_sph).length() < real(1e-6),
+              "write-back recovers the authored translation while the body is unturned");
+
+        // turn the box body as physics would, write it back the way the viewer
+        // does, then re-derive the collider: physics and render must agree
+        set_orientation(bb, quat_from_euler_zyx_degrees(vec3(30, -60, 10)));
+        new(tb) transform(tb->child, transform_translation_of(bb), quat_to_euler_zyx_degrees(bb.orient), bb.scale);
+        vec3 pos, half, off; quat q;
+        box_collider_of(tb, pos, half, q, off);
+        CHECK((pos - bb.pos).length() < real(1e-5),
+              "after a turn, the re-derived collider is where physics left the body");
+        CHECK((tb->translation - T_box).length() > real(0.1),
+              "and the transform's origin moved: the object turned about its collider centre");
+        sc3.release();
     }
 
     printf(fails ? "SCENE PHYSICS TESTS FAILED (%d)\n" : "ALL SCENE PHYSICS TESTS PASSED\n", fails);
