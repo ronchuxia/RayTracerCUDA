@@ -58,12 +58,13 @@ __global__ void tonemap_frame(const color* accum, gbuffer gb, int view, int rw, 
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= w || j >= h) return;
     int idx = (j * rh / h) * rw + (i * rw / w);
-    real inv = real(1) / samples;
+    real inv  = real(1) / samples;      // beauty samples
+    real ginv = real(1) / gb.samples;   // G-buffer samples
     color c;
-    if (view == 1)      c = gb.albedo[idx] * inv;                               // albedo
-    else if (view == 2) c = real(0.5) * (gb.normal[idx] * inv + vec3(1, 1, 1)); // normal, [-1,1] -> [0,1]
+    if (view == 1)      c = gb.albedo[idx] * ginv;                               // albedo
+    else if (view == 2) c = real(0.5) * (gb.normal[idx] * ginv + vec3(1, 1, 1)); // normal, [-1,1] -> [0,1]
     else if (denoised)  c = color(denoised[j * w + i].x, denoised[j * w + i].y, denoised[j * w + i].z); // denoised
-    else                c = accum[idx] * inv;                                   // beauty
+    else                c = accum[idx] * inv;                                    // beauty
     unsigned char r, g, b;
     tonemap_pixel(c, 1, r, g, b);
     out[j * w + i] = make_uchar4(r, g, b, 255);
@@ -82,7 +83,8 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
     for (int sample = 0; sample < spp; ++sample) {
         ray r = cam.get_ray(i, j, rand_state);
         camera::first_hit fh;
-        accum[pixel_index] += cam.ray_color(r, world, max_depth, rand_state, &fh);
+        color c = cam.ray_color(r, world, max_depth, rand_state, &fh);
+        if (accum) accum[pixel_index] += c;
         gb.albedo[pixel_index] += fh.albedo;
         gb.normal[pixel_index] += fh.normal;
     }
@@ -787,18 +789,29 @@ int main() {
         }
 
         // frame accumulation
+        bool guide_view = view != 0;
+        bool did_trace = false;
         bool did_accumulate = false;
-        if (total_samples < target_samples) {
+        if ((guide_view ? gb.samples : total_samples) < target_samples) {
             checkCudaErrors(cudaEventRecord(ev_trace0));
-            accumulate_frame<<<blocks, threads>>>(*cam, cam->max_depth, world, accum, gb, rand_states, spp_per_frame);
+            accumulate_frame<<<blocks, threads>>>(
+                *cam, 
+                guide_view ? 1 : cam->max_depth, 
+                world,
+                guide_view ? nullptr : accum, 
+                gb, 
+                rand_states, 
+                spp_per_frame
+            );
             checkCudaErrors(cudaEventRecord(ev_trace1));
-            did_accumulate = true;
-            total_samples += spp_per_frame;
+            did_trace = true;
+            if (!guide_view) { total_samples += spp_per_frame; did_accumulate = true; }
+            gb.samples += spp_per_frame;
         }
 
         // denoise
         bool did_denoise = false;
-        if (denoise_mode != DENOISE_OFF && (denoise_dirty || did_accumulate)) {
+        if (denoise_mode != DENOISE_OFF && !guide_view && (denoise_dirty || did_accumulate)) {
             checkCudaErrors(cudaEventRecord(ev_dn0));
             dn->invoke(accum, gb, total_samples, blend);
             checkCudaErrors(cudaEventRecord(ev_dn1));
@@ -830,7 +843,7 @@ int main() {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, h_rgba);
         }
 
-        if (did_accumulate) {
+        if (did_trace) {
             checkCudaErrors(cudaEventSynchronize(ev_trace1));
             checkCudaErrors(cudaEventElapsedTime(&ms_trace, ev_trace0, ev_trace1));
         } else {

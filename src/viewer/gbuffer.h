@@ -9,6 +9,7 @@ struct gbuffer {
     color* albedo = nullptr;
     vec3*  normal = nullptr;
     size_t pixels = 0;
+    int    samples = 0;
 
     void allocate(int w, int h) {
         release();
@@ -20,6 +21,7 @@ struct gbuffer {
     void clear() {
         checkCudaErrors(cudaMemset(albedo, 0, pixels * sizeof(color)));
         checkCudaErrors(cudaMemset(normal, 0, pixels * sizeof(vec3)));
+        samples = 0;
     }
     void release() {
         checkCudaErrors(cudaFree(albedo));
