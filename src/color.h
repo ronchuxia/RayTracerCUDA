@@ -15,12 +15,15 @@ __host__ __device__ inline real linear_to_gamma(real linear_component)
 
 // color -> RGB8
 __host__ __device__ inline void tonemap_pixel(color pixel_color, int samples_per_pixel,
-                                              unsigned char& r, unsigned char& g, unsigned char& b) {
+                                              unsigned char& r, unsigned char& g, unsigned char& b,
+                                              bool gamma = true) {
     real scale = real(1.0) / samples_per_pixel;
     const interval intensity(0.000, 0.999);
-    r = static_cast<unsigned char>(256 * intensity.clamp(linear_to_gamma(pixel_color.x() * scale)));
-    g = static_cast<unsigned char>(256 * intensity.clamp(linear_to_gamma(pixel_color.y() * scale)));
-    b = static_cast<unsigned char>(256 * intensity.clamp(linear_to_gamma(pixel_color.z() * scale)));
+    color c = pixel_color * scale;
+    if (gamma) c = color(linear_to_gamma(c.x()), linear_to_gamma(c.y()), linear_to_gamma(c.z()));
+    r = static_cast<unsigned char>(256 * intensity.clamp(c.x()));
+    g = static_cast<unsigned char>(256 * intensity.clamp(c.y()));
+    b = static_cast<unsigned char>(256 * intensity.clamp(c.z()));
 }
 
 // write one pixel as a PPM ASCII triplet

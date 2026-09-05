@@ -66,7 +66,7 @@ __global__ void tonemap_frame(const color* accum, gbuffer gb, int view, int rw, 
     else if (denoised)  c = color(denoised[j * w + i].x, denoised[j * w + i].y, denoised[j * w + i].z); // denoised
     else                c = accum[idx] * inv;                                    // beauty
     unsigned char r, g, b;
-    tonemap_pixel(c, 1, r, g, b);
+    tonemap_pixel(c, 1, r, g, b, view != 2);
     out[j * w + i] = make_uchar4(r, g, b, 255);
 }
 
