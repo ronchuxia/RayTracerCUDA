@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <ctime>
+#include <memory>
 #include <vector>
 
 #ifndef RT_IMAGE_WIDTH
@@ -41,24 +42,30 @@
 #include "physics.h"
 #include "viewer/scene.h"
 #include "viewer/gbuffer.h"
+#include "viewer/denoiser_optix.h"
 #include "scenes/scene_utils.h"
 #include "viewer/physics_utils.h"
 #include "viewer/scenes/primitives.h"
 #include "viewer/scenes/ball_pit.h"
 #include "viewer/scenes/spin.h"
+#include "viewer/scenes/denoise_room.h"
 
 // color/gbuffer -> RGBA8
 __global__ void tonemap_frame(const color* accum, gbuffer gb, int view, int rw, int rh,
+                              const float3* denoised,
                               uchar4* out, int w, int h, int samples) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= w || j >= h) return;
     int idx = (j * rh / h) * rw + (i * rw / w);
-    color c = view == 0 ? accum[idx]    // beauty
-            : view == 1 ? gb.albedo[idx]    // albedo
-            : real(0.5) * (gb.normal[idx] + real(samples) * vec3(1, 1, 1)); // normal
+    real inv = real(1) / samples;
+    color c;
+    if (view == 1)      c = gb.albedo[idx] * inv;                               // albedo
+    else if (view == 2) c = real(0.5) * (gb.normal[idx] * inv + vec3(1, 1, 1)); // normal, [-1,1] -> [0,1]
+    else if (denoised)  c = color(denoised[j * w + i].x, denoised[j * w + i].y, denoised[j * w + i].z); // denoised
+    else                c = accum[idx] * inv;                                   // beauty
     unsigned char r, g, b;
-    tonemap_pixel(c, samples, r, g, b);
+    tonemap_pixel(c, 1, r, g, b);
     out[j * w + i] = make_uchar4(r, g, b, 255);
 }
 
@@ -104,7 +111,9 @@ int main() {
 
     // scene
     scene sc;
-#if VIEWER_SCENE == 4
+#if VIEWER_SCENE == 5
+    build_denoise_room_scene(sc);
+#elif VIEWER_SCENE == 4
     build_spin_scene(sc);
 #elif VIEWER_SCENE == 3
     build_ball_pit_rolling_scene(sc);
@@ -135,8 +144,7 @@ int main() {
     cam->focus_dist    = 10.0;
     cam->initialize();
     int W = cam->image_width, H = cam->image_height;    // window size
-    int RW = W, RH = H;                                 // render size
-    int render_div = 1;
+    int RW = W, RH = H;                                 // render size = window / the denoiser's upscale factor
 
     // SDL window and GL context
     SDL_Window* win = SDL_CreateWindow(
@@ -187,6 +195,16 @@ int main() {
     int total_samples = 0;
     int target_samples = RT_TARGET_SAMPLES;
     int view = 0;                            // displayed buffer: 0 beauty, 1 albedo, 2 normal
+
+    // denoiser
+    enum { DENOISE_OFF = 0, DENOISE_OPTIX_AOV = 1 };
+    int   denoise_mode = DENOISE_OFF;
+    auto  upscale_factor = [&]() { return 1; };
+    bool  guide_albedo = true;
+    bool  guide_normal = true;
+    float blend = 0.0f;                      // 0 = fully denoised, 1 = untouched input
+    std::unique_ptr<denoiser> dn = std::make_unique<optix_denoiser>(guide_albedo, guide_normal);
+
     unsigned long rng_seed = (cam->seed < 0) ? (unsigned long)time(0) : (unsigned long)cam->seed;
 
     auto resize_frame = [&](int w, int h) {
@@ -200,7 +218,7 @@ int main() {
         checkCudaErrors(cudaFree(rand_states));
 
         W = w; H = h;
-        RW = W / render_div; RH = H / render_div;
+        RW = W / upscale_factor(); RH = H / upscale_factor();
         cam->image_width  = RW;
         cam->aspect_ratio = real(RW) / (real(RH) + real(0.5));
         cam->initialize();
@@ -233,6 +251,7 @@ int main() {
         checkCudaErrors(cudaMalloc(&accum, (size_t)RW * RH * sizeof(color)));
         checkCudaErrors(cudaMemset(accum, 0, (size_t)RW * RH * sizeof(color)));
         gb.allocate(RW, RH);
+        dn->setup(RW, RH, W, H);
         total_samples = 0;
 
         // rng
@@ -280,6 +299,10 @@ int main() {
     checkCudaErrors(cudaEventCreate(&ev_trace0));
     checkCudaErrors(cudaEventCreate(&ev_trace1));
     float ms_trace = 0.0f;
+    cudaEvent_t ev_dn0, ev_dn1;
+    checkCudaErrors(cudaEventCreate(&ev_dn0));
+    checkCudaErrors(cudaEventCreate(&ev_dn1));
+    float ms_denoise = 0.0f;
 
     // panel visibility
     bool show_performance = true, show_rendering = true, show_display = true, show_camera = true, show_object = true, show_physics = true;
@@ -386,6 +409,7 @@ int main() {
     bool running = true;
     while (running) {
         bool camera_dirty = false;
+        bool denoise_dirty = false;
 
         // mouse and keyboard events
         SDL_Event e;
@@ -483,6 +507,7 @@ int main() {
                 ImGui::Text("%.0f fps", io.Framerate);
                 ImGui::Text("frame   %6.2f ms", io.DeltaTime * 1000.0f);
                 ImGui::Text("trace   %6.2f ms", ms_trace);
+                ImGui::Text("denoise %6.2f ms", ms_denoise);
                 if (nvml_ok && vram_poll++ % 30 == 0) {
                     unsigned int n = 64;
                     nvmlProcessInfo_t procs[64];
@@ -515,10 +540,17 @@ int main() {
             if (show_display) {
                 section_break();
                 ImGui::Combo("view", &view, "beauty\0albedo\0normal\0");
-                int div_idx = render_div - 1;
-                if (ImGui::Combo("render", &div_idx, "full\0half\0")) {
-                    render_div = div_idx + 1;
-                    resize_frame(W, H);
+                if (ImGui::Combo("denoiser", &denoise_mode, "off\0optix aov\0")) {
+                    if (RW != W / upscale_factor()) resize_frame(W, H);
+                    denoise_dirty = true;
+                }
+                if (ImGui::SliderFloat("blend", &blend, 0.0f, 1.0f)) denoise_dirty = true;
+                bool guides_changed = ImGui::Checkbox("albedo guide", &guide_albedo);
+                guides_changed     |= ImGui::Checkbox("normal guide", &guide_normal);
+                if (guides_changed) {
+                    dn = std::make_unique<optix_denoiser>(guide_albedo, guide_normal);
+                    dn->setup(RW, RH, W, H);
+                    denoise_dirty = true;
                 }
             }
 
@@ -764,6 +796,17 @@ int main() {
             total_samples += spp_per_frame;
         }
 
+        // denoise
+        bool did_denoise = false;
+        if (denoise_mode != DENOISE_OFF && (denoise_dirty || did_accumulate)) {
+            checkCudaErrors(cudaEventRecord(ev_dn0));
+            dn->invoke(accum, gb, total_samples, blend);
+            checkCudaErrors(cudaEventRecord(ev_dn1));
+            did_denoise = true;
+            denoise_dirty = false;
+        }
+        const float3* denoised = denoise_mode != DENOISE_OFF ? dn->output : nullptr;
+
         // presentation
         if (use_interop) {  
             // CUDA-GL interop
@@ -771,7 +814,7 @@ int main() {
             size_t nbytes = 0;
             checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo, 0));
             checkCudaErrors(cudaGraphicsResourceGetMappedPointer((void**)&dptr, &nbytes, cuda_pbo));
-            tonemap_frame<<<blocks_out, threads>>>(accum, gb, view, RW, RH, dptr, W, H, total_samples);
+            tonemap_frame<<<blocks_out, threads>>>(accum, gb, view, RW, RH, denoised, dptr, W, H, total_samples);
             checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo, 0));   // syncs the stream
 
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
@@ -780,7 +823,7 @@ int main() {
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         } else {    
             // CPU readback
-            tonemap_frame<<<blocks_out, threads>>>(accum, gb, view, RW, RH, d_rgba, W, H, total_samples);
+            tonemap_frame<<<blocks_out, threads>>>(accum, gb, view, RW, RH, denoised, d_rgba, W, H, total_samples);
             checkCudaErrors(cudaMemcpy(h_rgba, d_rgba, frame_bytes, cudaMemcpyDeviceToHost));
 
             glBindTexture(GL_TEXTURE_2D, tex);
@@ -792,6 +835,12 @@ int main() {
             checkCudaErrors(cudaEventElapsedTime(&ms_trace, ev_trace0, ev_trace1));
         } else {
             ms_trace = 0.0f;
+        }
+        if (did_denoise) {
+            checkCudaErrors(cudaEventSynchronize(ev_dn1));
+            checkCudaErrors(cudaEventElapsedTime(&ms_denoise, ev_dn0, ev_dn1));
+        } else {
+            ms_denoise = 0.0f;
         }
 
         // draw a fullscreen textured quad
@@ -820,6 +869,8 @@ int main() {
     cudaFree(pick_result);
     cudaEventDestroy(ev_trace0);
     cudaEventDestroy(ev_trace1);
+    cudaEventDestroy(ev_dn0);
+    cudaEventDestroy(ev_dn1);
     ImGui_ImplOpenGL2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();

@@ -11,6 +11,7 @@
 #   2       ball pit, tight 1.3, frictionless       build/viewer_tight
 #   3       ball pit, roomy 1.5, friction 0.5       build/viewer_rolling
 #   4       spinning earth balls, friction 0.5      build/viewer_spin
+#   5       denoiser evaluation room                build/viewer_denoise
 #
 # Needs SDL2 + GLEW + OpenGL dev libraries; no display required to build.
 # Full output (incl. nvcc/ptxas warnings) is teed to build/build_viewer.log
@@ -53,7 +54,8 @@ case "$SCENE" in
     2) NAME=viewer_tight ;;
     3) NAME=viewer_rolling ;;
     4) NAME=viewer_spin ;;
-    *) echo "error: unknown SCENE=$SCENE (0 primitives, 1 pit, 2 tight, 3 rolling, 4 spin)" >&2
+    5) NAME=viewer_denoise ;;
+    *) echo "error: unknown SCENE=$SCENE (0 primitives, 1 pit, 2 tight, 3 rolling, 4 spin, 5 denoise room)" >&2
        exit 1 ;;
 esac
 
@@ -62,6 +64,11 @@ esac
 PRECISION="${PRECISION:-32}"
 OUT="build/$NAME"
 [ "$PRECISION" = 64 ] && OUT="${OUT}_fp64"
+
+# The OptiX AI denoiser (src/viewer/denoiser_optix.h) is always compiled in.
+# Headers are vendored in src/external/optix (v9.1.0); the runtime is the
+# driver's libnvoptix.so.1, loaded through dlopen, hence -ldl.
+OPTIX_FLAGS=(-Isrc/external/optix -ldl)
 
 # Dear ImGui (vendored in src/external/imgui, pinned v1.92.8) is plain C++ —
 # nvcc hands the .cpp files to the host compiler. Its SDL2 backend does
@@ -73,5 +80,5 @@ nvcc src/viewer/viewer.cu \
     "$IMGUI"/imgui_widgets.cpp "$IMGUI"/imgui_impl_sdl2.cpp "$IMGUI"/imgui_impl_opengl2.cpp \
     -o "$OUT" -std=c++14 -arch="$ARCH" -rdc=true -Isrc -I"$IMGUI" $SDL_CFLAGS \
     -DRT_PRECISION="$PRECISION" -DVIEWER_SCENE="$SCENE" \
-    -lSDL2 -lGLEW -lGL -lnvidia-ml "$@"
+    -lSDL2 -lGLEW -lGL -lnvidia-ml "${OPTIX_FLAGS[@]}" "$@"
 echo "built $OUT (SCENE=$SCENE, RT_PRECISION=$PRECISION, log: $LOG)"
