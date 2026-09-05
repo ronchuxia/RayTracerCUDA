@@ -48,17 +48,18 @@
 #include "viewer/scenes/spin.h"
 
 // color/gbuffer -> RGBA8
-__global__ void tonemap_frame(const color* accum, gbuffer gb, int view, uchar4* out, int w, int h, int samples) {
+__global__ void tonemap_frame(const color* accum, gbuffer gb, int view, int rw, int rh,
+                              uchar4* out, int w, int h, int samples) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= w || j >= h) return;
-    int idx = j * w + i;
+    int idx = (j * rh / h) * rw + (i * rw / w);
     color c = view == 0 ? accum[idx]    // beauty
             : view == 1 ? gb.albedo[idx]    // albedo
             : real(0.5) * (gb.normal[idx] + real(samples) * vec3(1, 1, 1)); // normal
     unsigned char r, g, b;
     tonemap_pixel(c, samples, r, g, b);
-    out[idx] = make_uchar4(r, g, b, 255);
+    out[j * w + i] = make_uchar4(r, g, b, 255);
 }
 
 // frame accumulation
@@ -133,7 +134,9 @@ int main() {
     cam->defocus_angle = 0;
     cam->focus_dist    = 10.0;
     cam->initialize();
-    int W = cam->image_width, H = cam->image_height;
+    int W = cam->image_width, H = cam->image_height;    // window size
+    int RW = W, RH = H;                                 // render size
+    int render_div = 1;
 
     // SDL window and GL context
     SDL_Window* win = SDL_CreateWindow(
@@ -175,7 +178,7 @@ int main() {
     color* accum = nullptr;                  // accumulation buffer
     gbuffer gb;                              // denoiser guides
     curandState* rand_states = nullptr;
-    dim3 threads(16, 16), blocks;
+    dim3 threads(16, 16), blocks, blocks_out;   // trace grid, tonemap grid
 
     // rendering configs
     checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
@@ -197,11 +200,13 @@ int main() {
         checkCudaErrors(cudaFree(rand_states));
 
         W = w; H = h;
-        cam->image_width  = w;
-        cam->aspect_ratio = real(w) / (real(h) + real(0.5));
+        RW = W / render_div; RH = H / render_div;
+        cam->image_width  = RW;
+        cam->aspect_ratio = real(RW) / (real(RH) + real(0.5));
         cam->initialize();
         frame_bytes = (size_t)W * H * 4;
-        blocks = dim3((W + threads.x - 1) / threads.x, (H + threads.y - 1) / threads.y);
+        blocks     = dim3((RW + threads.x - 1) / threads.x, (RH + threads.y - 1) / threads.y);
+        blocks_out = dim3((W  + threads.x - 1) / threads.x, (H  + threads.y - 1) / threads.y);
         glViewport(0, 0, W, H);
 
         glBindTexture(GL_TEXTURE_2D, tex);
@@ -225,21 +230,21 @@ int main() {
         }
 
         // accumulation buffer
-        checkCudaErrors(cudaMalloc(&accum, (size_t)W * H * sizeof(color)));
-        checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
-        gb.allocate(W, H);
+        checkCudaErrors(cudaMalloc(&accum, (size_t)RW * RH * sizeof(color)));
+        checkCudaErrors(cudaMemset(accum, 0, (size_t)RW * RH * sizeof(color)));
+        gb.allocate(RW, RH);
         total_samples = 0;
 
         // rng
-        checkCudaErrors(cudaMalloc(&rand_states, (size_t)W * H * sizeof(curandState)));
-        initialize_rand<<<(W * H + 255) / 256, 256>>>(*cam, rand_states, rng_seed);
+        checkCudaErrors(cudaMalloc(&rand_states, (size_t)RW * RH * sizeof(curandState)));
+        initialize_rand<<<(RW * RH + 255) / 256, 256>>>(*cam, rand_states, rng_seed);
         checkCudaErrors(cudaDeviceSynchronize());
     };
     
     resize_frame(W, H);
 
-    fprintf(stderr, "viewer: rendering: %dx%d, %d spp/frame (target %d), depth %d\n",
-            W, H, spp_per_frame, target_samples, cam->max_depth);
+    fprintf(stderr, "viewer: rendering: %dx%d frame, %dx%d window, %d spp/frame (target %d), depth %d\n",
+            RW, RH, W, H, spp_per_frame, target_samples, cam->max_depth);
     fprintf(stderr, "viewer: presentation: %s\n",
             use_interop ? "CUDA-GL interop" : "CPU readback");
     fprintf(stderr, "viewer: controls: drag orbit, scroll zoom, shift-drag pan, R reset, ESC quit\n");
@@ -328,7 +333,7 @@ int main() {
     int vram_poll = 0;
 
     auto reset_accumulation = [&]() {
-        checkCudaErrors(cudaMemset(accum, 0, (size_t)W * H * sizeof(color)));
+        checkCudaErrors(cudaMemset(accum, 0, (size_t)RW * RH * sizeof(color)));
         gb.clear();
         total_samples = 0;
     };
@@ -407,7 +412,7 @@ int main() {
             else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) {
                 // picking
                 if (maybe_click && abs(e.button.x - press_x) <= 2 && abs(e.button.y - press_y) <= 2) {
-                    pick<<<1, 1>>>(*cam, world, e.button.x, e.button.y, pick_state, pick_result);
+                    pick<<<1, 1>>>(*cam, world, e.button.x * RW / W, e.button.y * RH / H, pick_state, pick_result);
                     checkCudaErrors(cudaDeviceSynchronize());
                     selected_id = *pick_result;
                 }
@@ -510,6 +515,11 @@ int main() {
             if (show_display) {
                 section_break();
                 ImGui::Combo("view", &view, "beauty\0albedo\0normal\0");
+                int div_idx = render_div - 1;
+                if (ImGui::Combo("render", &div_idx, "full\0half\0")) {
+                    render_div = div_idx + 1;
+                    resize_frame(W, H);
+                }
             }
 
             if (show_physics) {
@@ -693,11 +703,12 @@ int main() {
         }
 
         // overlays: world-space line segments projected through the camera
+        const float sx = (float)W / RW, sy = (float)H / RH;
         auto draw_line = [&](const point3& a, const point3& b, ImU32 col, float width) {
             real ax, ay, bx, by;
             if (cam->world_to_pixel(a, ax, ay) && cam->world_to_pixel(b, bx, by))
-                ImGui::GetForegroundDrawList()->AddLine(ImVec2((float)ax, (float)ay),
-                                                        ImVec2((float)bx, (float)by), col, width);
+                ImGui::GetForegroundDrawList()->AddLine(ImVec2((float)ax * sx, (float)ay * sy),
+                                                        ImVec2((float)bx * sx, (float)by * sy), col, width);
         };
         static const int edge[12][2] = {{0,1},{0,2},{0,4},{1,3},{1,5},{2,3},
                                         {2,6},{3,7},{4,5},{4,6},{5,7},{6,7}};
@@ -760,7 +771,7 @@ int main() {
             size_t nbytes = 0;
             checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo, 0));
             checkCudaErrors(cudaGraphicsResourceGetMappedPointer((void**)&dptr, &nbytes, cuda_pbo));
-            tonemap_frame<<<blocks, threads>>>(accum, gb, view, dptr, W, H, total_samples);
+            tonemap_frame<<<blocks_out, threads>>>(accum, gb, view, RW, RH, dptr, W, H, total_samples);
             checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo, 0));   // syncs the stream
 
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
@@ -769,7 +780,7 @@ int main() {
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         } else {    
             // CPU readback
-            tonemap_frame<<<blocks, threads>>>(accum, gb, view, d_rgba, W, H, total_samples);
+            tonemap_frame<<<blocks_out, threads>>>(accum, gb, view, RW, RH, d_rgba, W, H, total_samples);
             checkCudaErrors(cudaMemcpy(h_rgba, d_rgba, frame_bytes, cudaMemcpyDeviceToHost));
 
             glBindTexture(GL_TEXTURE_2D, tex);
