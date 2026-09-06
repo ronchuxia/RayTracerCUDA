@@ -51,7 +51,7 @@
 #include "viewer/scenes/denoise_room.h"
 
 // color/gbuffer -> RGBA8
-__global__ void tonemap_frame(const color* accum, gbuffer gb, int view, int rw, int rh,
+__global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, int view, int rw, int rh,
                               const float3* denoised,
                               uchar4* out, int w, int h, int samples) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -61,12 +61,19 @@ __global__ void tonemap_frame(const color* accum, gbuffer gb, int view, int rw, 
     real inv  = real(1) / samples;      // beauty samples
     real ginv = real(1) / gb.samples;   // G-buffer samples
     color c;
-    if (view == 1)      c = gb.albedo[idx] * ginv;                               // albedo
-    else if (view == 2) c = real(0.5) * (gb.normal[idx] * ginv + vec3(1, 1, 1)); // normal, [-1,1] -> [0,1]
+    if (view == 1)      c = gb.albedo[idx] * ginv;                                // albedo
+    else if (view == 2) c = real(0.5) * (gb.normal[idx] * ginv + vec3(1, 1, 1));  // normal, [-1,1] -> [0,1]
+    else if (view == 3) c = color(ff.flow[idx].x / 16 + 0.5, ff.flow[idx].y / 16 + 0.5, 0.5); // flow, ±16 px
+    else if (view == 4) c = color(ff.trust[idx], ff.trust[idx], ff.trust[idx]);   // trust mask
+    else if (view == 5) c = color(1, 1, 1) / (real(1) + ff.depth[idx]);           // depth, near = white
+    else if (view == 6) c = ff.id[idx] < 0 ? color(0, 0, 0)                       // id
+                          : color(((ff.id[idx] + 1) * 97 % 256) / 255.0, 
+                                  ((ff.id[idx] + 1) * 57 % 256) / 255.0,
+                                  ((ff.id[idx] + 1) * 37 % 256) / 255.0);
     else if (denoised)  c = color(denoised[j * w + i].x, denoised[j * w + i].y, denoised[j * w + i].z); // denoised
     else                c = accum[idx] * inv;                                    // beauty
     unsigned char r, g, b;
-    tonemap_pixel(c, 1, r, g, b, view != 2);
+    tonemap_pixel(c, 1, r, g, b, view <= 1);
     out[j * w + i] = make_uchar4(r, g, b, 255);
 }
 
@@ -199,13 +206,30 @@ int main() {
     int view = 0;                            // displayed buffer: 0 beauty, 1 albedo, 2 normal
 
     // denoiser
-    enum { DENOISE_OFF = 0, DENOISE_OPTIX_AOV = 1 };
+    enum { DENOISE_OFF = 0, DENOISE_OPTIX_AOV = 1, DENOISE_OPTIX_TEMPORAL = 2 };
     int   denoise_mode = DENOISE_OFF;
     auto  upscale_factor = [&]() { return 1; };
     bool  guide_albedo = true;
     bool  guide_normal = true;
     float blend = 0.0f;                      // 0 = fully denoised, 1 = untouched input
-    std::unique_ptr<denoiser> dn = std::make_unique<optix_denoiser>(guide_albedo, guide_normal);
+
+    auto  make_denoiser = [&]() {
+        auto kind = denoise_mode == DENOISE_OPTIX_TEMPORAL ? OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV
+                                                           : OPTIX_DENOISER_MODEL_KIND_AOV;
+        return std::make_unique<optix_denoiser>(guide_albedo, guide_normal, kind);
+    };
+    std::unique_ptr<denoiser> dn = make_denoiser();
+
+    // temporal denoiser buffers
+    flow_field ff;
+    camera prev_cam = *cam;
+    const transform** tr;                     // by scene id, live
+    transform* tr_prev;                       // by scene id, previous frame
+    checkCudaErrors(cudaMallocManaged((void**)&tr,      sc.objects.size() * sizeof(transform*)));
+    checkCudaErrors(cudaMallocManaged((void**)&tr_prev, sc.objects.size() * sizeof(transform)));
+    
+    for (int id = 0; id < (int)sc.objects.size(); id++)
+        tr[id] = static_cast<const transform*>(sc.get(id)->object);
 
     unsigned long rng_seed = (cam->seed < 0) ? (unsigned long)time(0) : (unsigned long)cam->seed;
 
@@ -253,6 +277,7 @@ int main() {
         checkCudaErrors(cudaMalloc(&accum, (size_t)RW * RH * sizeof(color)));
         checkCudaErrors(cudaMemset(accum, 0, (size_t)RW * RH * sizeof(color)));
         gb.allocate(RW, RH);
+        ff.allocate(RW, RH);
         dn->setup(RW, RH, W, H);
         total_samples = 0;
 
@@ -301,7 +326,10 @@ int main() {
     checkCudaErrors(cudaEventCreate(&ev_trace0));
     checkCudaErrors(cudaEventCreate(&ev_trace1));
     float ms_trace = 0.0f;
-    cudaEvent_t ev_dn0, ev_dn1;
+    cudaEvent_t ev_dn0, ev_dn1, ev_flow0, ev_flow1;
+    checkCudaErrors(cudaEventCreate(&ev_flow0));
+    checkCudaErrors(cudaEventCreate(&ev_flow1));
+    float ms_flow = 0.0f;
     checkCudaErrors(cudaEventCreate(&ev_dn0));
     checkCudaErrors(cudaEventCreate(&ev_dn1));
     float ms_denoise = 0.0f;
@@ -394,6 +422,8 @@ int main() {
         bodies = initial_bodies;
         sc.refit();
         reset_accumulation();
+        ff.reset_history();
+        dn->reset_history();
         phys_accum = 0.0; still_steps = 0; asleep = false; playing = false;
     };
 
@@ -509,6 +539,7 @@ int main() {
                 ImGui::Text("%.0f fps", io.Framerate);
                 ImGui::Text("frame   %6.2f ms", io.DeltaTime * 1000.0f);
                 ImGui::Text("trace   %6.2f ms", ms_trace);
+                ImGui::Text("flow    %6.2f ms", ms_flow);
                 ImGui::Text("denoise %6.2f ms", ms_denoise);
                 if (nvml_ok && vram_poll++ % 30 == 0) {
                     unsigned int n = 64;
@@ -541,17 +572,15 @@ int main() {
 
             if (show_display) {
                 section_break();
-                ImGui::Combo("view", &view, "beauty\0albedo\0normal\0");
-                if (ImGui::Combo("denoiser", &denoise_mode, "off\0optix aov\0")) {
-                    if (RW != W / upscale_factor()) resize_frame(W, H);
-                    denoise_dirty = true;
-                }
+                ImGui::Combo("view", &view, "beauty\0albedo\0normal\0flow\0trust\0depth\0id\0");
+                bool remake_denoiser = ImGui::Combo("denoiser", &denoise_mode, "off\0optix aov\0optix temporal\0");
+                remake_denoiser |= ImGui::Checkbox("albedo guide", &guide_albedo);
+                remake_denoiser |= ImGui::Checkbox("normal guide", &guide_normal);
                 if (ImGui::SliderFloat("blend", &blend, 0.0f, 1.0f)) denoise_dirty = true;
-                bool guides_changed = ImGui::Checkbox("albedo guide", &guide_albedo);
-                guides_changed     |= ImGui::Checkbox("normal guide", &guide_normal);
-                if (guides_changed) {
-                    dn = std::make_unique<optix_denoiser>(guide_albedo, guide_normal);
-                    dn->setup(RW, RH, W, H);
+                if (remake_denoiser) {
+                    dn = make_denoiser();
+                    if (RW != W / upscale_factor()) resize_frame(W, H);   // resize_frame runs dn->setup
+                    else dn->setup(RW, RH, W, H);
                     denoise_dirty = true;
                 }
             }
@@ -788,11 +817,14 @@ int main() {
             }
         }
 
+        // views
+        bool guide_view = view == 1 || view == 2;
+        bool data_view  = view >= 3;
+
         // frame accumulation
-        bool guide_view = view != 0;
         bool did_trace = false;
         bool did_accumulate = false;
-        if ((guide_view ? gb.samples : total_samples) < target_samples) {
+        if (!data_view && (guide_view ? gb.samples : total_samples) < target_samples) {
             checkCudaErrors(cudaEventRecord(ev_trace0));
             accumulate_frame<<<blocks, threads>>>(
                 *cam, 
@@ -809,11 +841,20 @@ int main() {
             gb.samples += spp_per_frame;
         }
 
+        // flow
+        bool did_flow = false;
+        if (data_view || (denoise_mode == DENOISE_OPTIX_TEMPORAL && (did_accumulate || denoise_dirty))) {
+            checkCudaErrors(cudaEventRecord(ev_flow0));
+            flow_frame<<<blocks, threads>>>(*cam, prev_cam, world, tr, tr_prev, rand_states, ff, RW, RH);
+            checkCudaErrors(cudaEventRecord(ev_flow1));
+            did_flow = true;
+        }
+
         // denoise
         bool did_denoise = false;
         if (denoise_mode != DENOISE_OFF && !guide_view && (denoise_dirty || did_accumulate)) {
             checkCudaErrors(cudaEventRecord(ev_dn0));
-            dn->invoke(accum, gb, total_samples, blend);
+            dn->invoke(accum, gb, total_samples, blend, ff);
             checkCudaErrors(cudaEventRecord(ev_dn1));
             did_denoise = true;
             denoise_dirty = false;
@@ -827,7 +868,7 @@ int main() {
             size_t nbytes = 0;
             checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo, 0));
             checkCudaErrors(cudaGraphicsResourceGetMappedPointer((void**)&dptr, &nbytes, cuda_pbo));
-            tonemap_frame<<<blocks_out, threads>>>(accum, gb, view, RW, RH, denoised, dptr, W, H, total_samples);
+            tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, view, RW, RH, denoised, dptr, W, H, total_samples);
             checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo, 0));   // syncs the stream
 
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
@@ -836,7 +877,7 @@ int main() {
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         } else {    
             // CPU readback
-            tonemap_frame<<<blocks_out, threads>>>(accum, gb, view, RW, RH, denoised, d_rgba, W, H, total_samples);
+            tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, view, RW, RH, denoised, d_rgba, W, H, total_samples);
             checkCudaErrors(cudaMemcpy(h_rgba, d_rgba, frame_bytes, cudaMemcpyDeviceToHost));
 
             glBindTexture(GL_TEXTURE_2D, tex);
@@ -854,6 +895,16 @@ int main() {
             checkCudaErrors(cudaEventElapsedTime(&ms_denoise, ev_dn0, ev_dn1));
         } else {
             ms_denoise = 0.0f;
+        }
+        if (did_flow) {
+            checkCudaErrors(cudaEventSynchronize(ev_flow1));
+            checkCudaErrors(cudaEventElapsedTime(&ms_flow, ev_flow0, ev_flow1));
+            for (int id = 0; id < (int)sc.objects.size(); id++)
+                tr_prev[id] = *tr[id];
+            prev_cam = *cam;
+            ff.advance();
+        } else {
+            ms_flow = 0.0f;
         }
 
         // draw a fullscreen textured quad
@@ -884,6 +935,8 @@ int main() {
     cudaEventDestroy(ev_trace1);
     cudaEventDestroy(ev_dn0);
     cudaEventDestroy(ev_dn1);
+    cudaEventDestroy(ev_flow0);
+    cudaEventDestroy(ev_flow1);
     ImGui_ImplOpenGL2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
@@ -891,6 +944,9 @@ int main() {
     if (h_rgba) cudaFreeHost(h_rgba);
     cudaFree(accum);
     gb.release();
+    ff.release();
+    cudaFree(tr_prev);
+    cudaFree(tr);
     cudaFree(rand_states);
     cudaFree(cam);
     sc.release();
