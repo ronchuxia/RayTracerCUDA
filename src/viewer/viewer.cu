@@ -206,16 +206,21 @@ int main() {
     int view = 0;                            // displayed buffer: 0 beauty, 1 albedo, 2 normal
 
     // denoiser
-    enum { DENOISE_OFF = 0, DENOISE_OPTIX_AOV = 1, DENOISE_OPTIX_TEMPORAL = 2 };
+    enum { DENOISE_OFF = 0, DENOISE_OPTIX_AOV = 1, DENOISE_OPTIX_TEMPORAL = 2,
+           DENOISE_OPTIX_UPSCALE = 3, DENOISE_OPTIX_TEMPORAL_UPSCALE = 4 };
     int   denoise_mode = DENOISE_OFF;
-    auto  upscale_factor = [&]() { return 1; };
+    auto  upscale_factor = [&]() { return denoise_mode >= DENOISE_OPTIX_UPSCALE ? 2 : 1; };
+    auto  temporal_mode  = [&]() { return denoise_mode == DENOISE_OPTIX_TEMPORAL || denoise_mode == DENOISE_OPTIX_TEMPORAL_UPSCALE; };
     bool  guide_albedo = true;
     bool  guide_normal = true;
     float blend = 0.0f;                      // 0 = fully denoised, 1 = untouched input
 
     auto  make_denoiser = [&]() {
-        auto kind = denoise_mode == DENOISE_OPTIX_TEMPORAL ? OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV
-                                                           : OPTIX_DENOISER_MODEL_KIND_AOV;
+        OptixDenoiserModelKind kind =
+            denoise_mode == DENOISE_OPTIX_TEMPORAL         ? OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV :
+            denoise_mode == DENOISE_OPTIX_UPSCALE          ? OPTIX_DENOISER_MODEL_KIND_UPSCALE2X :
+            denoise_mode == DENOISE_OPTIX_TEMPORAL_UPSCALE ? OPTIX_DENOISER_MODEL_KIND_TEMPORAL_UPSCALE2X :
+                                                             OPTIX_DENOISER_MODEL_KIND_AOV;
         return std::make_unique<optix_denoiser>(guide_albedo, guide_normal, kind);
     };
     std::unique_ptr<denoiser> dn = make_denoiser();
@@ -243,15 +248,16 @@ int main() {
         checkCudaErrors(cudaFree(accum));
         checkCudaErrors(cudaFree(rand_states));
 
-        W = w; H = h;
-        RW = W / upscale_factor(); RH = H / upscale_factor();
+        int f = upscale_factor();
+        W = w / f * f; H = h / f * f;
+        RW = W / f; RH = H / f;
         cam->image_width  = RW;
         cam->aspect_ratio = real(RW) / (real(RH) + real(0.5));
         cam->initialize();
         frame_bytes = (size_t)W * H * 4;
         blocks     = dim3((RW + threads.x - 1) / threads.x, (RH + threads.y - 1) / threads.y);
         blocks_out = dim3((W  + threads.x - 1) / threads.x, (H  + threads.y - 1) / threads.y);
-        glViewport(0, 0, W, H);
+        glViewport(0, 0, w, h);
 
         glBindTexture(GL_TEXTURE_2D, tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
@@ -573,13 +579,17 @@ int main() {
             if (show_display) {
                 section_break();
                 ImGui::Combo("view", &view, "beauty\0albedo\0normal\0flow\0trust\0depth\0id\0");
-                bool remake_denoiser = ImGui::Combo("denoiser", &denoise_mode, "off\0optix aov\0optix temporal\0");
+                bool remake_denoiser = ImGui::Combo("denoiser", &denoise_mode, "off\0optix aov\0optix temporal\0optix upscale2x\0optix temporal upscale2x\0");
                 remake_denoiser |= ImGui::Checkbox("albedo guide", &guide_albedo);
                 remake_denoiser |= ImGui::Checkbox("normal guide", &guide_normal);
                 if (ImGui::SliderFloat("blend", &blend, 0.0f, 1.0f)) denoise_dirty = true;
                 if (remake_denoiser) {
                     dn = make_denoiser();
-                    if (RW != W / upscale_factor()) resize_frame(W, H);   // resize_frame runs dn->setup
+                    if (RW != W / upscale_factor()) {                     // resize_frame runs dn->setup
+                        int w, h; 
+                        SDL_GetWindowSize(win, &w, &h);
+                        resize_frame(w, h);
+                    }
                     else dn->setup(RW, RH, W, H);
                     denoise_dirty = true;
                 }
@@ -843,7 +853,7 @@ int main() {
 
         // flow
         bool did_flow = false;
-        if (data_view || (denoise_mode == DENOISE_OPTIX_TEMPORAL && (did_accumulate || denoise_dirty))) {
+        if (data_view || (temporal_mode() && (did_accumulate || denoise_dirty))) {
             checkCudaErrors(cudaEventRecord(ev_flow0));
             flow_frame<<<blocks, threads>>>(*cam, prev_cam, world, tr, tr_prev, rand_states, ff, RW, RH);
             checkCudaErrors(cudaEventRecord(ev_flow1));
