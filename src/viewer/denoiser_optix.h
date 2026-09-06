@@ -88,6 +88,7 @@ struct optix_denoiser : denoiser {
             checkCudaErrors(cudaMalloc(&prev_output, nout * sizeof(float3)));
             checkCudaErrors(cudaMalloc(&ig_prev, nout * sizes.internalGuideLayerPixelSizeInBytes));
             checkCudaErrors(cudaMalloc(&ig_cur,  nout * sizes.internalGuideLayerPixelSizeInBytes));
+            checkCudaErrors(cudaMemset(ig_prev, 0, nout * sizes.internalGuideLayerPixelSizeInBytes));
             checkCudaErrors(cudaMalloc(&distrust, nin * sizeof(float)));
         }
         history = false;
@@ -106,7 +107,10 @@ struct optix_denoiser : denoiser {
         return im;
     }
 
-    void reset_history() override { history = false; }
+    void reset_history() override {
+        if (temporal) checkCudaErrors(cudaMemset(ig_prev, 0, (size_t)out_w * out_h * sizes.internalGuideLayerPixelSizeInBytes));
+        history = false;
+    }
 
     void invoke(const color* accum, const gbuffer& gb, int samples, float blend, const flow_field& ff) override {
         int n = in_w * in_h;
