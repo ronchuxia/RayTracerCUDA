@@ -187,7 +187,8 @@ int main() {
     bool  guide_normal = true;
     float blend = 0.0f;                      // 0 = fully denoised, 1 = untouched input
 
-    auto  make_denoiser = [&]() {
+    auto  make_denoiser = [&]() -> std::unique_ptr<denoiser> {
+        if (denoise_mode == DENOISE_OFF) return nullptr;
         OptixDenoiserModelKind kind =
             denoise_mode == DENOISE_OPTIX_TEMPORAL         ? OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV :
             denoise_mode == DENOISE_OPTIX_UPSCALE          ? OPTIX_DENOISER_MODEL_KIND_UPSCALE2X :
@@ -231,7 +232,7 @@ int main() {
         checkCudaErrors(cudaMemset(accum, 0, (size_t)RW * RH * sizeof(color)));
         gb.allocate(RW, RH);
         ff.allocate(RW, RH);
-        dn->setup(RW, RH, W, H);
+        if (dn) dn->setup(RW, RH, W, H);
         total_samples = 0;
 
         // rng
@@ -376,7 +377,7 @@ int main() {
         sc.refit();
         reset_accumulation();
         ff.reset_history();
-        dn->reset_history();
+        if (dn) dn->reset_history();
         phys_accum = 0.0; still_steps = 0; asleep = false; playing = false;
     };
 
@@ -537,7 +538,7 @@ int main() {
                         SDL_GetWindowSize(win, &w, &h);
                         resize_frame(w, h);
                     }
-                    else dn->setup(RW, RH, W, H);
+                    else if (dn) dn->setup(RW, RH, W, H);
                     denoise_dirty = true;
                 }
             }
@@ -809,14 +810,14 @@ int main() {
 
         // denoise
         bool did_denoise = false;
-        if (denoise_mode != DENOISE_OFF && !guide_view && (denoise_dirty || did_accumulate)) {
+        if (dn && !guide_view && (denoise_dirty || did_accumulate)) {
             checkCudaErrors(cudaEventRecord(ev_dn0));
             dn->invoke(accum, gb, total_samples, blend, ff);
             checkCudaErrors(cudaEventRecord(ev_dn1));
             did_denoise = true;
             denoise_dirty = false;
         }
-        const float3* denoised = denoise_mode != DENOISE_OFF ? dn->output : nullptr;
+        const float3* denoised = dn ? dn->output : nullptr;
 
         // tonemap into the presented frame
         tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, view, RW, RH, denoised, vk.frame_target(), W, H, total_samples);
