@@ -13,7 +13,7 @@
 #   4       spinning earth balls, friction 0.5      build/viewer_spin
 #   5       denoiser evaluation room                build/viewer_denoise
 #
-# Needs SDL2 + GLEW + OpenGL dev libraries; no display required to build.
+# Needs SDL2 + Vulkan dev libraries (libvulkan-dev); no display required to build.
 # Full output (incl. nvcc/ptxas warnings) is teed to build/build_viewer.log
 # and still shown on the terminal; override the path with LOG=...
 #   scripts/build_viewer.sh                                       # scene 0, auto-detect GPU arch
@@ -77,8 +77,8 @@ SDL_CFLAGS=$(pkg-config --cflags sdl2)
 IMGUI=src/external/imgui
 nvcc src/viewer/viewer.cu \
     "$IMGUI"/imgui.cpp "$IMGUI"/imgui_draw.cpp "$IMGUI"/imgui_tables.cpp \
-    "$IMGUI"/imgui_widgets.cpp "$IMGUI"/imgui_impl_sdl2.cpp "$IMGUI"/imgui_impl_opengl2.cpp \
+    "$IMGUI"/imgui_widgets.cpp "$IMGUI"/imgui_impl_sdl2.cpp "$IMGUI"/imgui_impl_vulkan.cpp \
     -o "$OUT" -std=c++14 -arch="$ARCH" -rdc=true -Isrc -I"$IMGUI" $SDL_CFLAGS \
     -DRT_PRECISION="$PRECISION" -DVIEWER_SCENE="$SCENE" \
-    -lSDL2 -lGLEW -lGL -lnvidia-ml "${OPTIX_FLAGS[@]}" "$@"
+    -lSDL2 -lvulkan -lnvidia-ml "${OPTIX_FLAGS[@]}" "$@"
 echo "built $OUT (SCENE=$SCENE, RT_PRECISION=$PRECISION, log: $LOG)"

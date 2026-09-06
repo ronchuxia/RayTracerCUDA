@@ -1,15 +1,13 @@
 // interactive real-time viewer
 
-#include <GL/glew.h>
 #include <SDL2/SDL.h>
-#include <cuda_gl_interop.h>
 #include <nvml.h>       // per-process VRAM query
 #include <unistd.h>     // getpid()
 
 // Dear ImGui v1.92.8
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
-#include "imgui_impl_opengl2.h"
+#include "viewer/present_vk.h"
 
 #include <cstdio>
 #include <ctime>
@@ -114,10 +112,6 @@ int main() {
         fprintf(stderr, "SDL_Init(SDL_INIT_VIDEO) failed: %s\n", SDL_GetError());
         return 1;
     }
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-
     // scene
     scene sc;
 #if VIEWER_SCENE == 5
@@ -155,43 +149,21 @@ int main() {
     int W = cam->image_width, H = cam->image_height;    // window size
     int RW = W, RH = H;                                 // render size = window / the denoiser's upscale factor
 
-    // SDL window and GL context
+    // SDL window, Vulkan presentation, Dear ImGui
     SDL_Window* win = SDL_CreateWindow(
         "RayTracingCUDA Viewer",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H,
-        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+        SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!win) { fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError()); return 1; }
-    SDL_GLContext gl = SDL_GL_CreateContext(win);
-    if (!gl) { fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError()); return 1; }
-
-    glewExperimental = GL_TRUE;
-    GLenum ge = glewInit();
-    if (ge != GLEW_OK) { fprintf(stderr, "glewInit failed: %s\n", glewGetErrorString(ge)); return 1; }
-
-    fprintf(stderr, "viewer: GL vendor: %s\n", (const char*)glGetString(GL_VENDOR));
-    fprintf(stderr, "viewer: renderer: %s\n", (const char*)glGetString(GL_RENDERER));
-
-    // Dear ImGui
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
-    ImGui_ImplSDL2_InitForOpenGL(win, gl);
-    ImGui_ImplOpenGL2_Init();
-
-    // GL texture
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    ImGui_ImplSDL2_InitForVulkan(win);
+    present_vk vk;
+    vk.init(win);
+    fprintf(stderr, "viewer: Vulkan device: %s%s\n", vk.device_name, vk.same_gpu ? " (the CUDA device)" : " (NOT the CUDA device)");
 
     // frame resources
-    size_t frame_bytes = 0;
-    GLuint pbo = 0;                          // CUDA-GL interop path
-    cudaGraphicsResource* cuda_pbo = nullptr;
-    bool use_interop = false;
-    uchar4* d_rgba = nullptr;                // CPU readback path
-    uchar4* h_rgba = nullptr;
     color* accum = nullptr;                  // accumulation buffer
     gbuffer gb;                              // denoiser guides
     curandState* rand_states = nullptr;
@@ -241,10 +213,6 @@ int main() {
     auto resize_frame = [&](int w, int h) {
         // release stale frame resources
         checkCudaErrors(cudaDeviceSynchronize());
-        if (cuda_pbo) { checkCudaErrors(cudaGraphicsUnregisterResource(cuda_pbo)); cuda_pbo = nullptr; }
-        glDeleteBuffers(1, &pbo); pbo = 0;
-        if (d_rgba) { checkCudaErrors(cudaFree(d_rgba)); d_rgba = nullptr; }
-        if (h_rgba) { checkCudaErrors(cudaFreeHost(h_rgba)); h_rgba = nullptr; }
         checkCudaErrors(cudaFree(accum));
         checkCudaErrors(cudaFree(rand_states));
 
@@ -254,30 +222,9 @@ int main() {
         cam->image_width  = RW;
         cam->aspect_ratio = real(RW) / (real(RH) + real(0.5));
         cam->initialize();
-        frame_bytes = (size_t)W * H * 4;
         blocks     = dim3((RW + threads.x - 1) / threads.x, (RH + threads.y - 1) / threads.y);
         blocks_out = dim3((W  + threads.x - 1) / threads.x, (H  + threads.y - 1) / threads.y);
-        glViewport(0, 0, w, h);
-
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
-
-        // present path
-        glGenBuffers(1, &pbo);
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-        glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)frame_bytes, 0, GL_DYNAMIC_DRAW);
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-        cudaError_t err = cudaGraphicsGLRegisterBuffer(&cuda_pbo, pbo, cudaGraphicsMapFlagsWriteDiscard);
-        use_interop = (err == cudaSuccess);
-        if (!use_interop) {
-            cudaGetLastError();
-            fprintf(stderr, "viewer: CUDA-GL interop unavailable (%s), using CPU readback.\n", cudaGetErrorString(err));
-            glDeleteBuffers(1, &pbo);
-            pbo = 0;
-            checkCudaErrors(cudaMalloc(&d_rgba, frame_bytes));
-            checkCudaErrors(cudaMallocHost(&h_rgba, frame_bytes));
-        }
+        vk.resize(W, H);
 
         // accumulation buffer
         checkCudaErrors(cudaMalloc(&accum, (size_t)RW * RH * sizeof(color)));
@@ -298,7 +245,7 @@ int main() {
     fprintf(stderr, "viewer: rendering: %dx%d frame, %dx%d window, %d spp/frame (target %d), depth %d\n",
             RW, RH, W, H, spp_per_frame, target_samples, cam->max_depth);
     fprintf(stderr, "viewer: presentation: %s\n",
-            use_interop ? "CUDA-GL interop" : "CPU readback");
+            vk.interop ? "CUDA-Vulkan interop" : "CPU readback");
     fprintf(stderr, "viewer: controls: drag orbit, scroll zoom, shift-drag pan, R reset, ESC quit\n");
 
     // camera orbit state
@@ -509,7 +456,7 @@ int main() {
         }
 
         // UI
-        ImGui_ImplOpenGL2_NewFrame();
+        ImGui_ImplVulkan_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
@@ -871,28 +818,8 @@ int main() {
         }
         const float3* denoised = denoise_mode != DENOISE_OFF ? dn->output : nullptr;
 
-        // presentation
-        if (use_interop) {  
-            // CUDA-GL interop
-            uchar4* dptr = nullptr;
-            size_t nbytes = 0;
-            checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo, 0));
-            checkCudaErrors(cudaGraphicsResourceGetMappedPointer((void**)&dptr, &nbytes, cuda_pbo));
-            tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, view, RW, RH, denoised, dptr, W, H, total_samples);
-            checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo, 0));   // syncs the stream
-
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-            glBindTexture(GL_TEXTURE_2D, tex);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, 0);
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-        } else {    
-            // CPU readback
-            tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, view, RW, RH, denoised, d_rgba, W, H, total_samples);
-            checkCudaErrors(cudaMemcpy(h_rgba, d_rgba, frame_bytes, cudaMemcpyDeviceToHost));
-
-            glBindTexture(GL_TEXTURE_2D, tex);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, h_rgba);
-        }
+        // tonemap into the presented frame
+        tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, view, RW, RH, denoised, vk.frame_target(), W, H, total_samples);
 
         if (did_trace) {
             checkCudaErrors(cudaEventSynchronize(ev_trace1));
@@ -917,24 +844,8 @@ int main() {
             ms_flow = 0.0f;
         }
 
-        // draw a fullscreen textured quad
-        glClear(GL_COLOR_BUFFER_BIT);
-        glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glBegin(GL_QUADS);
-            glTexCoord2f(0, 0); glVertex2f(-1,  1);
-            glTexCoord2f(1, 0); glVertex2f( 1,  1);
-            glTexCoord2f(1, 1); glVertex2f( 1, -1);
-            glTexCoord2f(0, 1); glVertex2f(-1, -1);
-        glEnd();
-        glDisable(GL_TEXTURE_2D);
-
-        // UI
         ImGui::Render();
-        ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
-
-        // present the rendered back buffer to the window
-        SDL_GL_SwapWindow(win);
+        vk.present(ImGui::GetDrawData());
     }
 
     // cleanup
@@ -947,11 +858,9 @@ int main() {
     cudaEventDestroy(ev_dn1);
     cudaEventDestroy(ev_flow0);
     cudaEventDestroy(ev_flow1);
-    ImGui_ImplOpenGL2_Shutdown();
+    vk.release();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
-    if (d_rgba) cudaFree(d_rgba);
-    if (h_rgba) cudaFreeHost(h_rgba);
     cudaFree(accum);
     gb.release();
     ff.release();
@@ -960,10 +869,6 @@ int main() {
     cudaFree(rand_states);
     cudaFree(cam);
     sc.release();
-    if (cuda_pbo) cudaGraphicsUnregisterResource(cuda_pbo);
-    if (pbo) glDeleteBuffers(1, &pbo);
-    glDeleteTextures(1, &tex);
-    SDL_GL_DeleteContext(gl);
     SDL_DestroyWindow(win);
     SDL_Quit();
     return 0;
