@@ -161,10 +161,14 @@ struct camera {
 
         // optional out-parameter of ray_color
         struct first_hit {
-            color albedo;
-            vec3  normal;
-            real  t;
-            int   id;
+            color  albedo;
+            vec3   normal;
+            real   t;
+            int    id;         // scene_id, -1 on miss
+            point3 p;          // hit point
+            color  diffuse;    // material::diffuse_albedo()  (DLSS diffuse albedo)
+            color  f0;         // material::specular_f0()     (DLSS specular F0)
+            real   roughness;  // material::roughness()
         };
 
         __device__ color ray_color(ray r, const hittable& world, int max_depth, curandState* state,
@@ -182,14 +186,14 @@ struct camera {
 
                     if (rec.mat->scatter(current_ray, rec, attenuation, scattered, state)) {
                         // If material scatters, accumulate attenuation, add emitted light and continue
-                        if (first && i == 0) *first = { attenuation, rec.normal, rec.t, rec.id };
+                        if (first && i == 0) *first = { attenuation, rec.normal, rec.t, rec.id, rec.p, rec.mat->diffuse_albedo(rec), rec.mat->specular_f0(), rec.mat->roughness() };
                         throughput *= attenuation;
                         current_color += throughput * emit;
                         current_ray = scattered;
                     }
                     else {
                         // If material doesn't scatter, add emitted light and terminate
-                        if (first && i == 0) *first = { color(1,1,1), rec.normal, rec.t, rec.id };
+                        if (first && i == 0) *first = { color(1,1,1), rec.normal, rec.t, rec.id, rec.p, rec.mat->diffuse_albedo(rec), rec.mat->specular_f0(), rec.mat->roughness() };
                         current_color += throughput * emit;
                         break;
                     }
@@ -203,7 +207,7 @@ struct camera {
 #else
                     color background = color(0,0,0);
 #endif
-                    if (first && i == 0) *first = { background, vec3(0,0,0), infinity, -1 };
+                    if (first && i == 0) *first = { background, vec3(0,0,0), infinity, -1, current_ray.origin() + unit_vector(current_ray.direction()) * real(1e4), color(0,0,0), color(0,0,0), 1 };
                     current_color += throughput * background;
                     break;
                 }

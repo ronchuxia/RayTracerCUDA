@@ -40,6 +40,7 @@
 #include "physics.h"
 #include "viewer/scene.h"
 #include "viewer/gbuffer.h"
+#include "viewer/primary_hits.h"
 #include "viewer/denoiser_optix.h"
 #include "scenes/scene_utils.h"
 #include "viewer/physics_utils.h"
@@ -49,7 +50,7 @@
 #include "viewer/scenes/denoise_room.h"
 
 // color/gbuffer -> RGBA8
-__global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, int view, int rw, int rh,
+__global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, primary_hits ph, int view, int rw, int rh,
                               const float3* denoised,
                               uchar4* out, int w, int h, int samples) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -68,16 +69,20 @@ __global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, int
                           : color(((ff.id[idx] + 1) * 97 % 256) / 255.0, 
                                   ((ff.id[idx] + 1) * 57 % 256) / 255.0,
                                   ((ff.id[idx] + 1) * 37 % 256) / 255.0);
+    else if (view == 7) c = ph.diffuse[idx];                                      // hit diffuse
+    else if (view == 8) c = ph.f0[idx];                                           // hit f0
+    else if (view == 9) c = color(1, 1, 1) * ph.roughness[idx];                   // hit roughness
+    else if (view == 10) c = color(1, 1, 1) / (real(1) + ph.depth[idx]);          // hit depth (axial)
     else if (denoised)  c = color(denoised[j * w + i].x, denoised[j * w + i].y, denoised[j * w + i].z); // denoised
     else                c = accum[idx] * inv;                                    // beauty
     unsigned char r, g, b;
-    tonemap_pixel(c, 1, r, g, b, view <= 1);
+    tonemap_pixel(c, 1, r, g, b, view <= 1 || view == 7 || view == 8);           // colours get gamma, data views not
     out[j * w + i] = make_uchar4(r, g, b, 255);
 }
 
 // frame accumulation
 __global__ void accumulate_frame(const camera& cam, int max_depth, const hittable& world,
-                                 color* accum, gbuffer gb, curandState* rand_states, int spp) {
+                                 color* accum, gbuffer gb, primary_hits ph, curandState* rand_states, int spp) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= cam.image_width || j >= cam.image_height) return;
@@ -85,14 +90,22 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
     int pixel_index = j * cam.image_width + i;
     curandState* rand_state = &rand_states[pixel_index];
 
+    camera::first_hit fh;
     for (int sample = 0; sample < spp; ++sample) {
         ray r = cam.get_ray(i, j, rand_state);
-        camera::first_hit fh;
         color c = cam.ray_color(r, world, max_depth, rand_state, &fh);
         if (accum) accum[pixel_index] += c;
         gb.albedo[pixel_index] += fh.albedo;
         gb.normal[pixel_index] += fh.normal;
     }
+    // the last sample's primary hit
+    ph.p[pixel_index]         = fh.p;
+    ph.id[pixel_index]        = fh.id;
+    ph.normal[pixel_index]    = fh.normal;
+    ph.diffuse[pixel_index]   = fh.diffuse;
+    ph.f0[pixel_index]        = fh.f0;
+    ph.roughness[pixel_index] = fh.roughness;
+    ph.depth[pixel_index]     = fh.id < 0 ? infinity : dot(fh.p - cam.center, -cam.w);
 }
 
 // object picking
@@ -165,7 +178,8 @@ int main() {
 
     // frame resources
     color* accum = nullptr;                  // accumulation buffer
-    gbuffer gb;                              // denoiser guides
+    gbuffer gb;                              // optix guides
+    primary_hits ph;                         // dlss guides
     curandState* rand_states = nullptr;
     dim3 threads(16, 16), blocks, blocks_out;   // trace grid, tonemap grid
 
@@ -231,6 +245,7 @@ int main() {
         checkCudaErrors(cudaMalloc(&accum, (size_t)RW * RH * sizeof(color)));
         checkCudaErrors(cudaMemset(accum, 0, (size_t)RW * RH * sizeof(color)));
         gb.allocate(RW, RH);
+        ph.allocate(RW, RH);
         ff.allocate(RW, RH);
         if (dn) dn->setup(RW, RH, W, H);
         total_samples = 0;
@@ -526,7 +541,7 @@ int main() {
 
             if (show_display) {
                 section_break();
-                ImGui::Combo("view", &view, "beauty\0albedo\0normal\0flow\0trust\0depth\0id\0");
+                ImGui::Combo("view", &view, "beauty\0albedo\0normal\0flow\0trust\0depth\0id\0diffuse\0f0\0roughness\0depth (axial)\0");
                 bool remake_denoiser = ImGui::Combo("denoiser", &denoise_mode, "off\0optix aov\0optix temporal\0optix upscale2x\0optix temporal upscale2x\0");
                 remake_denoiser |= ImGui::Checkbox("albedo guide", &guide_albedo);
                 remake_denoiser |= ImGui::Checkbox("normal guide", &guide_normal);
@@ -775,9 +790,10 @@ int main() {
             }
         }
 
-        // views
-        bool guide_view = view == 1 || view == 2;
-        bool data_view  = view >= 3;
+        // views: 1-2 G-buffer guides and 7-10 the primary-hit record trace first hits only;
+        // 3-6 show the flow field and run only the flow kernel
+        bool guide_view = view == 1 || view == 2 || view >= 7;
+        bool data_view  = view >= 3 && view <= 6;
 
         // frame accumulation
         bool did_trace = false;
@@ -790,6 +806,7 @@ int main() {
                 world,
                 guide_view ? nullptr : accum, 
                 gb, 
+                ph,
                 rand_states, 
                 spp_per_frame
             );
@@ -820,7 +837,7 @@ int main() {
         const float3* denoised = dn ? dn->output : nullptr;
 
         // tonemap into the presented frame
-        tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, view, RW, RH, denoised, vk.frame_target(), W, H, total_samples);
+        tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, ph, view, RW, RH, denoised, vk.frame_target(), W, H, total_samples);
 
         if (did_trace) {
             checkCudaErrors(cudaEventSynchronize(ev_trace1));
@@ -864,6 +881,7 @@ int main() {
     ImGui::DestroyContext();
     cudaFree(accum);
     gb.release();
+    ph.release();
     ff.release();
     cudaFree(tr_prev);
     cudaFree(tr);

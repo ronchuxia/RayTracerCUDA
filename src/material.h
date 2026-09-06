@@ -159,6 +159,30 @@ struct material {
       }
       return color(0, 0, 0);
     }
+
+    __device__ color diffuse_albedo(const hit_record& rec) const {
+      switch (type) {
+          case LAMBERTIAN: return lam.albedo.value(rec.u, rec.v, rec.p);
+          case ISOTROPIC:  return iso.albedo.value(rec.u, rec.v, rec.p);
+          default:         return color(0, 0, 0);
+      }
+    }
+
+    __host__ __device__ color specular_f0() const {
+      switch (type) {
+          case METAL:      return met.albedo;
+          case DIELECTRIC: { real r0 = (1 - die.ir) / (1 + die.ir); return color(r0*r0, r0*r0, r0*r0); }
+          default:         return color(0, 0, 0);
+      }
+    }
+    
+    __host__ __device__ real roughness() const {
+      switch (type) {
+          case METAL:      return met.fuzz;
+          case DIELECTRIC: return 0;
+          default:         return 1;
+      }
+    }
 };
 
 #endif // MATERIAL_H
