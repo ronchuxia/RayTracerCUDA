@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <ctime>
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -49,6 +50,13 @@
 #include "viewer/scenes/spin.h"
 #include "viewer/scenes/denoise_room.h"
 
+// Halton sequence in [0,1)
+static real halton(int i, int base) {
+    real f = 1, r = 0;
+    while (i > 0) { f /= base; r += f * (i % base); i /= base; }
+    return r;
+}
+
 // color/gbuffer -> RGBA8
 __global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, primary_hits ph, int view, int rw, int rh,
                               const float3* denoised,
@@ -82,7 +90,8 @@ __global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, pri
 
 // frame accumulation
 __global__ void accumulate_frame(const camera& cam, int max_depth, const hittable& world,
-                                 color* accum, gbuffer gb, primary_hits ph, curandState* rand_states, int spp) {
+                                 color* accum, gbuffer gb, primary_hits ph, curandState* rand_states, int spp,
+                                 bool dlss) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= cam.image_width || j >= cam.image_height) return;
@@ -92,7 +101,7 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
 
     camera::first_hit fh;
     for (int sample = 0; sample < spp; ++sample) {
-        ray r = cam.get_ray(i, j, rand_state);
+        ray r = dlss ? cam.get_ray_through_pixel(i, j) : cam.get_ray(i, j, rand_state);
         color c = cam.ray_color(r, world, max_depth, rand_state, &fh);
         if (accum) accum[pixel_index] += c;
         gb.albedo[pixel_index] += fh.albedo;
@@ -100,7 +109,7 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
     }
 
     // fixed ray through pixel for stable estimation
-    fh = hit_through_pixel(cam, i, j, world, rand_state);
+    if (!dlss) fh = hit_through_pixel(cam, i, j, world, rand_state);
     ph.p[pixel_index]         = fh.p;
     ph.id[pixel_index]        = fh.id;
     ph.normal[pixel_index]    = fh.normal;
@@ -162,7 +171,8 @@ int main() {
     cam->focus_dist    = 10.0;
     cam->initialize();
     int W = cam->image_width, H = cam->image_height;    // window size
-    int RW = W, RH = H;                                 // render size = window / the denoiser's upscale factor
+    int FW = W, FH = H;                                 // frame size: the presented image, the denoiser's output (frame_sizes)
+    int RW = W, RH = H;                                 // render size: the camera image (frame_sizes)
 
     // SDL window, Vulkan presentation, Dear ImGui
     SDL_Window* win = SDL_CreateWindow(
@@ -195,16 +205,32 @@ int main() {
 
     // denoiser
     enum { DENOISE_OFF = 0, DENOISE_OPTIX_AOV = 1, DENOISE_OPTIX_TEMPORAL = 2,
-           DENOISE_OPTIX_UPSCALE = 3, DENOISE_OPTIX_TEMPORAL_UPSCALE = 4 };
+           DENOISE_OPTIX_UPSCALE = 3, DENOISE_OPTIX_TEMPORAL_UPSCALE = 4, DENOISE_DLSS_RR = 5 };
     int   denoise_mode = DENOISE_OFF;
-    auto  upscale_factor = [&]() { return denoise_mode >= DENOISE_OPTIX_UPSCALE ? 2 : 1; };
-    auto  temporal_mode  = [&]() { return denoise_mode == DENOISE_OPTIX_TEMPORAL || denoise_mode == DENOISE_OPTIX_TEMPORAL_UPSCALE; };
+    int   dlss_quality = 0;                   // dlaa, quality, balanced, performance, ultra performance
+    int   jitter_phase = 0;
+    static const real kDlssRatio[] = { 1.0, 1.5, 1.724, 2.0, 3.0 };
+    auto  dlss_mode      = [&]() { return denoise_mode == DENOISE_DLSS_RR; };
+    auto  temporal_mode  = [&]() { return denoise_mode == DENOISE_OPTIX_TEMPORAL || denoise_mode == DENOISE_OPTIX_TEMPORAL_UPSCALE || denoise_mode == DENOISE_DLSS_RR; };
+
+    auto  frame_sizes = [&](int w, int h, int& fw, int& fh, int& rw, int& rh) {
+        if (dlss_mode()) {
+            real ratio = kDlssRatio[dlss_quality];
+            fw = w; fh = h;
+            rw = (int)lround(w / ratio); rh = (int)lround(h / ratio);
+        } else {
+            int f = denoise_mode >= DENOISE_OPTIX_UPSCALE ? 2 : 1;
+            fw = w / f * f; fh = h / f * f;
+            rw = fw / f; rh = fh / f;
+        }
+    };
+    
     bool  guide_albedo = true;
     bool  guide_normal = true;
     float blend = 0.0f;                      // 0 = fully denoised, 1 = untouched input
 
     auto  make_denoiser = [&]() -> std::unique_ptr<denoiser> {
-        if (denoise_mode == DENOISE_OFF) return nullptr;
+        if (denoise_mode == DENOISE_OFF || dlss_mode()) return nullptr;
         OptixDenoiserModelKind kind =
             denoise_mode == DENOISE_OPTIX_TEMPORAL         ? OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV :
             denoise_mode == DENOISE_OPTIX_UPSCALE          ? OPTIX_DENOISER_MODEL_KIND_UPSCALE2X :
@@ -233,15 +259,14 @@ int main() {
         checkCudaErrors(cudaFree(accum));
         checkCudaErrors(cudaFree(rand_states));
 
-        int f = upscale_factor();
-        W = w / f * f; H = h / f * f;
-        RW = W / f; RH = H / f;
+        W = w; H = h;
+        frame_sizes(W, H, FW, FH, RW, RH);
         cam->image_width  = RW;
         cam->aspect_ratio = real(RW) / (real(RH) + real(0.5));
         cam->initialize();
         blocks     = dim3((RW + threads.x - 1) / threads.x, (RH + threads.y - 1) / threads.y);
-        blocks_out = dim3((W  + threads.x - 1) / threads.x, (H  + threads.y - 1) / threads.y);
-        vk.resize(W, H);
+        blocks_out = dim3((FW + threads.x - 1) / threads.x, (FH + threads.y - 1) / threads.y);
+        vk.resize(FW, FH);
 
         // accumulation buffer
         checkCudaErrors(cudaMalloc(&accum, (size_t)RW * RH * sizeof(color)));
@@ -249,7 +274,7 @@ int main() {
         gb.allocate(RW, RH);
         ph.allocate(RW, RH);
         ff.allocate(RW, RH);
-        if (dn) dn->setup(RW, RH, W, H);
+        if (dn) dn->setup(RW, RH, FW, FH);
         total_samples = 0;
 
         // rng
@@ -261,7 +286,7 @@ int main() {
     resize_frame(W, H);
 
     fprintf(stderr, "viewer: rendering: %dx%d frame, %dx%d window, %d spp/frame (target %d), depth %d\n",
-            RW, RH, W, H, spp_per_frame, target_samples, cam->max_depth);
+            RW, RH, FW, FH, spp_per_frame, target_samples, cam->max_depth);
     fprintf(stderr, "viewer: presentation: %s\n",
             vk.interop ? "CUDA-Vulkan interop" : "CPU readback");
     fprintf(stderr, "viewer: controls: drag orbit, scroll zoom, shift-drag pan, R reset, ESC quit\n");
@@ -439,7 +464,7 @@ int main() {
             else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) {
                 // picking
                 if (maybe_click && abs(e.button.x - press_x) <= 2 && abs(e.button.y - press_y) <= 2) {
-                    pick<<<1, 1>>>(*cam, world, e.button.x * RW / W, e.button.y * RH / H, pick_state, pick_result);
+                    pick<<<1, 1>>>(*cam, world, e.button.x * RW / FW, e.button.y * RH / FH, pick_state, pick_result);
                     checkCudaErrors(cudaDeviceSynchronize());
                     selected_id = *pick_result;
                 }
@@ -544,18 +569,21 @@ int main() {
             if (show_display) {
                 section_break();
                 ImGui::Combo("view", &view, "beauty\0albedo\0normal\0flow\0trust\0depth\0id\0diffuse\0f0\0roughness\0depth (axial)\0");
-                bool remake_denoiser = ImGui::Combo("denoiser", &denoise_mode, "off\0optix aov\0optix temporal\0optix upscale2x\0optix temporal upscale2x\0");
-                remake_denoiser |= ImGui::Checkbox("albedo guide", &guide_albedo);
-                remake_denoiser |= ImGui::Checkbox("normal guide", &guide_normal);
-                if (ImGui::SliderFloat("blend", &blend, 0.0f, 1.0f)) denoise_dirty = true;
+                bool remake_denoiser = ImGui::Combo("denoiser", &denoise_mode, "off\0optix aov\0optix temporal\0optix upscale2x\0optix temporal upscale2x\0dlss rr\0");
+                if (dlss_mode()) {  // dlss quality
+                    remake_denoiser |= ImGui::Combo("dlss quality", &dlss_quality, "dlaa\0quality\0balanced\0performance\0ultra performance\0");
+                } else if (denoise_mode != DENOISE_OFF) {   // optix guides and blend
+                    remake_denoiser |= ImGui::Checkbox("albedo guide", &guide_albedo);
+                    remake_denoiser |= ImGui::Checkbox("normal guide", &guide_normal);
+                    if (ImGui::SliderFloat("blend", &blend, 0.0f, 1.0f)) denoise_dirty = true;
+                }
                 if (remake_denoiser) {
                     dn = make_denoiser();
-                    if (RW != W / upscale_factor()) {                     // resize_frame runs dn->setup
-                        int w, h; 
-                        SDL_GetWindowSize(win, &w, &h);
-                        resize_frame(w, h);
-                    }
-                    else if (dn) dn->setup(RW, RH, W, H);
+                    if (!dlss_mode()) cam->jitter_x = cam->jitter_y = 0;
+                    int fw, fh, rw, rh;
+                    frame_sizes(W, H, fw, fh, rw, rh);
+                    if (fw != FW || fh != FH || rw != RW || rh != RH) resize_frame(W, H);   // runs dn->setup
+                    else if (dn) dn->setup(RW, RH, FW, FH);
                     denoise_dirty = true;
                 }
             }
@@ -741,7 +769,7 @@ int main() {
         }
 
         // overlays: world-space line segments projected through the camera
-        const float sx = (float)W / RW, sy = (float)H / RH;
+        const float sx = (float)FW / RW, sy = (float)FH / RH;
         auto draw_line = [&](const point3& a, const point3& b, ImU32 col, float width) {
             real ax, ay, bx, by;
             if (cam->world_to_pixel(a, ax, ay) && cam->world_to_pixel(b, bx, by))
@@ -795,6 +823,17 @@ int main() {
         bool guide_view = view != 0;                  // any guide buffer: first hits only, beauty paused, no denoise
         bool flow_view  = view >= 3 && view <= 6;     // the flow field views also run the flow kernel
 
+        // dlss: reset accumulation, set camera jitter
+        bool dlss = dlss_mode() && !guide_view;
+        if (dlss) {
+            reset_accumulation();
+            real ratio = kDlssRatio[dlss_quality];
+            int phases = std::max(32, (int)lround(8 * ratio * ratio));
+            jitter_phase = (jitter_phase + 1) % phases;
+            cam->jitter_x = halton(jitter_phase + 1, 2) - real(0.5);
+            cam->jitter_y = halton(jitter_phase + 1, 3) - real(0.5);
+        }
+
         // frame accumulation
         bool did_trace = false;
         bool did_accumulate = false;
@@ -808,7 +847,8 @@ int main() {
                 gb, 
                 ph,
                 rand_states, 
-                spp_per_frame
+                spp_per_frame,
+                dlss
             );
             checkCudaErrors(cudaEventRecord(ev_trace1));
             did_trace = true;
@@ -837,7 +877,7 @@ int main() {
         const float3* denoised = dn ? dn->output : nullptr;
 
         // tonemap into the presented frame
-        tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, ph, view, RW, RH, denoised, vk.frame_target(), W, H, total_samples);
+        tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, ph, view, RW, RH, denoised, vk.frame_target(), FW, FH, total_samples);
 
         if (did_trace) {
             checkCudaErrors(cudaEventSynchronize(ev_trace1));
