@@ -83,6 +83,7 @@ __global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, pri
     else if (view == 9) c = color(1, 1, 1) * ph.roughness[idx];                   // hit roughness
     else if (view == 10) c = color(1, 1, 1) / (real(1) + ph.depth[idx]);          // hit depth (axial)
     else if (view == 11) c = ph.spec_dist[idx] > 0 ? color(1, 1, 1) / (real(1) + ph.spec_dist[idx]) : color(0, 0, 0);   // hit specular distance
+    else if (view == 12) c = real(0.5) * (ph.normal[idx] + vec3(1, 1, 1));         // hit normal, [-1,1] -> [0,1]
     else if (denoised)  c = color(denoised[j * w + i].x, denoised[j * w + i].y, denoised[j * w + i].z); // denoised
     else                c = accum[idx] * inv;                                    // beauty
     unsigned char r, g, b;
@@ -93,7 +94,7 @@ __global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, pri
 // frame accumulation
 __global__ void accumulate_frame(const camera& cam, int max_depth, const hittable& world,
                                  color* accum, gbuffer gb, primary_hits ph, curandState* rand_states, int spp,
-                                 bool dlss) {
+                                 bool dlss_beauty, bool psr) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= cam.image_width || j >= cam.image_height) return;
@@ -103,7 +104,7 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
 
     camera::first_hit fh;
     for (int sample = 0; sample < spp; ++sample) {
-        ray r = dlss ? cam.get_ray_through_pixel(i, j) : cam.get_ray(i, j, rand_state);
+        ray r = dlss_beauty ? cam.get_ray_through_pixel(i, j) : cam.get_ray(i, j, rand_state);
         color c = cam.ray_color(r, world, max_depth, rand_state, &fh);
         if (accum) accum[pixel_index] += c;
         gb.albedo[pixel_index] += fh.albedo;
@@ -111,15 +112,7 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
     }
 
     // fixed ray through pixel for stable estimation
-    if (!dlss) fh = hit_through_pixel(cam, i, j, world, rand_state);
-    ph.p[pixel_index]         = fh.p;
-    ph.id[pixel_index]        = fh.id;
-    ph.normal[pixel_index]    = fh.normal;
-    ph.diffuse[pixel_index]   = fh.diffuse;
-    ph.f0[pixel_index]        = fh.f0;
-    ph.roughness[pixel_index] = fh.roughness;
-    ph.depth[pixel_index]     = fh.id < 0 ? infinity : dot(fh.p - cam.center, -cam.w);
-    ph.spec_dist[pixel_index] = fh.spec_dist;
+    hit_through_pixel(cam, i, j, world, rand_state, psr, ph, pixel_index);
 }
 
 // object picking
@@ -578,7 +571,7 @@ int main() {
 
             if (show_display) {
                 section_break();
-                ImGui::Combo("view", &view, "beauty\0albedo\0normal\0flow\0trust\0depth\0id\0diffuse\0f0\0roughness\0depth (axial)\0spec dist\0");
+                ImGui::Combo("view", &view, "beauty\0albedo\0normal\0flow\0trust\0depth\0id\0diffuse\0f0\0roughness\0depth (dlss)\0spec dist\0normal (dlss)\0");
                 bool remake_denoiser = ImGui::Combo("denoiser", &denoise_mode, "off\0optix aov\0optix temporal\0optix upscale2x\0optix temporal upscale2x\0dlss rr\0");
                 if (dlss_mode()) {  // dlss quality
                     remake_denoiser |= ImGui::Combo("dlss quality", &dlss_quality, "dlaa\0quality\0balanced\0performance\0ultra performance\0");
@@ -832,11 +825,13 @@ int main() {
 
         bool guide_view = view != 0;
         bool flow_view  = view >= 3 && view <= 6;
-        int  guide_depth = view == 1 ? cam->max_depth : view == 11 ? 2 : 1;
+        int  guide_depth = view == 1 ? cam->max_depth : 1;
 
-        // dlss: reset accumulation, set camera jitter
-        bool dlss = dlss_mode() && (!guide_view || view == 11);
-        if (dlss) {
+        // dlss beauty: reset accumulation, set camera jitter
+        bool dlss_beauty = dlss_mode() && view == 0;
+        // dlss guide
+        bool dlss_guide = dlss_mode() || view >= 7;
+        if (dlss_beauty) {
             reset_accumulation();
             real ratio = kDlssRatio[dlss_quality];
             int phases = std::max(32, (int)lround(8 * ratio * ratio));
@@ -859,7 +854,8 @@ int main() {
                 ph,
                 rand_states, 
                 spp_per_frame,
-                dlss
+                dlss_beauty,
+                dlss_guide
             );
             checkCudaErrors(cudaEventRecord(ev_trace1));
             did_trace = true;

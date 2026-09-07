@@ -49,8 +49,12 @@ __global__ void flow_frame(const camera& cam, const camera& prev_cam,
         ff.id[p]    = id;
         const transform& t  = *tr[id];
         const transform& tp = tr_prev[id];
-        vec3 q  = t.inv_scale * t.apply_Rt(pt - t.translation);             // transform hit point from world space to object space
-        pt_prev = tp.apply_R(q * tp.scale) + tp.translation;                // transform hit point from object space to world space in previous frame
+        point3 hp = ph.hit[p];                                              // non-delta surface point
+        vec3 q  = t.inv_scale * t.apply_Rt(hp - t.translation);             // transform surface point from world space to object space
+        vec3 hp_prev = tp.apply_R(q * tp.scale) + tp.translation;           // transform surface point from object space to world space in last frame
+        vec3 motion = hp_prev - hp;                                         // motion of surface point in world space
+        const vec3* X = ph.xform + 3 * p;                                   // transform of delta chain
+        pt_prev = pt + vec3(dot(X[0], motion), dot(X[1], motion), dot(X[2], motion));
     } else {
         ff.depth[p] = infinity;
         ff.id[p]    = -1;
