@@ -346,6 +346,8 @@ int main() {
     checkCudaErrors(cudaEventCreate(&ev_flow0));
     checkCudaErrors(cudaEventCreate(&ev_flow1));
     float ms_flow = 0.0f;
+    float ms_phys = 0.0f;
+    int   phys_steps = 0;
     checkCudaErrors(cudaEventCreate(&ev_dn0));
     checkCudaErrors(cudaEventCreate(&ev_dn1));
     float ms_denoise = 0.0f;
@@ -367,7 +369,7 @@ int main() {
     int    friction_combine    = (int)COMBINE_AVERAGE;
     int    restitution_combine = (int)COMBINE_AVERAGE;
     const double PHYS_DT = 1.0 / 240.0;
-    const int    PHYS_MAX_STEPS = 8;
+    const int    PHYS_MAX_STEPS = 64;
     const real   SLEEP_VEL   = real(0.1);
     const int    SLEEP_STEPS = 60;
 
@@ -563,6 +565,7 @@ int main() {
                 ImGui::Text("flow    %6.2f ms", ms_flow);
                 ImGui::Text("denoise %6.2f ms", ms_denoise);
                 ImGui::Text("present %6.2f ms", vk.ms_present);
+                ImGui::Text("physics %6.2f ms (%d steps)", ms_phys, phys_steps);
                 if (nvml_ok && vram_poll++ % 30 == 0) {
                     unsigned int n = 64;
                     nvmlProcessInfo_t procs[64];
@@ -774,6 +777,7 @@ int main() {
         if (camera_dirty) rebuild_camera();
 
         // step physics
+        ms_phys = 0.0f; phys_steps = 0;
         if (playing && !asleep && !bodies.empty()) {
             const phys_params pp{ real(gravity), (combine_mode)friction_combine,
                                                  (combine_mode)restitution_combine };
@@ -782,12 +786,15 @@ int main() {
             const double cap = PHYS_DT * PHYS_MAX_STEPS;
             if (phys_accum > cap) phys_accum = cap;     // spiral-of-death clamp
             bool stepped = false;
+            Uint64 t0 = SDL_GetPerformanceCounter();
             while (phys_accum >= PHYS_DT) {
                 real maxv = physics_step(bodies, pp, real(PHYS_DT));
                 if (maxv < SLEEP_VEL) still_steps++; else still_steps = 0;
                 phys_accum -= PHYS_DT;
                 stepped = true;
+                phys_steps++;
             }
+            ms_phys = (float)((SDL_GetPerformanceCounter() - t0) * 1000.0 / SDL_GetPerformanceFrequency());
             if (still_steps > SLEEP_STEPS) asleep = true;
             // update transform of scene objects
             if (stepped) {
