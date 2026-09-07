@@ -102,39 +102,17 @@ struct dlss_denoiser : denoiser {
     float2 *l_mv = nullptr;
     float  world_to_view[16], view_to_clip[16];   // row-major, row-vector convention
 
-    static int& ngx_users() { static int n = 0; return n; }
-
-    dlss_denoiser(NVSDK_NGX_PerfQuality_Value quality) : quality(quality) {
-        checkCudaErrors(cudaFree(0));
+    dlss_denoiser(NVSDK_NGX_PerfQuality_Value quality) : quality(quality) {   // needs ngx_cuda_init() to have returned true
         cuCtxGetCurrent(&ctx);
         checkCudaErrors(cudaStreamCreate(&stream));
-        if (ngx_users()++ == 0) {
-            wchar_t* paths[1] = { (wchar_t*)DLSS_SNIPPET_DIR };
-            NVSDK_NGX_FeatureCommonInfo info{};
-            info.PathListInfo.Path = paths;
-            info.PathListInfo.Length = 1;
-            info.LoggingInfo.LoggingCallback = log_cb;
-            info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;   // ON prints ~60 snippet-search lines per init; errors come back as results
-            info.LoggingInfo.DisableOtherLoggingSinks = true;
-            checkNgx(NVSDK_NGX_CUDA_Init_with_ProjectID("a0676bfa-99ea-4d5e-9a1b-3c8f2e1d7b44", NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", L"build", &info));
-            NVSDK_NGX_Parameter* caps = nullptr;
-            checkNgx(NVSDK_NGX_CUDA_GetCapabilityParameters(&caps));
-            int available = 0;
-            NVSDK_NGX_Parameter_GetI(caps, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &available);
-            if (!available) { fprintf(stderr, "DLSS-RR is not available on this driver/GPU\n"); exit(97); }
-            NVSDK_NGX_CUDA_DestroyParameters(caps);
-        }
         checkNgx(NVSDK_NGX_CUDA_AllocateParameters(&params));
     }
 
     ~dlss_denoiser() {
         release();
         NVSDK_NGX_CUDA_DestroyParameters(params);
-        if (--ngx_users() == 0) NVSDK_NGX_CUDA_Shutdown1(nullptr);
         cudaStreamDestroy(stream);
     }
-
-    static void NVSDK_CONV log_cb(const char* msg, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) { fprintf(stderr, "ngx: %s", msg); }
 
     static image make_image(int w, int h, cudaChannelFormatDesc desc, size_t pixel_bytes) {
         image im;
@@ -251,5 +229,29 @@ struct dlss_denoiser : denoiser {
         l_roughness = l_depth = l_spec_dist = nullptr; l_mv = nullptr; output = nullptr;
     }
 };
+
+// process-wide NGX CUDA init
+inline bool ngx_cuda_init() {
+    checkCudaErrors(cudaFree(0));
+    wchar_t* paths[1] = { (wchar_t*)DLSS_SNIPPET_DIR };
+
+    NVSDK_NGX_FeatureCommonInfo info{};
+    info.PathListInfo.Path = paths;
+    info.PathListInfo.Length = 1;
+    info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
+
+    NVSDK_NGX_Result r = NVSDK_NGX_CUDA_Init_with_ProjectID("a0676bfa-99ea-4d5e-9a1b-3c8f2e1d7b44", NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", L"build", &info);
+    if (NVSDK_NGX_FAILED(r)) { fprintf(stderr, "dlss: NGX CUDA init failed 0x%x\n", (unsigned)r); return false; }
+    
+    NVSDK_NGX_Parameter* caps = nullptr;
+    checkNgx(NVSDK_NGX_CUDA_GetCapabilityParameters(&caps));
+    int avail = 0;
+    NVSDK_NGX_Parameter_GetI(caps, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &avail);
+    NVSDK_NGX_CUDA_DestroyParameters(caps);
+    
+    return avail != 0;
+}
+
+inline void ngx_cuda_shutdown() { NVSDK_NGX_CUDA_Shutdown1(nullptr); }
 
 #endif // VIEWER_DENOISER_DLSS_H

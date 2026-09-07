@@ -185,6 +185,7 @@ int main() {
     present_vk vk;
     vk.init(win);
     fprintf(stderr, "viewer: Vulkan device: %s%s\n", vk.device_name, vk.same_gpu ? " (the CUDA device)" : " (NOT the CUDA device)");
+    bool rr_available = ngx_cuda_init();     // DLSS ray reconstruction
 
     // frame resources
     color* accum = nullptr;                  // accumulation buffer
@@ -582,7 +583,8 @@ int main() {
             if (show_display) {
                 section_break();
                 ImGui::Combo("view", &view, "beauty\0albedo\0normal\0flow\0trust\0depth\0id\0diffuse\0f0\0roughness\0depth (dlss)\0spec dist\0normal (dlss)\0");
-                bool remake_denoiser = ImGui::Combo("denoiser", &denoise_mode, "off\0optix aov\0optix temporal\0optix upscale2x\0optix temporal upscale2x\0dlss rr\0");
+                bool remake_denoiser = ImGui::Combo("denoiser", &denoise_mode, rr_available ? "off\0optix aov\0optix temporal\0optix upscale2x\0optix temporal upscale2x\0dlss rr\0"
+                                                                                    : "off\0optix aov\0optix temporal\0optix upscale2x\0optix temporal upscale2x\0");
                 if (dlss_mode()) {  // dlss quality
                     remake_denoiser |= ImGui::Combo("dlss quality", &dlss_quality, "dlaa\0quality\0balanced\0performance\0ultra performance\0");
                 } else if (denoise_mode != DENOISE_OFF) {   // optix guides and blend
@@ -955,6 +957,8 @@ int main() {
     cudaEventDestroy(ev_dn1);
     cudaEventDestroy(ev_flow0);
     cudaEventDestroy(ev_flow1);
+    dn.reset();
+    ngx_cuda_shutdown();
     vk.release();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
