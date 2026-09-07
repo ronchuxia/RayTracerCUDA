@@ -170,7 +170,7 @@ struct camera {
         static constexpr real diffuse_roughness = real(0.15);
 
         __device__ color ray_color(ray r, const hittable& world, int max_depth, curandState* state,
-                                   first_hit* first = nullptr) const {
+                                   first_hit* first = nullptr, bool gbuffer_only = false) const {
             ray current_ray = r;
             color current_color = color(0,0,0); // Total color until now
             color throughput = color(1,1,1);    // Total attenuation until now
@@ -197,6 +197,7 @@ struct camera {
                         throughput *= attenuation;
                         current_color += throughput * emit;
                         current_ray = scattered;
+                        if (gbuffer_only && albedo_written) break;
                     }
                     else {
                         if (rec.mat->type == DIFFUSE_LIGHT) write_albedo(emit); // light

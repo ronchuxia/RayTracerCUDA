@@ -105,7 +105,7 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
     camera::first_hit fh;
     for (int sample = 0; sample < spp; ++sample) {
         ray r = dlss_beauty ? cam.get_ray_through_pixel(i, j) : cam.get_ray(i, j, rand_state);
-        color c = cam.ray_color(r, world, max_depth, rand_state, &fh);
+        color c = cam.ray_color(r, world, max_depth, rand_state, &fh, accum == nullptr);
         if (accum) accum[pixel_index] += c;
         gb.albedo[pixel_index] += fh.albedo;
         gb.normal[pixel_index] += fh.normal;
