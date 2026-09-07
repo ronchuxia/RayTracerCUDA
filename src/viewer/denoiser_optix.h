@@ -60,7 +60,6 @@ struct optix_denoiser : denoiser {
         : guide_albedo(guide_albedo), guide_normal(guide_normal),
           temporal(kind == OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV ||
                    kind == OPTIX_DENOISER_MODEL_KIND_TEMPORAL_UPSCALE2X) {
-        checkOptix(optixInit());
         // context
         OptixDeviceContextOptions o{};
         o.logCallbackFunction = log_cb;
@@ -178,5 +177,12 @@ struct optix_denoiser : denoiser {
         ig_prev = ig_cur = nullptr;
     }
 };
+
+// process-wide driver load
+inline bool optix_init() {
+    OptixResult r = optixInit();
+    if (r != OPTIX_SUCCESS) fprintf(stderr, "optix: init failed (%d)\n", (int)r);
+    return r == OPTIX_SUCCESS;
+}
 
 #endif // VIEWER_DENOISER_OPTIX_H

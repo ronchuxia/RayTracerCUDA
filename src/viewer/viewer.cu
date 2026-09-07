@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <memory>
 #include <vector>
+#include <string>
 
 #ifndef RT_IMAGE_WIDTH
 #define RT_IMAGE_WIDTH 800
@@ -185,6 +186,7 @@ int main() {
     present_vk vk;
     vk.init(win);
     fprintf(stderr, "viewer: Vulkan device: %s%s\n", vk.device_name, vk.same_gpu ? " (the CUDA device)" : " (NOT the CUDA device)");
+    bool optix_available = optix_init();     // OptiX denoiser
     bool rr_available = ngx_cuda_init();     // DLSS ray reconstruction
 
     // frame resources
@@ -206,6 +208,7 @@ int main() {
     enum { DENOISE_OFF = 0, DENOISE_OPTIX_AOV = 1, DENOISE_OPTIX_TEMPORAL = 2,
            DENOISE_OPTIX_UPSCALE = 3, DENOISE_OPTIX_TEMPORAL_UPSCALE = 4, DENOISE_DLSS_RR = 5 };
     int   denoise_mode = DENOISE_OFF;
+    int   denoise_row = 0;                    // the row number of denoise_mode in the combo
     int   dlss_quality = 0;                   // dlaa, quality, balanced, performance, ultra performance
     int   jitter_phase = 0;
     bool  fg_on = false;                      // DLSS frame generation
@@ -245,6 +248,15 @@ int main() {
                                                              OPTIX_DENOISER_MODEL_KIND_AOV;
         return std::make_unique<optix_denoiser>(guide_albedo, guide_normal, kind);
     };
+    static const char* kDenoiseNames[] = { "off", "optix aov", "optix temporal", "optix upscale2x", "optix temporal upscale2x", "dlss rr" };
+    std::vector<int> denoise_modes;
+    std::string      denoise_items;
+    for (int m = DENOISE_OFF; m <= DENOISE_DLSS_RR; m++)
+        if (m == DENOISE_OFF || (m == DENOISE_DLSS_RR ? rr_available : optix_available)) { 
+            denoise_modes.push_back(m); 
+            denoise_items += kDenoiseNames[m]; 
+            denoise_items += '\0'; 
+    }
     std::unique_ptr<denoiser> dn = make_denoiser();
 
     // temporal denoiser buffers
@@ -583,8 +595,8 @@ int main() {
             if (show_display) {
                 section_break();
                 ImGui::Combo("view", &view, "beauty\0albedo\0normal\0flow\0trust\0depth\0id\0diffuse\0f0\0roughness\0depth (dlss)\0spec dist\0normal (dlss)\0");
-                bool remake_denoiser = ImGui::Combo("denoiser", &denoise_mode, rr_available ? "off\0optix aov\0optix temporal\0optix upscale2x\0optix temporal upscale2x\0dlss rr\0"
-                                                                                    : "off\0optix aov\0optix temporal\0optix upscale2x\0optix temporal upscale2x\0");
+                bool remake_denoiser = ImGui::Combo("denoiser", &denoise_row, denoise_items.c_str());
+                denoise_mode = denoise_modes[denoise_row];
                 if (dlss_mode()) {  // dlss quality
                     remake_denoiser |= ImGui::Combo("dlss quality", &dlss_quality, "dlaa\0quality\0balanced\0performance\0ultra performance\0");
                 } else if (denoise_mode != DENOISE_OFF) {   // optix guides and blend
