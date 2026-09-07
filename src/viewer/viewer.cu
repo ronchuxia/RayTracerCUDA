@@ -7,7 +7,6 @@
 // Dear ImGui v1.92.8
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
-#include "viewer/present_vk.h"
 
 #include <cstdio>
 #include <ctime>
@@ -42,6 +41,7 @@
 #include "viewer/scene.h"
 #include "viewer/gbuffer.h"
 #include "viewer/primary_hits.h"
+#include "viewer/present_vk.h"
 #include "viewer/denoiser_optix.h"
 #include "viewer/denoiser_dlss.h"
 #include "scenes/scene_utils.h"
@@ -207,6 +207,9 @@ int main() {
     int   denoise_mode = DENOISE_OFF;
     int   dlss_quality = 0;                   // dlaa, quality, balanced, performance, ultra performance
     int   jitter_phase = 0;
+    bool  fg_on = false;                      // DLSS frame generation
+    int   fg_count = 1;                       // generated frames per rendered frame, 1..vk.fg.max_frames
+    bool  fg_reset = true;
     static const real kDlssRatio[] = { 1.0, 1.5, 1.724, 2.0, 3.0 };
     auto  dlss_mode      = [&]() { return denoise_mode == DENOISE_DLSS_RR; };
     auto  temporal_mode  = [&]() { return denoise_mode == DENOISE_OPTIX_TEMPORAL || denoise_mode == DENOISE_OPTIX_TEMPORAL_UPSCALE || denoise_mode == DENOISE_DLSS_RR; };
@@ -269,7 +272,8 @@ int main() {
         cam->initialize();
         blocks     = dim3((RW + threads.x - 1) / threads.x, (RH + threads.y - 1) / threads.y);
         blocks_out = dim3((FW + threads.x - 1) / threads.x, (FH + threads.y - 1) / threads.y);
-        vk.resize(FW, FH);
+        vk.resize(FW, FH, RW, RH);
+        fg_reset = true;
 
         // accumulation buffer
         checkCudaErrors(cudaMalloc(&accum, (size_t)RW * RH * sizeof(color)));
@@ -332,6 +336,10 @@ int main() {
     checkCudaErrors(cudaEventCreate(&ev_dn0));
     checkCudaErrors(cudaEventCreate(&ev_dn1));
     float ms_denoise = 0.0f;
+    
+    float presented_rate = 0.0f;
+    long  presented_last = 0; 
+    double t_last = 0;
 
     // panel visibility
     bool show_performance = true, show_rendering = true, show_display = true, show_camera = true, show_object = true, show_physics = true;
@@ -423,6 +431,7 @@ int main() {
         reset_accumulation();
         ff.reset_history();
         if (dn) dn->reset_history();
+        fg_reset = true;
         phys_accum = 0.0; still_steps = 0; asleep = false; playing = false;
     };
 
@@ -535,11 +544,12 @@ int main() {
 
             if (show_performance) {
                 section_break();
-                ImGui::Text("%.0f fps", io.Framerate);
+                ImGui::Text("%.0f fps", presented_rate);
                 ImGui::Text("frame   %6.2f ms", io.DeltaTime * 1000.0f);
                 ImGui::Text("trace   %6.2f ms", ms_trace);
                 ImGui::Text("flow    %6.2f ms", ms_flow);
                 ImGui::Text("denoise %6.2f ms", ms_denoise);
+                ImGui::Text("present %6.2f ms", vk.ms_present);
                 if (nvml_ok && vram_poll++ % 30 == 0) {
                     unsigned int n = 64;
                     nvmlProcessInfo_t procs[64];
@@ -588,6 +598,11 @@ int main() {
                     if (fw != FW || fh != FH || rw != RW || rh != RH) resize_frame(W, H);   // runs dn->setup
                     else if (dn) dn->setup(RW, RH, FW, FH);
                     denoise_dirty = true;
+                    fg_reset = true;
+                }
+                if (vk.fg.available) {
+                    if (ImGui::Checkbox("frame generation", &fg_on)) { vk.enable_fg(fg_on); fg_reset = true; }
+                    if (fg_on) ImGui::SliderInt("generated frames", &fg_count, 1, (int)vk.fg.max_frames);
                 }
             }
 
@@ -865,7 +880,7 @@ int main() {
 
         // flow
         bool did_flow = false;
-        if (flow_view || (temporal_mode() && (did_accumulate || denoise_dirty))) {
+        if (flow_view || ((temporal_mode() || fg_on) && (did_accumulate || denoise_dirty))) {   // frame generation needs the flow in any mode
             checkCudaErrors(cudaEventRecord(ev_flow0));
             flow_frame<<<blocks, threads>>>(*cam, prev_cam, tr, tr_prev, ph, ff, RW, RH);
             checkCudaErrors(cudaEventRecord(ev_flow1));
@@ -885,6 +900,15 @@ int main() {
 
         // tonemap into the presented frame
         tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, ph, view, RW, RH, denoised, vk.frame_target(), FW, FH, total_samples);
+
+        // frame generation inputs
+        bool fg = fg_on && !guide_view && vk.fg.feature;
+        NVSDK_NGX_DLSSG_Opt_Eval_Params fgp;
+        if (fg) {
+            prepare_fg<<<(RW * RH + 255) / 256, 256>>>(ph, ff.flow, cam->jitter_x, cam->jitter_y, RW * RH, (float*)vk.fg.depth_buf.d, (float2*)vk.fg.mv_buf.d);
+            fg_params(fgp, *cam, prev_cam, fg_reset);
+            fg_reset = false;
+        }
 
         if (did_trace) {
             checkCudaErrors(cudaEventSynchronize(ev_trace1));
@@ -910,7 +934,15 @@ int main() {
         }
 
         ImGui::Render();
-        vk.present(ImGui::GetDrawData());
+        vk.present(ImGui::GetDrawData(), fg ? &fgp : nullptr, fg_count);
+        {
+            double t = SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency();
+            if (t - t_last >= 0.5) { 
+                presented_rate = (float)((vk.presented - presented_last) / (t - t_last)); 
+                presented_last = vk.presented; 
+                t_last = t; 
+            }
+        }
     }
 
     // cleanup

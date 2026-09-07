@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "viewer/denoiser.h"
+#include "viewer/view_matrices.h"
 
 #ifndef DLSS_SNIPPET_DIR
 #define DLSS_SNIPPET_DIR L"src/external/dlss/lib"
@@ -237,20 +238,8 @@ struct dlss_denoiser : denoiser {
     }
 
     void matrices(const camera& cam) {
-        vec3 fwd = -cam.w;
-        float m[16] = { (float)cam.u.x(), (float)cam.v.x(), (float)fwd.x(), 0,
-                        (float)cam.u.y(), (float)cam.v.y(), (float)fwd.y(), 0,
-                        (float)cam.u.z(), (float)cam.v.z(), (float)fwd.z(), 0,
-                        -(float)dot(cam.center, cam.u), -(float)dot(cam.center, cam.v), -(float)dot(cam.center, fwd), 1 };
-        for (int k = 0; k < 16; k++) world_to_view[k] = m[k];
-        float f = 1.f / tanf((float)degrees_to_radians(cam.vfov) * 0.5f);
-        float aspect = (float)cam.image_width / (float)cam.image_height;
-        float zn = 0.01f, zf = 1e4f;                          // the record's far point is 1e4; only the reprojection uses these
-        float pm[16] = { f / aspect, 0, 0, 0,
-                         0, f, 0, 0,
-                         0, 0, zf / (zf - zn), 1,
-                         0, 0, -zn * zf / (zf - zn), 0 };
-        for (int k = 0; k < 16; k++) view_to_clip[k] = pm[k];
+        ::world_to_view(cam, world_to_view);
+        ::view_to_clip(cam, view_to_clip);
     }
 
     void release() {

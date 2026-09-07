@@ -21,6 +21,31 @@ inline void check_vk(VkResult r, const char* func, const char* file, int line) {
     }
 }
 
+inline uint32_t memory_type(VkPhysicalDevice phys, uint32_t bits, VkMemoryPropertyFlags want) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
+    fprintf(stderr, "Vulkan: no memory type for 0x%x / 0x%x\n", bits, want);
+    exit(97);
+}
+
+inline void barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, VkImageLayout to,
+                    VkPipelineStageFlags src_stage, VkAccessFlags src, VkPipelineStageFlags dst_stage, VkAccessFlags dst) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    b.srcAccessMask = src;
+    b.dstAccessMask = dst;
+    vkCmdPipelineBarrier(c, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+#include "viewer/framegen_vk.h"
+
 struct present_vk {
     SDL_Window*      win = nullptr;
     VkInstance       instance = VK_NULL_HANDLE;
@@ -33,10 +58,16 @@ struct present_vk {
     VkRenderPass     render_pass = VK_NULL_HANDLE;   // ImGui draws onto the blitted swapchain image
     VkCommandPool    pool = VK_NULL_HANDLE;
     VkCommandBuffer  cmd = VK_NULL_HANDLE;
-    VkSemaphore      sem_acquire = VK_NULL_HANDLE, sem_done = VK_NULL_HANDLE;
+    VkSemaphore      sem_acquire = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> sem_done;               // one per swapchain image
     VkFence          fence = VK_NULL_HANDLE;
+    bool             recording = false;
+    float            ms_present = 0;
+    long             presented = 0;
     char             device_name[256] = "";
     bool             same_gpu = false;               // the Vulkan device is the CUDA device (UUID match)
+    bool             fg_capable = false;             // the device offers NGX's extensions
+    framegen_vk      fg;                             // DLSS frame generation
 
     // swapchain (window size)
     VkSwapchainKHR             swapchain = VK_NULL_HANDLE;
@@ -45,8 +76,7 @@ struct present_vk {
     std::vector<VkImageView>   views;
     std::vector<VkFramebuffer> framebuffers;
 
-    // frame (W x H RGBA8)
-    int            W = 0, H = 0;
+    int            FW = 0, FH = 0, RW = 0, RH = 0;
     VkBuffer       frame_buf = VK_NULL_HANDLE;
     VkDeviceMemory frame_mem = VK_NULL_HANDLE;
     VkImage        frame_img = VK_NULL_HANDLE;
@@ -130,6 +160,18 @@ struct present_vk {
         if (same_gpu) {
             dext.push_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
             dext.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+
+            uint32_t ne = 0;
+            vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, nullptr);
+            std::vector<VkExtensionProperties> have(ne);
+            vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, have.data());
+            fg_capable = true;
+            for (const char* want : framegen_vk::device_extensions()) {
+                bool found = false;
+                for (auto& e : have) found |= strcmp(e.extensionName, want) == 0;
+                fg_capable &= found;
+            }
+            if (fg_capable) for (const char* e : framegen_vk::device_extensions()) dext.push_back(e);
         }
         // device creation
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -140,6 +182,7 @@ struct present_vk {
         checkVk(vkCreateDevice(phys, &dci, nullptr, &dev));
         vkGetDeviceQueue(dev, qfam, 0, &queue);
         if (same_gpu) vkGetMemoryFdKHR = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(dev, "vkGetMemoryFdKHR");
+        if (fg_capable) fg.init(instance, phys, dev, queue, qfam, vkGetMemoryFdKHR);
 
         // surface format
         uint32_t nf = 0; 
@@ -201,7 +244,6 @@ struct present_vk {
         // sync objects
         VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         checkVk(vkCreateSemaphore(dev, &sci, nullptr, &sem_acquire));
-        checkVk(vkCreateSemaphore(dev, &sci, nullptr, &sem_done));
         VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         checkVk(vkCreateFence(dev, &fci, nullptr, &fence));
@@ -258,6 +300,11 @@ struct present_vk {
         vkGetSwapchainImagesKHR(dev, swapchain, &ni, images.data());
         views.resize(ni);
         framebuffers.resize(ni);
+        // semaphores
+        sem_done.resize(ni);
+        VkSemaphoreCreateInfo semci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        for (uint32_t i = 0; i < ni; i++) checkVk(vkCreateSemaphore(dev, &semci, nullptr, &sem_done[i]));
+        
         for (uint32_t i = 0; i < ni; i++) {
             VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             vci.image = images[i];
@@ -279,6 +326,8 @@ struct present_vk {
     void destroy_swapchain() {
         for (auto fb : framebuffers) vkDestroyFramebuffer(dev, fb, nullptr);
         for (auto v : views) vkDestroyImageView(dev, v, nullptr);
+        for (auto sd : sem_done) vkDestroySemaphore(dev, sd, nullptr);
+        sem_done.clear();
         framebuffers.clear();
         views.clear();
         images.clear();
@@ -286,42 +335,35 @@ struct present_vk {
         swapchain = VK_NULL_HANDLE;
     }
 
-    uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
-        VkPhysicalDeviceMemoryProperties mp;
-        vkGetPhysicalDeviceMemoryProperties(phys, &mp);
-        for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
-            if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
-        fprintf(stderr, "Vulkan: no memory type for 0x%x / 0x%x\n", bits, want);
-        exit(97);
-    }
-
     // create or recreate the swapchain
-    void resize(int fw, int fh) {
+    void resize(int fw, int fh, int rw, int rh) {
         vkDeviceWaitIdle(dev);
         destroy_swapchain();
         release_frame();
         create_swapchain();
-        W = fw;
-        H = fh;
-        VkDeviceSize bytes = (VkDeviceSize)W * H * 4;
+        FW = fw;
+        FH = fh;
+        RW = rw;
+        RH = rh;
+        VkDeviceSize bytes = (VkDeviceSize)FW * FH * 4;
 
         // frame image
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ici.imageType = VK_IMAGE_TYPE_2D;
         ici.format = VK_FORMAT_R8G8B8A8_UNORM;
-        ici.extent = { (uint32_t)W, (uint32_t)H, 1 };
+        ici.extent = { (uint32_t)FW, (uint32_t)FH, 1 };
         ici.mipLevels = 1;
         ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         checkVk(vkCreateImage(dev, &ici, nullptr, &frame_img));
         VkMemoryRequirements mr;
         vkGetImageMemoryRequirements(dev, frame_img, &mr);
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.allocationSize = mr.size;
-        mai.memoryTypeIndex = memory_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        mai.memoryTypeIndex = memory_type(phys, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         checkVk(vkAllocateMemory(dev, &mai, nullptr, &frame_img_mem));
         checkVk(vkBindImageMemory(dev, frame_img, frame_img_mem, 0));
 
@@ -339,7 +381,7 @@ struct present_vk {
         emai.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
         mai.allocationSize = mr.size;
         mai.pNext = same_gpu ? &emai : nullptr;
-        mai.memoryTypeIndex = memory_type(mr.memoryTypeBits, same_gpu ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        mai.memoryTypeIndex = memory_type(phys, mr.memoryTypeBits, same_gpu ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
                                                                       : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         checkVk(vkAllocateMemory(dev, &mai, nullptr, &frame_mem));
         checkVk(vkBindBufferMemory(dev, frame_buf, frame_mem, 0));
@@ -366,54 +408,72 @@ struct present_vk {
             checkVk(vkMapMemory(dev, frame_mem, 0, bytes, 0, &h_frame));
             checkCudaErrors(cudaMalloc(&d_rgba, bytes));
         }
+        if (fg.wanted) fg.resize(FW, FH, RW, RH, frame_img);
     }
 
-    void present(ImDrawData* ui) {
-        // make the frame visible to Vulkan
-        VkDeviceSize bytes = (VkDeviceSize)W * H * 4;
-        if (interop) checkCudaErrors(cudaStreamSynchronize(0));
-        else         checkCudaErrors(cudaMemcpy(h_frame, d_rgba, bytes, cudaMemcpyDeviceToHost));
+    // enable/disable frame generation
+    void enable_fg(bool on) {
+        if (on == fg.wanted) return;
+        fg.wanted = on;
+        
+        vkDeviceWaitIdle(dev);
+        if (on) fg.resize(FW, FH, RW, RH, frame_img);
+        else    fg.release_feature();
+    }
 
-        // wait for last frame's GPU work, acquire a swapchain image
+    // begin recording after the previous submit finished
+    void begin() {
         checkVk(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
-        uint32_t idx;
-        VkResult r = vkAcquireNextImageKHR(dev, swapchain, UINT64_MAX, sem_acquire, VK_NULL_HANDLE, &idx);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR) {
-            resize(W, H);
-            return;
-        }
         checkVk(vkResetFences(dev, 1, &fence));
 
-        // record
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         checkVk(vkBeginCommandBuffer(cmd, &bi));
-        auto barrier = [&](VkImage img, VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst) {
-            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            b.oldLayout = from;
-            b.newLayout = to;
-            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.image = img;
-            b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            b.srcAccessMask = src;
-            b.dstAccessMask = dst;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
-        };
-        barrier(frame_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+        
+        recording = true;
+    }
+
+    // the CUDA-written frame → frame_img
+    void upload() {
+        VkDeviceSize bytes = (VkDeviceSize)FW * FH * 4;
+        
+        if (interop) checkCudaErrors(cudaStreamSynchronize(0));
+        else         checkCudaErrors(cudaMemcpy(h_frame, d_rgba, bytes, cudaMemcpyDeviceToHost));
+        
+        begin();
+
+        barrier(cmd, frame_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        
         VkBufferImageCopy region{};
         region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        region.imageExtent = { (uint32_t)W, (uint32_t)H, 1 };
+        region.imageExtent = { (uint32_t)FW, (uint32_t)FH, 1 };
         vkCmdCopyBufferToImage(cmd, frame_buf, frame_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-        barrier(frame_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        barrier(images[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-        // blit
+        
+        barrier(cmd, frame_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    }
+
+    // blit, draw ImGui, submit, present. returns false when the swapchain was out of date
+    bool show(VkImage src, ImDrawData* ui) {
+        if (!recording) begin();
+
+        uint32_t idx;
+        VkResult r = vkAcquireNextImageKHR(dev, swapchain, UINT64_MAX, sem_acquire, VK_NULL_HANDLE, &idx);
+        if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+            checkVk(vkEndCommandBuffer(cmd));
+            recording = false;
+            checkVk(vkQueueSubmit(queue, 0, nullptr, fence));
+            resize(FW, FH, RW, RH);
+            return false;
+        }
+
+        barrier(cmd, images[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         VkImageBlit blit{};
         blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        blit.srcOffsets[1] = { W, H, 1 };
+        blit.srcOffsets[1] = { FW, FH, 1 };
         blit.dstOffsets[1] = { (int)extent.width, (int)extent.height, 1 };
-        vkCmdBlitImage(cmd, frame_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        
         // ImGui
         VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         rbi.renderPass = render_pass;
@@ -423,6 +483,7 @@ struct present_vk {
         ImGui_ImplVulkan_RenderDrawData(ui, cmd);
         vkCmdEndRenderPass(cmd);
         checkVk(vkEndCommandBuffer(cmd));
+        recording = false;
 
         // submit
         VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -433,19 +494,33 @@ struct present_vk {
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cmd;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &sem_done;
+        si.pSignalSemaphores = &sem_done[idx];
         checkVk(vkQueueSubmit(queue, 1, &si, fence));
 
         // present
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &sem_done;
+        pi.pWaitSemaphores = &sem_done[idx];
         pi.swapchainCount = 1;
         pi.pSwapchains = &swapchain;
         pi.pImageIndices = &idx;
         r = vkQueuePresentKHR(queue, &pi);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) resize(W, H);
-        else checkVk(r);
+        presented++;
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { resize(FW, FH, RW, RH); return false; }
+        checkVk(r);
+        return true;
+    }
+
+    void present(ImDrawData* ui, NVSDK_NGX_DLSSG_Opt_Eval_Params* fgp = nullptr, int fg_count = 0) {
+        double t0 = SDL_GetPerformanceCounter() * 1000.0 / SDL_GetPerformanceFrequency();
+        upload();
+        if (fgp && fg.feature) {
+            fg.evaluate(cmd, frame_img, *fgp, fg_count);
+            for (int k = 0; k < fg_count; k++)
+                if (!show(fg.out[k].img, ui)) return;
+        }
+        show(frame_img, ui);
+        ms_present = (float)(SDL_GetPerformanceCounter() * 1000.0 / SDL_GetPerformanceFrequency() - t0);
     }
 
     void release_frame() {
@@ -465,11 +540,11 @@ struct present_vk {
     void release() {
         vkDeviceWaitIdle(dev);
         ImGui_ImplVulkan_Shutdown();
+        if (fg_capable) fg.release();
         release_frame();
         destroy_swapchain();
         vkDestroyFence(dev, fence, nullptr);
         vkDestroySemaphore(dev, sem_acquire, nullptr);
-        vkDestroySemaphore(dev, sem_done, nullptr);
         vkDestroyCommandPool(dev, pool, nullptr);
         vkDestroyRenderPass(dev, render_pass, nullptr);
         vkDestroyDevice(dev, nullptr);
