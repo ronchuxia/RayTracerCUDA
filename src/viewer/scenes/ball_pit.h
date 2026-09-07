@@ -5,9 +5,14 @@
 
 #include "viewer/scene.h"
 #include "scenes/scene_utils.h"
+#include "loaders/image_loader.h"
 #include "viewer/physics_utils.h"
 
-inline void build_ball_pit(scene& sc, real box_half, real pit_mu) {
+#ifndef RT_EARTH_IMG
+#define RT_EARTH_IMG "assets/earthmap.jpg"
+#endif
+
+inline void build_ball_pit(scene& sc, real box_half, real pit_mu, bool mixed = false) {
     sc.init();
 
     constexpr real BOX_H    = real(3.0);    // wall height
@@ -62,7 +67,11 @@ inline void build_ball_pit(scene& sc, real box_half, real pit_mu) {
         color col(0.5 + 0.4 * ((i * 37) % 7) / 6.0,
                   0.5 + 0.4 * ((i * 53) % 5) / 4.0,
                   0.5 + 0.4 * ((i * 29) % 3) / 2.0);
-        material* m = new_lambertian(col, sc.allocs);
+        material* m = !mixed || i % 5 == 4 ? new_lambertian(col, sc.allocs)
+                    : i % 5 == 0 ? new_metal(col, 0.0, sc.allocs)
+                    : i % 5 == 1 ? new_metal(col, 0.3, sc.allocs)
+                    : i % 5 == 2 ? new_dielectric(1.5, sc.allocs)
+                    :              new_lambertian(load_image_texture(RT_EARTH_IMG, sc.allocs), sc.allocs);
         int ball_id = sc.add(new_transform(make_sphere(point3(0,0,0), BALL_R, m, sc.allocs),
                                            vec3(x, y, z), vec3(0,0,0), vec3(1,1,1), sc.allocs));
         sc.bodies.push_back(make_sphere_body(sc, ball_id, DYNAMIC, real(1),
@@ -87,6 +96,11 @@ inline void build_ball_pit_tight_scene(scene& sc) {
 // ROLLING pit
 inline void build_ball_pit_rolling_scene(scene& sc) {
     build_ball_pit(sc, real(1.5), real(0.5));
+}
+
+// DLSS pit
+inline void build_dlss_pit_scene(scene& sc) {
+    build_ball_pit(sc, real(1.5), real(0.5), true);
 }
 
 #endif // VIEWER_SCENES_BALL_PIT_H

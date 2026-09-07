@@ -171,6 +171,7 @@ struct camera {
             color  diffuse;    // material::diffuse_albedo()  (DLSS diffuse albedo)
             color  f0;         // material::specular_f0()     (DLSS specular F0)
             real   roughness;  // material::roughness()
+            real   spec_dist;  // |second hit − first hit| when bounce 0 was a specular reflection, else 0
         };
 
         static constexpr real diffuse_roughness = real(0.15);
@@ -183,6 +184,7 @@ struct camera {
             hit_record rec;
 
             bool albedo_written = !first;
+            bool spec_reflect = false;
             auto write_albedo = [&](const color& surface) {
                 if (albedo_written) return;
                 color c = throughput * surface;
@@ -195,10 +197,12 @@ struct camera {
                     ray scattered;
                     color attenuation;
                     color emit = rec.mat->emitted();
-                    if (first && i == 0) *first = { color(0,0,0), rec.normal, rec.t, rec.id, rec.p, rec.mat->diffuse_albedo(rec), rec.mat->specular_f0(), rec.mat->roughness() };
+                    if (first && i == 0) *first = { color(0,0,0), rec.normal, rec.t, rec.id, rec.p, rec.mat->diffuse_albedo(rec), rec.mat->specular_f0(), rec.mat->roughness(), 0 };
+                    if (first && i == 1 && spec_reflect) first->spec_dist = (rec.p - first->p).length();
 
                     if (rec.mat->scatter(current_ray, rec, attenuation, scattered, state)) {
                         // If material scatters, accumulate attenuation, add emitted light and continue
+                        if (first && i == 0) spec_reflect = rec.mat->type == METAL || (rec.mat->type == DIELECTRIC && dot(scattered.direction(), rec.normal) > 0);
                         if (rec.mat->roughness() >= diffuse_roughness) write_albedo(attenuation);
                         throughput *= attenuation;
                         current_color += throughput * emit;
@@ -220,7 +224,8 @@ struct camera {
 #else
                     color background = color(0,0,0);
 #endif
-                    if (first && i == 0) *first = { color(0,0,0), vec3(0,0,0), infinity, -1, current_ray.origin() + unit_vector(current_ray.direction()) * real(1e4), color(0,0,0), color(0,0,0), 1 };
+                    if (first && i == 0) *first = { color(0,0,0), vec3(0,0,0), infinity, -1, current_ray.origin() + unit_vector(current_ray.direction()) * real(1e4), color(0,0,0), color(0,0,0), 1, 0 };
+                    if (first && i == 1 && spec_reflect) first->spec_dist = real(1e4);   // the reflection sees the sky
                     write_albedo(background);   // a miss is a light
                     current_color += throughput * background;
                     break;

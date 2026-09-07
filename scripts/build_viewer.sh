@@ -12,6 +12,7 @@
 #   3       ball pit, roomy 1.5, friction 0.5       build/viewer_rolling
 #   4       spinning earth balls, friction 0.5      build/viewer_spin
 #   5       denoiser evaluation room                build/viewer_denoise
+#   6       dlss pit: rolling pit, mixed materials  build/viewer_dlss
 #
 # Needs SDL2 + Vulkan dev libraries (libvulkan-dev); no display required to build.
 # Full output (incl. nvcc/ptxas warnings) is teed to build/build_viewer.log
@@ -55,7 +56,8 @@ case "$SCENE" in
     3) NAME=viewer_rolling ;;
     4) NAME=viewer_spin ;;
     5) NAME=viewer_denoise ;;
-    *) echo "error: unknown SCENE=$SCENE (0 primitives, 1 pit, 2 tight, 3 rolling, 4 spin, 5 denoise room)" >&2
+    6) NAME=viewer_dlss ;;
+    *) echo "error: unknown SCENE=$SCENE (0 primitives, 1 pit, 2 tight, 3 rolling, 4 spin, 5 denoise room, 6 dlss pit)" >&2
        exit 1 ;;
 esac
 

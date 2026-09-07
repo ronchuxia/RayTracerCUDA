@@ -82,6 +82,7 @@ __global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, pri
     else if (view == 8) c = ph.f0[idx];                                           // hit f0
     else if (view == 9) c = color(1, 1, 1) * ph.roughness[idx];                   // hit roughness
     else if (view == 10) c = color(1, 1, 1) / (real(1) + ph.depth[idx]);          // hit depth (axial)
+    else if (view == 11) c = ph.spec_dist[idx] > 0 ? color(1, 1, 1) / (real(1) + ph.spec_dist[idx]) : color(0, 0, 0);   // hit specular distance
     else if (denoised)  c = color(denoised[j * w + i].x, denoised[j * w + i].y, denoised[j * w + i].z); // denoised
     else                c = accum[idx] * inv;                                    // beauty
     unsigned char r, g, b;
@@ -118,6 +119,7 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
     ph.f0[pixel_index]        = fh.f0;
     ph.roughness[pixel_index] = fh.roughness;
     ph.depth[pixel_index]     = fh.id < 0 ? infinity : dot(fh.p - cam.center, -cam.w);
+    ph.spec_dist[pixel_index] = fh.spec_dist;
 }
 
 // object picking
@@ -139,7 +141,9 @@ int main() {
     }
     // scene
     scene sc;
-#if VIEWER_SCENE == 5
+#if VIEWER_SCENE == 6
+    build_dlss_pit_scene(sc);
+#elif VIEWER_SCENE == 5
     build_denoise_room_scene(sc);
 #elif VIEWER_SCENE == 4
     build_spin_scene(sc);
@@ -574,7 +578,7 @@ int main() {
 
             if (show_display) {
                 section_break();
-                ImGui::Combo("view", &view, "beauty\0albedo\0normal\0flow\0trust\0depth\0id\0diffuse\0f0\0roughness\0depth (axial)\0");
+                ImGui::Combo("view", &view, "beauty\0albedo\0normal\0flow\0trust\0depth\0id\0diffuse\0f0\0roughness\0depth (axial)\0spec dist\0");
                 bool remake_denoiser = ImGui::Combo("denoiser", &denoise_mode, "off\0optix aov\0optix temporal\0optix upscale2x\0optix temporal upscale2x\0dlss rr\0");
                 if (dlss_mode()) {  // dlss quality
                     remake_denoiser |= ImGui::Combo("dlss quality", &dlss_quality, "dlaa\0quality\0balanced\0performance\0ultra performance\0");
@@ -826,11 +830,12 @@ int main() {
             }
         }
 
-        bool guide_view = view != 0;                  // any guide buffer: first hits only, beauty paused, no denoise
-        bool flow_view  = view >= 3 && view <= 6;     // the flow field views also run the flow kernel
+        bool guide_view = view != 0;
+        bool flow_view  = view >= 3 && view <= 6;
+        int  guide_depth = view == 1 ? cam->max_depth : view == 11 ? 2 : 1;
 
         // dlss: reset accumulation, set camera jitter
-        bool dlss = dlss_mode() && !guide_view;
+        bool dlss = dlss_mode() && (!guide_view || view == 11);
         if (dlss) {
             reset_accumulation();
             real ratio = kDlssRatio[dlss_quality];
@@ -847,7 +852,7 @@ int main() {
             checkCudaErrors(cudaEventRecord(ev_trace0));
             accumulate_frame<<<blocks, threads>>>(
                 *cam, 
-                guide_view && view != 1 ? 1 : cam->max_depth,   // the albedo guide is written along the path (mirrors/glass pass through), so its view needs full depth
+                guide_view ? guide_depth : cam->max_depth,
                 world,
                 guide_view ? nullptr : accum, 
                 gb, 

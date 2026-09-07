@@ -37,7 +37,7 @@ __device__ inline float3 env_brdf_approx2(float3 f0, float alpha, float nov) {
 }
 
 __global__ void prepare_dlss(const color* accum, int samples, primary_hits ph, const float2* flow, point3 center, real jx, real jy, int n,
-                             float4* colour, float4* diffuse, float4* specular, float4* normal, float* roughness, float* depth, float2* mv) {
+                             float4* colour, float4* diffuse, float4* specular, float4* normal, float* roughness, float* depth, float2* mv, float* spec_dist) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n) return;
 
@@ -67,6 +67,9 @@ __global__ void prepare_dlss(const color* accum, int samples, primary_hits ph, c
 
     float2 f     = flow[p];
     mv[p]        = make_float2(-f.x - (float)jx, -f.y - (float)jy);   // current + mv = previous
+
+    real sd      = ph.spec_dist[p];
+    spec_dist[p] = (float)sd;
 }
 
 __global__ void unpack_output(cudaSurfaceObject_t surf, float3* out, int w, int h) {
@@ -92,10 +95,11 @@ struct dlss_denoiser : denoiser {
         size_t pitch = 0; 
     };
     
-    image colour, diffuse, specular, normal, roughness, depth, mv, out;
+    image colour, diffuse, specular, normal, roughness, depth, mv, spec_dist, out;
     float4 *l_colour = nullptr, *l_diffuse = nullptr, *l_specular = nullptr, *l_normal = nullptr;   // linear staging, prepare_dlss writes here
-    float  *l_roughness = nullptr, *l_depth = nullptr;
+    float  *l_roughness = nullptr, *l_depth = nullptr, *l_spec_dist = nullptr;
     float2 *l_mv = nullptr;
+    float  world_to_view[16], view_to_clip[16];   // row-major, row-vector convention
 
     static int& ngx_users() { static int n = 0; return n; }
 
@@ -166,6 +170,7 @@ struct dlss_denoiser : denoiser {
         roughness = make_image(iw, ih, f1, 4);
         depth     = make_image(iw, ih, f1, 4);
         mv        = make_image(iw, ih, f2, 8);
+        spec_dist = make_image(iw, ih, f1, 4);
         out       = make_image(ow, oh, f4, 16);
         checkCudaErrors(cudaMalloc(&l_colour,    n * sizeof(float4)));
         checkCudaErrors(cudaMalloc(&l_diffuse,   n * sizeof(float4)));
@@ -174,6 +179,7 @@ struct dlss_denoiser : denoiser {
         checkCudaErrors(cudaMalloc(&l_roughness, n * sizeof(float)));
         checkCudaErrors(cudaMalloc(&l_depth,     n * sizeof(float)));
         checkCudaErrors(cudaMalloc(&l_mv,        n * sizeof(float2)));
+        checkCudaErrors(cudaMalloc(&l_spec_dist, n * sizeof(float)));
         checkCudaErrors(cudaMalloc(&output, (size_t)ow * oh * sizeof(float3)));
 
         NVSDK_NGX_CUDA_DLSSD_Create_Params cp{};
@@ -198,12 +204,13 @@ struct dlss_denoiser : denoiser {
                 const primary_hits& ph, const camera& cam) override {
         int n = in_w * in_h;
         prepare_dlss<<<(n + 255) / 256, 256>>>(accum, samples, ph, ff.flow, cam.center, cam.jitter_x, cam.jitter_y, n,
-                                               l_colour, l_diffuse, l_specular, l_normal, l_roughness, l_depth, l_mv);
+                                               l_colour, l_diffuse, l_specular, l_normal, l_roughness, l_depth, l_mv, l_spec_dist);
         auto upload = [&](image& im, const void* src) {
             checkCudaErrors(cudaMemcpy2DToArrayAsync(im.arr, 0, 0, src, im.pitch, im.pitch, in_h, cudaMemcpyDeviceToDevice, 0));
         };
         upload(colour, l_colour); upload(diffuse, l_diffuse); upload(specular, l_specular); upload(normal, l_normal);
-        upload(roughness, l_roughness); upload(depth, l_depth); upload(mv, l_mv);
+        upload(roughness, l_roughness); upload(depth, l_depth); upload(mv, l_mv); upload(spec_dist, l_spec_dist);
+        matrices(cam);
 
         NVSDK_NGX_CUDA_DLSSD_Eval_Params ep{};
         ep.pInColor          = &colour.tex;
@@ -214,6 +221,9 @@ struct dlss_denoiser : denoiser {
         ep.pInDepth          = &depth.tex;
         ep.pInMotionVectors  = &mv.tex;
         ep.pInOutput         = &out.surf;
+        ep.pInSpecularHitDistance = &spec_dist.tex;
+        ep.pInWorldToViewMatrix   = world_to_view;
+        ep.pInViewToClipMatrix    = view_to_clip;
         ep.InRenderSubrectDimensions = { (unsigned)in_w, (unsigned)in_h };
         ep.InJitterOffsetX = -(float)cam.jitter_x;
         ep.InJitterOffsetY = -(float)cam.jitter_y;
@@ -226,13 +236,30 @@ struct dlss_denoiser : denoiser {
         unpack_output<<<b, t>>>(out.surf, output, out_w, out_h);
     }
 
+    void matrices(const camera& cam) {
+        vec3 fwd = -cam.w;
+        float m[16] = { (float)cam.u.x(), (float)cam.v.x(), (float)fwd.x(), 0,
+                        (float)cam.u.y(), (float)cam.v.y(), (float)fwd.y(), 0,
+                        (float)cam.u.z(), (float)cam.v.z(), (float)fwd.z(), 0,
+                        -(float)dot(cam.center, cam.u), -(float)dot(cam.center, cam.v), -(float)dot(cam.center, fwd), 1 };
+        for (int k = 0; k < 16; k++) world_to_view[k] = m[k];
+        float f = 1.f / tanf((float)degrees_to_radians(cam.vfov) * 0.5f);
+        float aspect = (float)cam.image_width / (float)cam.image_height;
+        float zn = 0.01f, zf = 1e4f;                          // the record's far point is 1e4; only the reprojection uses these
+        float pm[16] = { f / aspect, 0, 0, 0,
+                         0, f, 0, 0,
+                         0, 0, zf / (zf - zn), 1,
+                         0, 0, -zn * zf / (zf - zn), 0 };
+        for (int k = 0; k < 16; k++) view_to_clip[k] = pm[k];
+    }
+
     void release() {
         if (feature) { NVSDK_NGX_CUDA_ReleaseFeature(feature); feature = nullptr; }
-        for (image* im : { &colour, &diffuse, &specular, &normal, &roughness, &depth, &mv, &out }) free_image(*im);
+        for (image* im : { &colour, &diffuse, &specular, &normal, &roughness, &depth, &mv, &spec_dist, &out }) free_image(*im);
         cudaFree(l_colour); cudaFree(l_diffuse); cudaFree(l_specular); cudaFree(l_normal);
-        cudaFree(l_roughness); cudaFree(l_depth); cudaFree(l_mv); cudaFree(output);
+        cudaFree(l_roughness); cudaFree(l_depth); cudaFree(l_mv); cudaFree(l_spec_dist); cudaFree(output);
         l_colour = l_diffuse = l_specular = l_normal = nullptr;
-        l_roughness = l_depth = nullptr; l_mv = nullptr; output = nullptr;
+        l_roughness = l_depth = l_spec_dist = nullptr; l_mv = nullptr; output = nullptr;
     }
 };
 
