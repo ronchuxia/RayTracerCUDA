@@ -173,6 +173,8 @@ struct camera {
             real   roughness;  // material::roughness()
         };
 
+        static constexpr real diffuse_roughness = real(0.15);
+
         __device__ color ray_color(ray r, const hittable& world, int max_depth, curandState* state,
                                    first_hit* first = nullptr) const {
             ray current_ray = r;
@@ -180,22 +182,31 @@ struct camera {
             color throughput = color(1,1,1);    // Total attenuation until now
             hit_record rec;
 
+            bool albedo_written = !first;
+            auto write_albedo = [&](const color& surface) {
+                if (albedo_written) return;
+                color c = throughput * surface;
+                first->albedo = color(fmin(c.x(), real(1)), fmin(c.y(), real(1)), fmin(c.z(), real(1)));
+                albedo_written = true;
+            };
+
             for (int i = 0; i < max_depth; i++) {
                 if (world.hit(current_ray, interval(real(0.001), infinity), rec, state)) {
                     ray scattered;
                     color attenuation;
                     color emit = rec.mat->emitted();
+                    if (first && i == 0) *first = { color(0,0,0), rec.normal, rec.t, rec.id, rec.p, rec.mat->diffuse_albedo(rec), rec.mat->specular_f0(), rec.mat->roughness() };
 
                     if (rec.mat->scatter(current_ray, rec, attenuation, scattered, state)) {
                         // If material scatters, accumulate attenuation, add emitted light and continue
-                        if (first && i == 0) *first = { attenuation, rec.normal, rec.t, rec.id, rec.p, rec.mat->diffuse_albedo(rec), rec.mat->specular_f0(), rec.mat->roughness() };
+                        if (rec.mat->roughness() >= diffuse_roughness) write_albedo(attenuation);
                         throughput *= attenuation;
                         current_color += throughput * emit;
                         current_ray = scattered;
                     }
                     else {
-                        // If material doesn't scatter, add emitted light and terminate
-                        if (first && i == 0) *first = { color(1,1,1), rec.normal, rec.t, rec.id, rec.p, rec.mat->diffuse_albedo(rec), rec.mat->specular_f0(), rec.mat->roughness() };
+                        if (rec.mat->type == DIFFUSE_LIGHT) write_albedo(emit); // light
+                        else if (rec.mat->roughness() >= diffuse_roughness) write_albedo(rec.mat->specular_f0());   // fuzzy metal
                         current_color += throughput * emit;
                         break;
                     }
@@ -209,7 +220,8 @@ struct camera {
 #else
                     color background = color(0,0,0);
 #endif
-                    if (first && i == 0) *first = { background, vec3(0,0,0), infinity, -1, current_ray.origin() + unit_vector(current_ray.direction()) * real(1e4), color(0,0,0), color(0,0,0), 1 };
+                    if (first && i == 0) *first = { color(0,0,0), vec3(0,0,0), infinity, -1, current_ray.origin() + unit_vector(current_ray.direction()) * real(1e4), color(0,0,0), color(0,0,0), 1 };
+                    write_albedo(background);   // a miss is a light
                     current_color += throughput * background;
                     break;
                 }

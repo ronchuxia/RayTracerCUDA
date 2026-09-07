@@ -802,7 +802,7 @@ int main() {
             checkCudaErrors(cudaEventRecord(ev_trace0));
             accumulate_frame<<<blocks, threads>>>(
                 *cam, 
-                guide_view ? 1 : cam->max_depth, 
+                guide_view && view != 1 ? 1 : cam->max_depth,   // the albedo guide is written along the path (mirrors/glass pass through), so its view needs full depth
                 world,
                 guide_view ? nullptr : accum, 
                 gb, 
