@@ -18,6 +18,18 @@ inline void check_optix(OptixResult result, char const *const func, const char *
     }
 }
 
+__global__ void prepare_optix(const color* accum, gbuffer gb, int samples, int n,
+                              float3* beauty, float3* albedo, float3* normal) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    color c = accum[p]     / real(samples);
+    color a = gb.albedo[p] / real(gb.samples);
+    vec3  m = gb.normal[p] / real(gb.samples);
+    beauty[p] = make_float3(c.x(), c.y(), c.z());
+    albedo[p] = make_float3(a.x(), a.y(), a.z());
+    normal[p] = make_float3(m.x(), m.y(), m.z());
+}
+
 // invert flow field trust for Optix 9.1 on driver 595.84
 __global__ void invert_trust(const float* trust, float* out, int n) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
@@ -112,10 +124,11 @@ struct optix_denoiser : denoiser {
         history = false;
     }
 
-    void invoke(const color* accum, const gbuffer& gb, int samples, float blend, const flow_field& ff) override {
+    void invoke(const color* accum, const gbuffer& gb, int samples, float blend, const flow_field& ff,
+                const primary_hits&, const camera&) override {
         int n = in_w * in_h;
         
-        prepare_input<<<(n + 255) / 256, 256>>>(accum, gb, samples, n, beauty, albedo, normal);
+        prepare_optix<<<(n + 255) / 256, 256>>>(accum, gb, samples, n, beauty, albedo, normal);
         
         OptixDenoiserLayer layer{};
         layer.input  = image(beauty, in_w, in_h);

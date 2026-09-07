@@ -69,6 +69,10 @@ OUT="build/$NAME"
 # Headers are vendored in src/external/optix (v9.1.0); the runtime is the
 # driver's libnvoptix.so.1, loaded through dlopen, hence -ldl.
 OPTIX_FLAGS=(-Isrc/external/optix -ldl)
+# DLSS-RR: the NGX SDK is vendored in src/external/dlss (headers + static shim
+# that dlopens the driver's libnvidia-ngx.so.1, hence -lcuda); the RR snippet
+# is loaded at run time from DLSS_SNIPPET_DIR (denoiser_dlss.h, repo-relative).
+DLSS_FLAGS=(-Isrc/external/dlss/include src/external/dlss/lib/libnvsdk_ngx.a -lcuda)
 
 # Dear ImGui (vendored in src/external/imgui, pinned v1.92.8) is plain C++ —
 # nvcc hands the .cpp files to the host compiler. Its SDL2 backend does
@@ -80,5 +84,5 @@ nvcc src/viewer/viewer.cu \
     "$IMGUI"/imgui_widgets.cpp "$IMGUI"/imgui_impl_sdl2.cpp "$IMGUI"/imgui_impl_vulkan.cpp \
     -o "$OUT" -std=c++14 -arch="$ARCH" -rdc=true -Isrc -I"$IMGUI" $SDL_CFLAGS \
     -DRT_PRECISION="$PRECISION" -DVIEWER_SCENE="$SCENE" \
-    -lSDL2 -lvulkan -lnvidia-ml "${OPTIX_FLAGS[@]}" "$@"
+    -lSDL2 -lvulkan -lnvidia-ml "${OPTIX_FLAGS[@]}" "${DLSS_FLAGS[@]}" "$@"
 echo "built $OUT (SCENE=$SCENE, RT_PRECISION=$PRECISION, log: $LOG)"

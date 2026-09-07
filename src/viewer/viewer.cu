@@ -43,6 +43,7 @@
 #include "viewer/gbuffer.h"
 #include "viewer/primary_hits.h"
 #include "viewer/denoiser_optix.h"
+#include "viewer/denoiser_dlss.h"
 #include "scenes/scene_utils.h"
 #include "viewer/physics_utils.h"
 #include "viewer/scenes/primitives.h"
@@ -230,7 +231,12 @@ int main() {
     float blend = 0.0f;                      // 0 = fully denoised, 1 = untouched input
 
     auto  make_denoiser = [&]() -> std::unique_ptr<denoiser> {
-        if (denoise_mode == DENOISE_OFF || dlss_mode()) return nullptr;
+        if (denoise_mode == DENOISE_OFF) return nullptr;
+        if (dlss_mode()) {
+            static const NVSDK_NGX_PerfQuality_Value q[] = { NVSDK_NGX_PerfQuality_Value_DLAA, NVSDK_NGX_PerfQuality_Value_MaxQuality, NVSDK_NGX_PerfQuality_Value_Balanced,
+                                                             NVSDK_NGX_PerfQuality_Value_MaxPerf, NVSDK_NGX_PerfQuality_Value_UltraPerformance };
+            return std::make_unique<dlss_denoiser>(q[dlss_quality]);
+        }
         OptixDenoiserModelKind kind =
             denoise_mode == DENOISE_OPTIX_TEMPORAL         ? OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV :
             denoise_mode == DENOISE_OPTIX_UPSCALE          ? OPTIX_DENOISER_MODEL_KIND_UPSCALE2X :
@@ -869,7 +875,7 @@ int main() {
         bool did_denoise = false;
         if (dn && !guide_view && (denoise_dirty || did_accumulate)) {
             checkCudaErrors(cudaEventRecord(ev_dn0));
-            dn->invoke(accum, gb, total_samples, blend, ff);
+            dn->invoke(accum, gb, total_samples, blend, ff, ph, *cam);
             checkCudaErrors(cudaEventRecord(ev_dn1));
             did_denoise = true;
             denoise_dirty = false;
