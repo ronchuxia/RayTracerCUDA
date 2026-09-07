@@ -3,6 +3,7 @@
 
 #include "camera.h"
 #include "cuda_helper.h"
+#include "viewer/primary_hits.h"
 
 struct flow_field {
     float2* flow = nullptr;
@@ -31,29 +32,26 @@ struct flow_field {
     void advance() { real* t = depth; depth = depth_prev; depth_prev = t; history = true; }
 };
 
-__global__ void flow_frame(const camera& cam, const camera& prev_cam, const hittable& world,
+__global__ void flow_frame(const camera& cam, const camera& prev_cam,
                            const transform* const* tr, const transform* tr_prev,
-                           curandState* rand_states, flow_field ff, int w, int h) {
+                           primary_hits ph, flow_field ff, int w, int h) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= w || j >= h) return;
     int p = j * w + i;
 
-    ray r = cam.get_ray_through_pixel(i, j);
-    hit_record rec;
-    bool hit = world.hit(r, interval(real(0.001), infinity), rec, &rand_states[p]);
+    int  id  = ph.id[p];
+    bool hit = id >= 0;
 
-    point3 pt, pt_prev;
+    point3 pt = ph.p[p], pt_prev;
     if (hit) {
-        pt = rec.p;
         ff.depth[p] = (pt - cam.center).length();
-        ff.id[p]    = rec.id;
-        const transform& t  = *tr[rec.id];
-        const transform& tp = tr_prev[rec.id];
+        ff.id[p]    = id;
+        const transform& t  = *tr[id];
+        const transform& tp = tr_prev[id];
         vec3 q  = t.inv_scale * t.apply_Rt(pt - t.translation);             // transform hit point from world space to object space
         pt_prev = tp.apply_R(q * tp.scale) + tp.translation;                // transform hit point from object space to world space in previous frame
     } else {
-        pt = cam.center + unit_vector(r.direction()) * real(1e4);
         ff.depth[p] = infinity;
         ff.id[p]    = -1;
         pt_prev = pt;

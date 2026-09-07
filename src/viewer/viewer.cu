@@ -98,7 +98,9 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
         gb.albedo[pixel_index] += fh.albedo;
         gb.normal[pixel_index] += fh.normal;
     }
-    // the last sample's primary hit
+
+    // fixed ray through pixel for stable estimation
+    fh = hit_through_pixel(cam, i, j, world, rand_state);
     ph.p[pixel_index]         = fh.p;
     ph.id[pixel_index]        = fh.id;
     ph.normal[pixel_index]    = fh.normal;
@@ -790,15 +792,13 @@ int main() {
             }
         }
 
-        // views: 1-2 G-buffer guides and 7-10 the primary-hit record trace first hits only;
-        // 3-6 show the flow field and run only the flow kernel
-        bool guide_view = view == 1 || view == 2 || view >= 7;
-        bool data_view  = view >= 3 && view <= 6;
+        bool guide_view = view != 0;                  // any guide buffer: first hits only, beauty paused, no denoise
+        bool flow_view  = view >= 3 && view <= 6;     // the flow field views also run the flow kernel
 
         // frame accumulation
         bool did_trace = false;
         bool did_accumulate = false;
-        if (!data_view && (guide_view ? gb.samples : total_samples) < target_samples) {
+        if ((guide_view ? gb.samples : total_samples) < target_samples) {
             checkCudaErrors(cudaEventRecord(ev_trace0));
             accumulate_frame<<<blocks, threads>>>(
                 *cam, 
@@ -818,9 +818,9 @@ int main() {
 
         // flow
         bool did_flow = false;
-        if (data_view || (temporal_mode() && (did_accumulate || denoise_dirty))) {
+        if (flow_view || (temporal_mode() && (did_accumulate || denoise_dirty))) {
             checkCudaErrors(cudaEventRecord(ev_flow0));
-            flow_frame<<<blocks, threads>>>(*cam, prev_cam, world, tr, tr_prev, rand_states, ff, RW, RH);
+            flow_frame<<<blocks, threads>>>(*cam, prev_cam, tr, tr_prev, ph, ff, RW, RH);
             checkCudaErrors(cudaEventRecord(ev_flow1));
             did_flow = true;
         }

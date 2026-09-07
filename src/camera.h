@@ -35,6 +35,7 @@ struct camera {
         vec3   vup      = vec3(0,1,0);     // Camera-relative "up" direction
 
         real defocus_angle = 0;  // Variation angle of rays through each pixel
+        real jitter_x = 0, jitter_y = 0;  // the frame's sub-pixel offset
         real focus_dist = 10;    // Distance from camera lookfrom point to plane of perfect focus
 
         long long seed = -1;       // RNG seed; negative → seed from time(0). Fix it for reproducible renders (tests).
@@ -137,7 +138,8 @@ struct camera {
 
         __host__ __device__ ray get_ray_through_pixel(int i, int j) const {
             // Get a deterministic camera ray through the center of the pixel at location i,j
-            auto pixel_center = pixel00_loc + (i * pixel_delta_u) + (j * pixel_delta_v);
+            // plus a deterministic jitter 
+            auto pixel_center = pixel00_loc + ((i + jitter_x) * pixel_delta_u) + ((j + jitter_y) * pixel_delta_v);
             return ray(center, pixel_center - center);
         }
 
