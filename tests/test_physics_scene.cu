@@ -25,6 +25,7 @@
 #include "viewer/physics_utils.h"
 #include "viewer/scenes/ball_pit.h"
 #include "viewer/scenes/primitives.h"
+#include "viewer/scenes/hull_pit.h"
 
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); fails++; } \
                               else printf("ok: %s\n", msg); } while (0)
@@ -316,6 +317,50 @@ int main() {
         CHECK((pos - hb.pos).length() < real(1e-5) && (off - hb.offset).length() < real(1e-5),
               "after a turn, the re-derived hull collider is where physics left the body");
         sc4.release();
+    }
+
+    // ================= hull pit =================
+    // VIEWER_SCENE 7: seven convex solids, a NON-convex spiky ball and two balls
+    // dropped into the arena. Every solid's collider is read back from its
+    // rendered triangles, so this is the reader on real fans (pentagons merged
+    // from three triangles, the 12-gon's long loops) and on a concave mesh
+    // (the spiky ball's hull is the dodecahedron over its 20 tips), then the
+    // pile must settle inside the walls with nothing through the floor.
+    {
+        scene sc5;
+        build_hull_pit_scene(sc5);
+        std::vector<phys_body> b = sc5.bodies;
+        int hulls = 0, faces = 0;
+        bool merged = true;
+        for (const phys_body& k : b) {
+            if (k.shape != COLLIDER_HULL) continue;
+            hulls++; faces += (int)k.hull.faces.size();
+            for (const hull_shape::face& f : k.hull.faces) merged = merged && f.loop.size() >= 3;
+        }
+        // 8 + 14 + 6 + 5 + 8 + 20 + 12 = 73 faces once the fans are merged back, + 12 for the spiky ball's hull
+        CHECK(hulls == 8 && faces == 85 && merged,
+              "the hull pit's eight solids read back with their polygon faces (85 in all), fans merged");
+        const phys_body& spiky = b[12];                    // floor, 4 walls, 7 convex solids, then the spiky ball
+        CHECK(spiky.shape == COLLIDER_HULL && spiky.hull.verts.size() == 20 && spiky.hull.faces.size() == 12,
+              "the spiky ball collides as its convex hull: its 20 tips of 32 vertices, a dodecahedron");
+        const phys_params p{ real(-9.8) };
+        real maxv = 0;
+        for (int s = 0; s < SETTLE; s++) maxv = physics_step(b, p, H);
+        bool inside = true;
+        real lowest = 1;
+        for (const phys_body& k : b) {
+            if (k.motion != DYNAMIC) continue;
+            if (k.shape == COLLIDER_SPHERE) { lowest = std::fmin(lowest, k.pos[1] - k.radius); continue; }
+            for (const vec3& v : k.hull.verts) {
+                const vec3 w = k.pos + k.axes[0] * v[0] + k.axes[1] * v[1] + k.axes[2] * v[2];
+                lowest = std::fmin(lowest, w[1]);
+                inside = inside && std::fabs((double)w[0]) < 1.5 + 0.03 && std::fabs((double)w[2]) < 1.5 + 0.03;
+            }
+        }
+        printf("  hull pit after 20 s: max |v| = %.4f, lowest point y = %.4f\n", (double)maxv, (double)lowest);
+        CHECK(maxv < real(0.1), "the hull pit settles");
+        CHECK(lowest > real(-0.03) && inside, "no solid sinks through the floor or leaves the walls");
+        sc5.release();
     }
 
     printf(fails ? "SCENE PHYSICS TESTS FAILED (%d)\n" : "ALL SCENE PHYSICS TESTS PASSED\n", fails);

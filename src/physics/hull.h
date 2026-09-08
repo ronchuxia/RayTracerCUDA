@@ -218,7 +218,7 @@ inline vec3 build_hull(const std::vector<vec3>& p, hull_shape& h) {
             const vec3& nxt  = p[loop[(k + 1) % loop.size()]];
             if (cross(cur - prev, nxt - prev).length() > tol * (nxt - prev).length()) kept.push_back(loop[k]);
         }
-        if ((int)kept.size() > HULL_MAX_LOOP) { fprintf(stderr, "build_hull: a face has more than %d vertices\n", (int)kept.size(), HULL_MAX_LOOP); exit(1); }
+        if ((int)kept.size() > HULL_MAX_LOOP) { fprintf(stderr, "build_hull: a face has more than %d vertices\n", HULL_MAX_LOOP); exit(1); }
         
         hull_shape::face fc;
         fc.normal = F[seed].n;

@@ -1133,6 +1133,73 @@ int main() {
               "build_hull: a hexagonal prism cloud gives two hexagons, six quads and the hand-built tensor");
     }
 
+    // 12. HULL DYNAMICS (B4 step 5): the box's rest / slide / tip behaviour on a
+    //     hull body, end to end through physics_step. A hexagonal prism where
+    //     the box tests used a cube; restitution 0 so the pile settles.
+    {
+        const phys_params p{ real(-9.8) };
+        const hull_shape hex = prism_hull(6, real(0.5), real(0.5));
+        auto prism = [&](const vec3& at, const hull_shape& hs, real mu) {
+            phys_body b = dynamic_hull(at, hs);
+            b.friction = mu; b.restitution = 0;
+            return b;
+        };
+
+        // 12a. dropped, it rests on its bottom face at its half-height
+        {
+            std::vector<phys_body> b;
+            b.push_back(ground_plane(real(0.5), real(0)));
+            b.push_back(prism(vec3(0, 3, 0), hex, real(0.5)));
+            real maxv = 0;
+            for (int s = 0; s < 2400; s++) maxv = physics_step(b, p, h);
+            printf("  dropped prism rests at y = %.5f (expect 0.5), max |v| = %.5f, up.y = %.5f\n",
+                   (double)b[1].pos[1], (double)maxv, (double)b[1].axes[1][1]);
+            CHECK(std::fabs((double)b[1].pos[1] - 0.5) < 2e-3 && maxv < real(0.02) && (double)b[1].axes[1][1] > 0.9999,
+                  "a dropped hull comes to rest flat on its face and settles");
+        }
+
+        // 12b. the spread rule's case: a 12-sided prism set down tilted half a
+        //      degree must settle flat and stay there, not rock on a clustered manifold
+        {
+            const hull_shape dodec = prism_hull(12, real(1), real(0.3));
+            std::vector<phys_body> b;
+            b.push_back(ground_plane(real(0.5), real(0)));
+            b.push_back(prism(vec3(0, real(0.32), 0), dodec, real(0.5)));
+            set_orientation(b[1], quat_from_euler_zyx_degrees(vec3(0, 0, real(0.5))));
+            real maxv = 0;
+            for (int s = 0; s < 2400; s++) maxv = physics_step(b, p, h);
+            printf("  tilted 12-gon prism after 10 s: up.y = %.6f, |omega| = %.5f, max |v| = %.5f\n",
+                   (double)b[1].axes[1][1], (double)b[1].omega.length(), (double)maxv);
+            CHECK((double)b[1].axes[1][1] > 0.99999 && b[1].omega.length() < real(0.01) && maxv < real(0.02),
+                  "a many-sided hull set down tilted settles flat and does not rock");
+        }
+
+        // 12c. sliding, it stops dead and stays flat
+        {
+            std::vector<phys_body> b;
+            b.push_back(ground_plane(real(0.5), real(0)));
+            b.push_back(prism(vec3(0, real(0.5), 0), hex, real(0.5)));
+            b[1].vel = vec3(2, 0, 0);
+            for (int s = 0; s < 480; s++) physics_step(b, p, h);
+            printf("  sliding prism: vx = %.4f, |omega| = %.4f, up.y = %.5f\n",
+                   (double)b[1].vel[0], (double)b[1].omega.length(), (double)b[1].axes[1][1]);
+            CHECK(std::fabs((double)b[1].vel[0]) < 0.05 && (double)b[1].axes[1][1] > 0.999,
+                  "a sliding hull stops dead and stays flat: the face clip resists the friction torque");
+        }
+
+        // 12d. supported off-centre, it tips — the overhang test of 9e on a hull
+        {
+            std::vector<phys_body> t;
+            t.push_back(static_box(vec3(0, real(0.5), 0), vec3(1, real(0.5), 1), real(0.8), real(0)));   // platform, top at y = 1
+            t.push_back(prism(vec3(real(1.3), real(1.5), 0), hex, real(0.8)));                             // centre past the +x edge
+            for (int s = 0; s < 120; s++) physics_step(t, p, h);
+            printf("  overhanging prism after 0.5 s: up.y = %.4f, |omega| = %.4f\n",
+                   (double)t[1].axes[1][1], (double)t[1].omega.length());
+            CHECK(t[1].omega.length() > real(0.1) && (double)t[1].axes[1][1] < 0.999,
+                  "a hull supported off-centre tips: the manifold's geometry becomes torque");
+        }
+    }
+
     printf(fails ? "PHYSICS TESTS FAILED (%d)\n" : "ALL PHYSICS TESTS PASSED\n", fails);
     return fails ? 1 : 0;
 }

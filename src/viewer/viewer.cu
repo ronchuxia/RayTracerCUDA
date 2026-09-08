@@ -51,6 +51,7 @@
 #include "viewer/scenes/ball_pit.h"
 #include "viewer/scenes/spin.h"
 #include "viewer/scenes/denoise_room.h"
+#include "viewer/scenes/hull_pit.h"
 
 // Halton sequence in [0,1)
 static real halton(int i, int base) {
@@ -135,7 +136,9 @@ int main() {
     }
     // scene
     scene sc;
-#if VIEWER_SCENE == 6
+#if VIEWER_SCENE == 7
+    build_hull_pit_scene(sc);
+#elif VIEWER_SCENE == 6
     build_dlss_pit_scene(sc);
 #elif VIEWER_SCENE == 5
     build_denoise_room_scene(sc);

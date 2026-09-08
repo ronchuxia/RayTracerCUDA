@@ -12,6 +12,7 @@
 #   SCENE=4  build/viewer_spin     spinning earth balls, friction 0.5
 #   SCENE=5  build/viewer_denoise  denoiser evaluation room
 #   SCENE=6  build/viewer_dlss      dlss pit (rolling pit, mixed materials)
+#   SCENE=7  build/viewer_hull      hull pit (convex solids + 2 balls)
 #
 # PRECISION=64 runs the double-precision build (…_fp64) instead of the default
 # float one — for comparing fp32 vs fp64 live.
@@ -38,7 +39,8 @@ case "$SCENE" in
     4) NAME=viewer_spin ;;
     5) NAME=viewer_denoise ;;
     6) NAME=viewer_dlss ;;
-    *) echo "error: unknown SCENE=$SCENE (0 primitives, 1 pit, 2 tight, 3 rolling, 4 spin, 5 denoise room, 6 dlss pit)" >&2
+    7) NAME=viewer_hull ;;
+    *) echo "error: unknown SCENE=$SCENE (0 primitives, 1 pit, 2 tight, 3 rolling, 4 spin, 5 denoise room, 6 dlss pit, 7 hull pit)" >&2
        exit 1 ;;
 esac
 PRECISION="${PRECISION:-32}"
