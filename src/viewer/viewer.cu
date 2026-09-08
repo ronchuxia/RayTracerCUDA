@@ -421,8 +421,9 @@ int main() {
         b.omega = vec3(0, 0, 0);
         b.scale = tr->scale;
         quat orient;
-        if (b.shape == COLLIDER_SPHERE) sphere_collider_of(tr, b.pos, b.radius, orient, b.offset);
-        else                            box_collider_of(tr, b.pos, b.half, orient, b.offset);
+        if (b.shape == COLLIDER_SPHERE)    sphere_collider_of(tr, b.pos, b.radius, orient, b.offset);
+        else if (b.shape == COLLIDER_BOX)  box_collider_of(tr, b.pos, b.half, orient, b.offset);
+        else                               hull_collider_of(tr, b.hull, b.pos, orient, b.offset);
         set_orientation(b, orient);
         asleep = false; still_steps = 0;   // a moved body disturbs the pile -> resume stepping
     };
@@ -842,6 +843,14 @@ int main() {
                                           + b.axes[2] * (k & 4 ? b.half.z() : -b.half.z());
                     for (int k = 0; k < 12; k++)
                         draw_line(corner[edge[k][0]], corner[edge[k][1]], col, 1.0f);
+                } else if (b.shape == COLLIDER_HULL) {
+                    auto at = [&](int i) { const vec3& v = b.hull.verts[i]; return b.pos + b.axes[0] * v[0] + b.axes[1] * v[1] + b.axes[2] * v[2]; };
+                    for (const hull_shape::face& f : b.hull.faces)
+                        for (size_t k = 0; k < f.loop.size(); k++) {
+                            const int a = f.loop[k];
+                            const int c = f.loop[(k + 1) % f.loop.size()];
+                            if (a < c) draw_line(at(a), at(c), col, 1.0f);
+                        }
                 } else {
                     const int N = 32;
                     for (int i = 0; i < 3; i++) {

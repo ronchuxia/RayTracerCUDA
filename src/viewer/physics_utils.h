@@ -8,6 +8,7 @@
 #include "hittables/sphere.h"
 #include "hittables/transforms.h"
 #include "physics/body.h"
+#include "physics/hull.h"
 #include "viewer/scene.h"
 
 inline transform* get_body_transform(scene& sc, int scene_id) {
@@ -78,6 +79,70 @@ inline phys_body make_box_body(scene& sc, int scene_id, motion_type motion = STA
     // derive the box collider from the object
     quat orient;
     box_collider_of(tr, b.pos, b.half, orient, b.offset);
+    set_orientation(b, orient);
+    return b;
+}
+
+// collect all vertices of the hittable object
+inline void collect_vertices(const hittable* h, std::vector<vec3>& out) {
+    const size_t first = out.size();
+    switch (h->type) {
+    case QUAD: {
+        const quad* q = static_cast<const quad*>(h->object);
+        out.push_back(q->Q); out.push_back(q->Q + q->u); out.push_back(q->Q + q->v); out.push_back(q->Q + q->u + q->v);
+        break;
+    }
+    case TRIANGLE: {
+        const triangle* t = static_cast<const triangle*>(h->object);
+        out.push_back(t->v0); out.push_back(t->v1); out.push_back(t->v2);
+        break;
+    }
+    case HITTABLE_LIST: {
+        const hittable_list* l = static_cast<const hittable_list*>(h->object);
+        for (int i = 0; i < l->size; i++) collect_vertices(l->objects[i], out);
+        break;
+    }
+    case BVH: {
+        const bvh* b = static_cast<const bvh*>(h->object);
+        for (int i = 0; i < b->prim_count; i++) collect_vertices(&b->prims[i], out);
+        break;
+    }
+    case TRANSFORM: {
+        const transform* t = static_cast<const transform*>(h->object);
+        collect_vertices(t->child, out);
+        for (size_t i = first; i < out.size(); i++) out[i] = t->apply_R(out[i] * t->scale) + t->translation;
+        break;
+    }
+    default:
+        std::cerr << "make_hull_body: HittableType not supported.\n";
+        std::exit(1);
+    }
+}
+
+// the hull of the object's scaled vertices about its centre of mass; offset = that centre (c·S), as for a box
+inline void hull_collider_of(const transform* tr, hull_shape& h, vec3& pos, quat& orient, vec3& offset) {
+    std::vector<vec3> pts;
+    collect_vertices(tr->child, pts);
+
+    for (vec3& v : pts) v *= tr->scale;
+    
+    offset = build_hull(pts, h);
+    
+    pos    = tr->apply_R(offset) + tr->translation;
+    orient = quat_from_euler_zyx_degrees(tr->rotation);
+}
+
+// make a hull body from a polygonal object
+inline phys_body make_hull_body(scene& sc, int scene_id, motion_type motion = DYNAMIC,
+                                real mass = real(1),
+                                real friction = real(0.5), real restitution = real(0.7)) {
+    transform* tr = get_body_transform(sc, scene_id);
+    phys_body b{ scene_id, vec3(0,0,0), vec3(0,0,0), tr->scale };
+    b.motion = motion;  b.mass = mass;
+    b.shape  = COLLIDER_HULL;
+    b.friction = friction;  b.restitution = restitution;
+    quat orient;
+    hull_collider_of(tr, b.hull, b.pos, orient, b.offset);
     set_orientation(b, orient);
     return b;
 }

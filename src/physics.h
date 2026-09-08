@@ -36,7 +36,7 @@ inline real physics_step(std::vector<phys_body>& bodies, const phys_params& p, r
     for (phys_body& b : bodies) {
         if (inv_mass(b) <= real(0)) continue;
         real v = b.vel.length();
-        real r = b.shape == COLLIDER_BOX ? b.half.length() : b.shape == COLLIDER_HULL ? b.hull->radius : b.radius;
+        real r = b.shape == COLLIDER_BOX ? b.half.length() : b.shape == COLLIDER_HULL ? b.hull.radius : b.radius;
         real w = b.omega.length() * r;
         if (v > maxv) maxv = v;
         if (w > maxv) maxv = w;

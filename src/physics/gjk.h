@@ -20,8 +20,8 @@ inline vec3 support(const phys_body& b, const vec3& dir) {
     }
     if (b.shape == COLLIDER_HULL) {
         const vec3 d(dot(dir, b.axes[0]), dot(dir, b.axes[1]), dot(dir, b.axes[2]));
-        const vec3* best = &b.hull->verts[0];
-        for (const vec3& v : b.hull->verts)
+        const vec3* best = &b.hull.verts[0];
+        for (const vec3& v : b.hull.verts)
             if (dot(v, d) > dot(*best, d))
                 best = &v;
         return b.pos + b.axes[0] * (*best)[0] + b.axes[1] * (*best)[1] + b.axes[2] * (*best)[2];

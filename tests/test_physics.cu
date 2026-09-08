@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "physics.h"
+#include "physics/hull.h"
 
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); fails++; } \
                               else printf("ok: %s\n", msg); } while (0)
@@ -108,12 +109,12 @@ static bool wound_outward(const hull_shape& hs) {                    // every lo
     }
     return ok;
 }
-static phys_body static_hull(const vec3& centre, const hull_shape* hull) {
+static phys_body static_hull(const vec3& centre, const hull_shape& hull) {
     phys_body b{ -1, centre, vec3(0,0,0), vec3() };
     b.motion = STATIC; b.shape = COLLIDER_HULL; b.hull = hull;
     return b;
 }
-static phys_body dynamic_hull(const vec3& centre, const hull_shape* hull) {
+static phys_body dynamic_hull(const vec3& centre, const hull_shape& hull) {
     phys_body b = static_hull(centre, hull);
     b.motion = DYNAMIC;
     return b;
@@ -977,7 +978,7 @@ int main() {
         CHECK(cube.faces.size() == 6 && cube.faces[0].loop.size() == 4, "hull: a box hull has six four-vertex faces");
         CHECK(wound_outward(cube), "hull: every face loop is counter-clockwise seen from outside");
 
-        phys_body hb = static_hull(vec3(0, 0, 0), &cube), bx = static_box(vec3(0, 0, 0), vec3(1, 2, 3));
+        phys_body hb = static_hull(vec3(0, 0, 0), cube), bx = static_box(vec3(0, 0, 0), vec3(1, 2, 3));
         // On a direction with no ties the support POINT must match; along a face
         // normal several corners tie and the two shapes may pick different ones, so
         // there only the support VALUE (the projection GJK consumes) is compared.
@@ -1002,10 +1003,10 @@ int main() {
 
         hull_shape unit = box_hull(vec3(1, 1, 1));                   // two hulls overlapping 0.1 along x, as test 8c's boxes
         vec3 n; real pen;
-        CHECK(gjk_epa_contact(static_hull(vec3(0, 0, 0), &unit), static_hull(vec3(real(1.9), 0, 0), &unit), n, pen)
+        CHECK(gjk_epa_contact(static_hull(vec3(0, 0, 0), unit), static_hull(vec3(real(1.9), 0, 0), unit), n, pen)
               && std::fabs((double)n[0] + 1) < 1e-3 && std::fabs((double)pen - 0.1) < 1e-3,
               "gjk/epa: hull overlapping a hull along x gives normal -x, depth 0.1");
-        CHECK(!gjk_epa_contact(static_hull(vec3(0, 0, 0), &unit), static_hull(vec3(3, 0, 0), &unit), n, pen),
+        CHECK(!gjk_epa_contact(static_hull(vec3(0, 0, 0), unit), static_hull(vec3(3, 0, 0), unit), n, pen),
               "gjk: two separated hulls do not touch");
 
         // 10b. Mass properties (B4 step 2): the polyhedron integrals must reproduce
@@ -1027,14 +1028,14 @@ int main() {
                   && std::fabs((double)off.inv_inertia[0][1]) < 1e-5 && std::fabs((double)off.inv_inertia[1][2]) < 1e-5,
                   "hull mass: a box hull's inverse tensor is 3 / (hy^2 + hz^2) on the diagonal, zero off it");
 
-            phys_body hb2 = static_hull(vec3(0, 0, 0), &off), bx2 = dynamic_box(vec3(0, 0, 0), vec3(2, 1, 1));
+            phys_body hb2 = static_hull(vec3(0, 0, 0), off), bx2 = dynamic_box(vec3(0, 0, 0), vec3(2, 1, 1));
             hb2.motion = DYNAMIC; hb2.mass = real(2); bx2.mass = real(2);
             const quat q = quat_from_euler_zyx_degrees(vec3(20, 50, -10));
             set_orientation(hb2, q); set_orientation(bx2, q);
             const vec3 L(real(0.3), -1, real(0.7));
             CHECK((delta_omega(hb2, L) - delta_omega(bx2, L)).length() < real(1e-5),
                   "delta_omega: a turned box hull spins exactly as the turned box does (R I^-1 R^T, mass 2)");
-            CHECK(delta_omega(static_hull(vec3(0, 0, 0), &off), L).near_zero(),
+            CHECK(delta_omega(static_hull(vec3(0, 0, 0), off), L).near_zero(),
                   "delta_omega: an immovable hull is rotation-free (role outranks shape)");
         }
 
@@ -1044,8 +1045,8 @@ int main() {
         {
             std::vector<phys_body> bb, bh, hh;
             bb.push_back(static_box(vec3(0, 0, 0), vec3(1, 1, 1)));  bb.push_back(dynamic_box(vec3(0, real(1.9), 0), vec3(1, 1, 1)));
-            bh.push_back(static_box(vec3(0, 0, 0), vec3(1, 1, 1)));  bh.push_back(dynamic_hull(vec3(0, real(1.9), 0), &unit));
-            hh.push_back(static_hull(vec3(0, 0, 0), &unit));         hh.push_back(dynamic_hull(vec3(0, real(1.9), 0), &unit));
+            bh.push_back(static_box(vec3(0, 0, 0), vec3(1, 1, 1)));  bh.push_back(dynamic_hull(vec3(0, real(1.9), 0), unit));
+            hh.push_back(static_hull(vec3(0, 0, 0), unit));         hh.push_back(dynamic_hull(vec3(0, real(1.9), 0), unit));
             std::vector<contact> Cbb, Cbh, Chh;
             build_contacts(bb, Cbb); build_contacts(bh, Cbh); build_contacts(hh, Chh);
             CHECK(Cbb.size() == 4 && manifold_distance(Cbb, Cbh) < 1e-6 && manifold_distance(Cbb, Chh) < 1e-6,
@@ -1058,7 +1059,7 @@ int main() {
             CHECK(wound_outward(hex) && hex.faces[0].loop.size() == 6, "hull: a hexagonal prism has six-vertex caps wound outward");
             std::vector<phys_body> pb;
             pb.push_back(static_box(vec3(0, -1, 0), vec3(10, 1, 10)));
-            pb.push_back(dynamic_hull(vec3(0, real(0.47), 0), &hex));
+            pb.push_back(dynamic_hull(vec3(0, real(0.47), 0), hex));
             set_orientation(pb[1], quat_from_euler_zyx_degrees(vec3(0, 0, real(0.5))));
             std::vector<contact> Cp;
             build_contacts(pb, Cp);
@@ -1071,6 +1072,65 @@ int main() {
             CHECK(Cp.size() == 4 && hi - lo > real(1.99) && zhi - zlo > real(1.7),
                   "face clip: the spread rule keeps the whole footprint of a tilted hexagonal prism");
         }
+    }
+
+    // 11. HULL BUILDER (B4 step 4): build_hull turns a point cloud into the
+    //     face-list hull the steps above consume. The hand-built hulls are the
+    //     oracle: a cube's 24 quad corners (every corner three times) plus
+    //     inside, on-face and on-edge points must give box_hull.
+    {
+        const vec3 half(1, 2, 3);
+        const hull_shape cube = box_hull(half);
+        std::vector<vec3> pts;
+        for (const hull_shape::face& f : cube.faces) for (int i : f.loop) pts.push_back(cube.verts[i]);
+        pts.push_back(vec3(0, 0, 0)); pts.push_back(vec3(1, 0, 0)); pts.push_back(vec3(real(0.5), 2, 1)); pts.push_back(vec3(1, 2, 0));
+        hull_shape built;
+        const vec3 com = build_hull(pts, built);
+        bool quads = built.faces.size() == 6;
+        for (const hull_shape::face& f : built.faces) quads = quads && f.loop.size() == 4;
+        CHECK(built.verts.size() == 8 && quads && wound_outward(built) && com.length() < real(1e-6)
+              && std::fabs((double)built.radius - std::sqrt(14.0)) < 1e-6,
+              "build_hull: a cube cloud with repeated, inside, on-face and on-edge points gives 8 vertices and six quads");
+        phys_body hb = static_hull(vec3(0, 0, 0), built), bx = static_box(vec3(0, 0, 0), half);
+        bool same = true;
+        for (int k = 0; k < 50; k++) {
+            const vec3 d(std::sin(real(k)), std::cos(real(3 * k)), std::sin(real(7 * k + 1)));
+            same = same && std::fabs((double)(dot(support(hb, d), d) - dot(support(bx, d), d))) < 1e-6;
+        }
+        CHECK(same, "build_hull: the built hull supports exactly like the analytic box");
+        bool tensor = true;
+        for (int r = 0; r < 3; r++) tensor = tensor && (built.inv_inertia[r] - cube.inv_inertia[r]).length() < real(1e-5);
+        CHECK(tensor, "build_hull: same inverse inertia as the hand-built box hull");
+
+        // the same cloud turned off-axis: the coplanarity test must still merge each face into one quad
+        phys_body turn = static_box(vec3(0, 0, 0), half);
+        set_orientation(turn, quat_from_euler_zyx_degrees(vec3(20, 50, -10)));
+        for (vec3& v : pts) v = turn.axes[0] * v[0] + turn.axes[1] * v[1] + turn.axes[2] * v[2];
+        hull_shape turned;
+        const vec3 com_t = build_hull(pts, turned);
+        quads = turned.faces.size() == 6;
+        for (const hull_shape::face& f : turned.faces) quads = quads && f.loop.size() == 4;
+        CHECK(turned.verts.size() == 8 && quads && wound_outward(turned) && com_t.length() < real(1e-6),
+              "build_hull: a turned cube still merges into six quads");
+
+        // an octahedron has no coplanar triangles: eight faces stay triangles
+        std::vector<vec3> oct = { vec3(1, 0, 0), vec3(-1, 0, 0), vec3(0, 1, 0), vec3(0, -1, 0), vec3(0, 0, 1), vec3(0, 0, -1) };
+        hull_shape o;
+        build_hull(oct, o);
+        bool tris = o.faces.size() == 8 && o.verts.size() == 6;
+        for (const hull_shape::face& f : o.faces) tris = tris && f.loop.size() == 3;
+        CHECK(tris && wound_outward(o), "build_hull: an octahedron keeps eight triangles");
+
+        // a hexagonal prism cloud gives prism_hull's faces and tensor
+        const hull_shape hexp = prism_hull(6, real(1), real(0.5));
+        hull_shape hb2;
+        build_hull(hexp.verts, hb2);
+        int caps = 0, sides = 0;
+        for (const hull_shape::face& f : hb2.faces) { caps += f.loop.size() == 6; sides += f.loop.size() == 4; }
+        tensor = true;
+        for (int r = 0; r < 3; r++) tensor = tensor && (hb2.inv_inertia[r] - hexp.inv_inertia[r]).length() < real(1e-5);
+        CHECK(caps == 2 && sides == 6 && hb2.verts.size() == 12 && tensor,
+              "build_hull: a hexagonal prism cloud gives two hexagons, six quads and the hand-built tensor");
     }
 
     printf(fails ? "PHYSICS TESTS FAILED (%d)\n" : "ALL PHYSICS TESTS PASSED\n", fails);

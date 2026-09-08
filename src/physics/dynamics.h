@@ -21,7 +21,7 @@ inline vec3 delta_omega(const phys_body& b, const vec3& L) {
     }
     // hull
     if (b.shape == COLLIDER_HULL) {
-        const vec3* J = b.hull->inv_inertia;
+        const vec3* J = b.hull.inv_inertia;
         const vec3  l_local(dot(L, b.axes[0]), dot(L, b.axes[1]), dot(L, b.axes[2]));
         return (b.axes[0] * dot(J[0], l_local) 
               + b.axes[1] * dot(J[1], l_local)

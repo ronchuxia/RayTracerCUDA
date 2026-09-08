@@ -32,12 +32,12 @@ inline int clip_polygon(const vec3* in, int n, const vec3& nrm, real off, vec3* 
 }
 
 inline int face_count(const phys_body& b) { 
-    return b.shape == COLLIDER_HULL ? (int)b.hull->faces.size() : 6;
+    return b.shape == COLLIDER_HULL ? (int)b.hull.faces.size() : 6;
 }
 
 inline vec3 face_normal(const phys_body& b, int f) {
     if (b.shape == COLLIDER_HULL) {
-        const vec3& n = b.hull->faces[f].normal;
+        const vec3& n = b.hull.faces[f].normal;
         return b.axes[0] * n[0] + b.axes[1] * n[1] + b.axes[2] * n[2];
     }
     // COLLIDER_BOX
@@ -47,9 +47,9 @@ inline vec3 face_normal(const phys_body& b, int f) {
 // return vertices of a face in world space
 inline int face_loop(const phys_body& b, int f, vec3* out) {
     if (b.shape == COLLIDER_HULL) {
-        const hull_shape::face& fc = b.hull->faces[f];
+        const hull_shape::face& fc = b.hull.faces[f];
         for (size_t i = 0; i < fc.loop.size(); i++) {
-            const vec3& v = b.hull->verts[fc.loop[i]];
+            const vec3& v = b.hull.verts[fc.loop[i]];
             out[i] = b.pos + b.axes[0] * v[0] + b.axes[1] * v[1] + b.axes[2] * v[2];
         }
         return (int)fc.loop.size();

@@ -286,6 +286,38 @@ int main() {
         sc3.release();
     }
 
+    // ================= hull reader (B4 step 4) =================
+    // make_hull_body reads the collider from the rendered polygons. On a box
+    // OBJECT it must reproduce the box collider exactly: same centre, same
+    // offset (the centre of mass IS the box centre), the scaled corners as
+    // vertices, the same spin; and the write-back round trip must hold.
+    {
+        scene sc4; sc4.init();
+        material* m = new_lambertian(color(0.5, 0.5, 0.5), sc4.allocs);
+        const vec3 T(2, 3, -1), R(10, 40, -25), S(2, 1, real(0.5));
+        int id = sc4.add(new_transform(new_box(point3(0,0,0), point3(1,2,3), m, sc4.allocs, sc4.list_dtors), T, R, S, sc4.allocs));
+        phys_body hb = make_hull_body(sc4, id, DYNAMIC), bb = make_box_body(sc4, id, DYNAMIC);
+        CHECK((hb.pos - bb.pos).length() < real(1e-5) && (hb.offset - bb.offset).length() < real(1e-5),
+              "a hull body read from a box object sits at the box collider's centre with the same offset");
+        // 2e-4: the box collider is read from the child's bounding box, which
+        // carries aabb::pad()'s 1e-4 on every side; the hull reads the corners.
+        bool corners = hb.hull.verts.size() == 8 && hb.hull.faces.size() == 6;
+        for (const vec3& v : hb.hull.verts)
+            for (int a = 0; a < 3; a++) corners = corners && std::fabs((double)std::fabs((double)v[a]) - (double)bb.half[a]) < 2e-4;
+        CHECK(corners, "its vertices are the scaled box's corners about the centre (to the bbox pad), six faces");
+        const vec3 L(real(0.3), -1, real(0.7));
+        CHECK((delta_omega(hb, L) - delta_omega(bb, L)).length() < real(1e-3), "and it spins like the box body (to the bbox pad)");
+
+        set_orientation(hb, quat_from_euler_zyx_degrees(vec3(30, -60, 10)));
+        transform* tr = static_cast<transform*>(sc4.get(id)->object);
+        new(tr) transform(tr->child, transform_translation_of(hb), quat_to_euler_zyx_degrees(hb.orient), hb.scale);
+        vec3 pos, off; quat q; hull_shape rebuilt;
+        hull_collider_of(tr, rebuilt, pos, q, off);
+        CHECK((pos - hb.pos).length() < real(1e-5) && (off - hb.offset).length() < real(1e-5),
+              "after a turn, the re-derived hull collider is where physics left the body");
+        sc4.release();
+    }
+
     printf(fails ? "SCENE PHYSICS TESTS FAILED (%d)\n" : "ALL SCENE PHYSICS TESTS PASSED\n", fails);
     return fails ? 1 : 0;
 }
