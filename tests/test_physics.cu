@@ -73,7 +73,7 @@ static hull_shape box_hull(const vec3& half) {
             if (sgn < 0) { int t = f.loop[1]; f.loop[1] = f.loop[3]; f.loop[3] = t; }   // mirror the winding for -normal
             h.faces.push_back(f);
         }
-    h.radius = half.length();
+    hull_mass_properties(h);
     return h;
 }
 static phys_body static_hull(const vec3& centre, const hull_shape* hull) {
@@ -962,6 +962,36 @@ int main() {
               "gjk/epa: hull overlapping a hull along x gives normal -x, depth 0.1");
         CHECK(!gjk_epa_contact(static_hull(vec3(0, 0, 0), &unit), static_hull(vec3(3, 0, 0), &unit), n, pen),
               "gjk: two separated hulls do not touch");
+
+        // 10b. Mass properties (B4 step 2): the polyhedron integrals must reproduce
+        //      the box's closed forms, and delta_omega must then match the box's
+        //      branch in every frame — the tensor is the only thing that changes
+        //      between a hull and the box it was built from.
+        {
+            hull_shape off = box_hull(vec3(2, 1, 1));            // authored 1,2,3 away from its own centre
+            for (vec3& v : off.verts) v += vec3(1, 2, 3);
+            const vec3 com = hull_mass_properties(off);
+            CHECK((com - vec3(1, 2, 3)).length() < real(1e-6) && std::fabs((double)off.radius - std::sqrt(6.0)) < 1e-6,
+                  "hull mass: the centre of mass of an off-centre box hull is where the box was, and the vertices move onto it");
+            printf("  off-centre box hull: inv_inertia diag %.7f %.7f %.7f, off-diag %.2e %.2e %.2e\n",
+                   (double)off.inv_inertia[0][0], (double)off.inv_inertia[1][1], (double)off.inv_inertia[2][2],
+                   (double)off.inv_inertia[0][1], (double)off.inv_inertia[1][2], (double)off.inv_inertia[0][2]);
+            // 1e-5: the float build integrates about the authored origin (terms up to
+            // 5^3) and subtracts the centre-of-mass shift, so ~6 digits survive.
+            CHECK(std::fabs((double)off.inv_inertia[0][0] - 3.0 / (1.0 + 1.0)) < 1e-5 && std::fabs((double)off.inv_inertia[1][1] - 3.0 / (4.0 + 1.0)) < 1e-5
+                  && std::fabs((double)off.inv_inertia[0][1]) < 1e-5 && std::fabs((double)off.inv_inertia[1][2]) < 1e-5,
+                  "hull mass: a box hull's inverse tensor is 3 / (hy^2 + hz^2) on the diagonal, zero off it");
+
+            phys_body hb2 = static_hull(vec3(0, 0, 0), &off), bx2 = dynamic_box(vec3(0, 0, 0), vec3(2, 1, 1));
+            hb2.motion = DYNAMIC; hb2.mass = real(2); bx2.mass = real(2);
+            const quat q = quat_from_euler_zyx_degrees(vec3(20, 50, -10));
+            set_orientation(hb2, q); set_orientation(bx2, q);
+            const vec3 L(real(0.3), -1, real(0.7));
+            CHECK((delta_omega(hb2, L) - delta_omega(bx2, L)).length() < real(1e-5),
+                  "delta_omega: a turned box hull spins exactly as the turned box does (R I^-1 R^T, mass 2)");
+            CHECK(delta_omega(static_hull(vec3(0, 0, 0), &off), L).near_zero(),
+                  "delta_omega: an immovable hull is rotation-free (role outranks shape)");
+        }
     }
 
     printf(fails ? "PHYSICS TESTS FAILED (%d)\n" : "ALL PHYSICS TESTS PASSED\n", fails);
