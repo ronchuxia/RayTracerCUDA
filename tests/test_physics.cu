@@ -76,10 +76,60 @@ static hull_shape box_hull(const vec3& half) {
     hull_mass_properties(h);
     return h;
 }
+// A right prism with a regular `sides`-gon of circumradius r as its cap (y = ±h):
+// the first hull with faces of more than four vertices, for the face clip.
+static hull_shape prism_hull(int sides, real r, real h) {
+    hull_shape hs;
+    for (int i = 0; i < sides; i++) {
+        const real t = real(2 * M_PI) * i / sides;
+        hs.verts.push_back(vec3(r * std::cos(t), -h, r * std::sin(t)));   // bottom_i = 2i, top_i = 2i + 1
+        hs.verts.push_back(vec3(r * std::cos(t),  h, r * std::sin(t)));
+    }
+    hull_shape::face top, bottom;
+    top.normal = vec3(0, 1, 0); bottom.normal = vec3(0, -1, 0);
+    for (int i = 0; i < sides; i++) { top.loop.push_back(2 * (sides - 1 - i) + 1); bottom.loop.push_back(2 * i); }
+    hs.faces.push_back(top); hs.faces.push_back(bottom);
+    for (int i = 0; i < sides; i++) {
+        const int j = (i + 1) % sides;
+        const real t = real(2 * M_PI) * (i + real(0.5)) / sides;
+        hull_shape::face f;
+        f.normal = vec3(std::cos(t), 0, std::sin(t));
+        f.loop = { 2 * i, 2 * i + 1, 2 * j + 1, 2 * j };
+        hs.faces.push_back(f);
+    }
+    hull_mass_properties(hs);
+    return hs;
+}
+static bool wound_outward(const hull_shape& hs) {                    // every loop counter-clockwise about its normal
+    bool ok = true;
+    for (const hull_shape::face& f : hs.faces) {
+        const vec3 e0 = hs.verts[f.loop[1]] - hs.verts[f.loop[0]], e1 = hs.verts[f.loop[2]] - hs.verts[f.loop[0]];
+        ok &= dot(cross(e0, e1), f.normal) > real(0);
+    }
+    return ok;
+}
 static phys_body static_hull(const vec3& centre, const hull_shape* hull) {
     phys_body b{ -1, centre, vec3(0,0,0), vec3() };
     b.motion = STATIC; b.shape = COLLIDER_HULL; b.hull = hull;
     return b;
+}
+static phys_body dynamic_hull(const vec3& centre, const hull_shape* hull) {
+    phys_body b = static_hull(centre, hull);
+    b.motion = DYNAMIC;
+    return b;
+}
+// two manifolds equal as sets: every point of C0 has a match in C1
+static double manifold_distance(const std::vector<contact>& C0, const std::vector<contact>& C1) {
+    double worst = C0.size() == C1.size() ? 0 : 1e9;
+    for (const contact& k : C0) {
+        double best = 1e9;
+        for (const contact& l : C1) {
+            const double e = (double)(k.p - l.p).length() + std::fabs((double)k.pen - (double)l.pen);
+            if (e < best) best = e;
+        }
+        if (best > worst) worst = best;
+    }
+    return worst;
 }
 static phys_body ball(int scene_id, const vec3& pos, const vec3& vel, real r,
                       real m = real(1), real friction = real(0.5),
@@ -925,12 +975,7 @@ int main() {
     {
         const hull_shape cube = box_hull(vec3(1, 2, 3));
         CHECK(cube.faces.size() == 6 && cube.faces[0].loop.size() == 4, "hull: a box hull has six four-vertex faces");
-        bool wound = true;                                           // every loop counter-clockwise about its normal
-        for (const hull_shape::face& f : cube.faces) {
-            const vec3 e0 = cube.verts[f.loop[1]] - cube.verts[f.loop[0]], e1 = cube.verts[f.loop[2]] - cube.verts[f.loop[0]];
-            wound &= dot(cross(e0, e1), f.normal) > real(0);
-        }
-        CHECK(wound, "hull: every face loop is counter-clockwise seen from outside");
+        CHECK(wound_outward(cube), "hull: every face loop is counter-clockwise seen from outside");
 
         phys_body hb = static_hull(vec3(0, 0, 0), &cube), bx = static_box(vec3(0, 0, 0), vec3(1, 2, 3));
         // On a direction with no ties the support POINT must match; along a face
@@ -991,6 +1036,40 @@ int main() {
                   "delta_omega: a turned box hull spins exactly as the turned box does (R I^-1 R^T, mass 2)");
             CHECK(delta_omega(static_hull(vec3(0, 0, 0), &off), L).near_zero(),
                   "delta_omega: an immovable hull is rotation-free (role outranks shape)");
+        }
+
+        // 10c. Face clip (B4 step 3): one generic clip serves box-box, box-hull and
+        //      hull-hull, with the box as a 6-face view of it. The box-box manifold
+        //      of test 8e is the oracle for the hull pairings.
+        {
+            std::vector<phys_body> bb, bh, hh;
+            bb.push_back(static_box(vec3(0, 0, 0), vec3(1, 1, 1)));  bb.push_back(dynamic_box(vec3(0, real(1.9), 0), vec3(1, 1, 1)));
+            bh.push_back(static_box(vec3(0, 0, 0), vec3(1, 1, 1)));  bh.push_back(dynamic_hull(vec3(0, real(1.9), 0), &unit));
+            hh.push_back(static_hull(vec3(0, 0, 0), &unit));         hh.push_back(dynamic_hull(vec3(0, real(1.9), 0), &unit));
+            std::vector<contact> Cbb, Cbh, Chh;
+            build_contacts(bb, Cbb); build_contacts(bh, Cbh); build_contacts(hh, Chh);
+            CHECK(Cbb.size() == 4 && manifold_distance(Cbb, Cbh) < 1e-6 && manifold_distance(Cbb, Chh) < 1e-6,
+                  "face clip: box-hull and hull-hull give the box-box 4-point manifold, same points and depths");
+
+            // A hexagonal prism on the ground: six bottom vertices survive the clip.
+            // Tilted half a degree about z, the deepest four cluster on the low side
+            // (x extent 1.5 of 2); the spread rule keeps both ends of the footprint.
+            const hull_shape hex = prism_hull(6, real(1), real(0.5));
+            CHECK(wound_outward(hex) && hex.faces[0].loop.size() == 6, "hull: a hexagonal prism has six-vertex caps wound outward");
+            std::vector<phys_body> pb;
+            pb.push_back(static_box(vec3(0, -1, 0), vec3(10, 1, 10)));
+            pb.push_back(dynamic_hull(vec3(0, real(0.47), 0), &hex));
+            set_orientation(pb[1], quat_from_euler_zyx_degrees(vec3(0, 0, real(0.5))));
+            std::vector<contact> Cp;
+            build_contacts(pb, Cp);
+            real lo = 1, hi = -1, zlo = 1, zhi = -1;
+            for (const contact& k : Cp) {
+                lo = std::fmin(lo, k.p[0]); hi = std::fmax(hi, k.p[0]);
+                zlo = std::fmin(zlo, k.p[2]); zhi = std::fmax(zhi, k.p[2]);
+            }
+            printf("  tilted hexagonal prism: %d contacts, x extent %.3f, z extent %.3f\n", (int)Cp.size(), (double)(hi - lo), (double)(zhi - zlo));
+            CHECK(Cp.size() == 4 && hi - lo > real(1.99) && zhi - zlo > real(1.7),
+                  "face clip: the spread rule keeps the whole footprint of a tilted hexagonal prism");
         }
     }
 

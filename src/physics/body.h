@@ -12,6 +12,8 @@ enum motion_type { STATIC, KINEMATIC, DYNAMIC };
 
 enum collider_type { COLLIDER_SPHERE, COLLIDER_BOX, COLLIDER_HULL };
 
+static const int HULL_MAX_LOOP = 32;   // max vertices per face loop
+
 struct hull_shape {
     struct face { 
         vec3 normal; 
