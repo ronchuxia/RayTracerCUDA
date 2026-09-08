@@ -51,6 +51,36 @@ static phys_body rotated_box_y(const vec3& centre, const vec3& half, real deg) {
     set_orientation(b, quat_from_euler_zyx_degrees(vec3(0, deg, 0)));
     return b;
 }
+// A box as a HULL (B4): the same eight corners, six faces with counter-clockwise
+// loops seen from outside. The analytic box is the oracle for every hull assertion.
+static hull_shape box_hull(const vec3& half) {
+    hull_shape h;
+    for (int i = 0; i < 8; i++)
+        h.verts.push_back(vec3(i & 1 ? half[0] : -half[0], i & 2 ? half[1] : -half[1], i & 4 ? half[2] : -half[2]));
+    for (int a = 0; a < 3; a++)
+        for (int sgn = -1; sgn <= 1; sgn += 2) {
+            hull_shape::face f;
+            f.normal = vec3(a == 0 ? sgn : 0, a == 1 ? sgn : 0, a == 2 ? sgn : 0);
+            const int u = (a + 1) % 3, v = (a + 2) % 3;              // u x v = normal for sgn > 0
+            for (int k = 0; k < 4; k++) {                            // counter-clockwise about +normal
+                const int cu = (k == 1 || k == 2), cv = (k >= 2);
+                int idx = 0;
+                if (a == 0 ? sgn > 0 : (u == 0 ? cu : cv)) idx |= 1;
+                if (a == 1 ? sgn > 0 : (u == 1 ? cu : cv)) idx |= 2;
+                if (a == 2 ? sgn > 0 : (u == 2 ? cu : cv)) idx |= 4;
+                f.loop.push_back(idx);
+            }
+            if (sgn < 0) { int t = f.loop[1]; f.loop[1] = f.loop[3]; f.loop[3] = t; }   // mirror the winding for -normal
+            h.faces.push_back(f);
+        }
+    h.radius = half.length();
+    return h;
+}
+static phys_body static_hull(const vec3& centre, const hull_shape* hull) {
+    phys_body b{ -1, centre, vec3(0,0,0), vec3() };
+    b.motion = STATIC; b.shape = COLLIDER_HULL; b.hull = hull;
+    return b;
+}
 static phys_body ball(int scene_id, const vec3& pos, const vec3& vel, real r,
                       real m = real(1), real friction = real(0.5),
                       real restitution = real(0.7)) {
@@ -887,6 +917,51 @@ int main() {
             CHECK(std::fabs((double)maxv - 2.0) < 1e-6,
                   "the sleep metric is a SURFACE speed: |omega| * r counts, not just |v|");
         }
+    }
+
+    // 10. CONVEX HULL (B4 step 1): a hull is a shared vertex/face list in the body's
+    //     frame; support() scans its vertices. A box-shaped hull must be
+    //     indistinguishable from the analytic box wherever GJK/EPA is the path.
+    {
+        const hull_shape cube = box_hull(vec3(1, 2, 3));
+        CHECK(cube.faces.size() == 6 && cube.faces[0].loop.size() == 4, "hull: a box hull has six four-vertex faces");
+        bool wound = true;                                           // every loop counter-clockwise about its normal
+        for (const hull_shape::face& f : cube.faces) {
+            const vec3 e0 = cube.verts[f.loop[1]] - cube.verts[f.loop[0]], e1 = cube.verts[f.loop[2]] - cube.verts[f.loop[0]];
+            wound &= dot(cross(e0, e1), f.normal) > real(0);
+        }
+        CHECK(wound, "hull: every face loop is counter-clockwise seen from outside");
+
+        phys_body hb = static_hull(vec3(0, 0, 0), &cube), bx = static_box(vec3(0, 0, 0), vec3(1, 2, 3));
+        // On a direction with no ties the support POINT must match; along a face
+        // normal several corners tie and the two shapes may pick different ones, so
+        // there only the support VALUE (the projection GJK consumes) is compared.
+        const vec3 exact[] = { vec3(1, -1, 1), vec3(-3, 2, real(0.5)) }, tied[] = { vec3(0, 1, 0), vec3(0, 0, -1) };
+        bool same = true;
+        for (const vec3& d : exact) same &= (support(hb, d) - support(bx, d)).length() < real(1e-9);
+        for (const vec3& d : tied)  same &= std::fabs((double)(dot(support(hb, d), d) - dot(support(bx, d), d))) < 1e-9;
+        CHECK(same, "hull support: a box hull answers with the analytic box's corners");
+
+        phys_body hr = hb, br = rotated_box_y(vec3(0, 0, 0), vec3(1, 2, 3), real(45));
+        set_orientation(hr, quat_from_euler_zyx_degrees(vec3(0, 45, 0)));
+        CHECK(std::fabs((double)(dot(support(hr, vec3(1, 0, 0)), vec3(1, 0, 0)) - dot(support(br, vec3(1, 0, 0)), vec3(1, 0, 0)))) < 1e-6,
+              "hull support: turned 45 degrees it reaches as far as the turned box's corner");
+
+        vec3 nh, nb; real ph, pb;                                    // sphere overlapping the top face by 0.5
+        phys_body sp = ball(-1, vec3(0, real(2.5), 0), vec3(), real(1));
+        bool hit_h = gjk_epa_contact(sp, hb, nh, ph), hit_b = gjk_epa_contact(sp, bx, nb, pb);
+        CHECK(hit_h && hit_b && (nh - nb).length() < real(1e-4) && std::fabs((double)(ph - pb)) < 1e-4,
+              "gjk/epa: sphere vs box hull gives the box's normal and depth");
+        CHECK(std::fabs((double)nh[1] - 1) < 1e-3 && std::fabs((double)ph - 0.5) < 1e-3,
+              "gjk/epa: sphere on the hull's top face: normal +y, depth 0.5");
+
+        hull_shape unit = box_hull(vec3(1, 1, 1));                   // two hulls overlapping 0.1 along x, as test 8c's boxes
+        vec3 n; real pen;
+        CHECK(gjk_epa_contact(static_hull(vec3(0, 0, 0), &unit), static_hull(vec3(real(1.9), 0, 0), &unit), n, pen)
+              && std::fabs((double)n[0] + 1) < 1e-3 && std::fabs((double)pen - 0.1) < 1e-3,
+              "gjk/epa: hull overlapping a hull along x gives normal -x, depth 0.1");
+        CHECK(!gjk_epa_contact(static_hull(vec3(0, 0, 0), &unit), static_hull(vec3(3, 0, 0), &unit), n, pen),
+              "gjk: two separated hulls do not touch");
     }
 
     printf(fails ? "PHYSICS TESTS FAILED (%d)\n" : "ALL PHYSICS TESTS PASSED\n", fails);

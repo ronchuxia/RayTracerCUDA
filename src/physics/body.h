@@ -2,6 +2,7 @@
 #define PHYSICS_BODY_H
 
 #include <cmath>
+#include <vector>
 
 #include "precision.h"   // real
 #include "quat.h"        // orientation
@@ -9,7 +10,14 @@
 
 enum motion_type { STATIC, KINEMATIC, DYNAMIC };
 
-enum collider_type { COLLIDER_SPHERE, COLLIDER_BOX };
+enum collider_type { COLLIDER_SPHERE, COLLIDER_BOX, COLLIDER_HULL };
+
+struct hull_shape {
+    struct face { vec3 normal; std::vector<int> loop; };
+    std::vector<vec3> verts;
+    std::vector<face> faces;
+    real radius = real(0);          // farthest vertex from the centre
+};
 
 struct phys_body {
     int  scene_id;
@@ -39,6 +47,9 @@ struct phys_body {
 
     // -- COLLIDER_BOX --
     vec3          half       = vec3(0, 0, 0);   // the box's half extents
+
+    // -- COLLIDER_HULL --
+    const hull_shape* hull   = nullptr;
 };
 
 // set the orientation and derive its x/y/z axes in world space

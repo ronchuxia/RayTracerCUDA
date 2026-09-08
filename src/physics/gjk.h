@@ -18,6 +18,15 @@ inline vec3 support(const phys_body& b, const vec3& dir) {
         if (len2 < real(1e-20)) return b.pos;
         return b.pos + dir * (b.radius / std::sqrt(len2));
     }
+    if (b.shape == COLLIDER_HULL) {
+        const vec3 d(dot(dir, b.axes[0]), dot(dir, b.axes[1]), dot(dir, b.axes[2]));
+        const vec3* best = &b.hull->verts[0];
+        for (const vec3& v : b.hull->verts)
+            if (dot(v, d) > dot(*best, d))
+                best = &v;
+        return b.pos + b.axes[0] * (*best)[0] + b.axes[1] * (*best)[1] + b.axes[2] * (*best)[2];
+    }
+    // COLLIDER_BOX
     vec3 p = b.pos;
     for (int i = 0; i < 3; i++)
         p += b.axes[i] * (dot(dir, b.axes[i]) >= real(0) ? b.half[i] : -b.half[i]);
