@@ -62,7 +62,7 @@ static real halton(int i, int base) {
 // color/gbuffer -> RGBA8
 __global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, primary_hits ph, int view, int rw, int rh,
                               const float3* denoised,
-                              uchar4* out, int w, int h, int samples) {
+                              uchar4* out, int w, int h, int samples, bool bgra) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= w || j >= h) return;
@@ -89,7 +89,7 @@ __global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, pri
     else                c = accum[idx] * inv;                                    // beauty
     unsigned char r, g, b;
     tonemap_pixel(c, 1, r, g, b, view <= 1 || view == 7 || view == 8);           // colours get gamma, data views not
-    out[j * w + i] = make_uchar4(r, g, b, 255);
+    out[j * w + i] = bgra ? make_uchar4(b, g, r, 255) : make_uchar4(r, g, b, 255);
 }
 
 // frame accumulation
@@ -920,7 +920,7 @@ int main() {
         const float3* denoised = dn ? dn->output : nullptr;
 
         // tonemap into the presented frame
-        tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, ph, view, RW, RH, denoised, vk.frame_target(), FW, FH, total_samples);
+        tonemap_frame<<<blocks_out, threads>>>(accum, gb, ff, ph, view, RW, RH, denoised, vk.frame_target(), FW, FH, total_samples, vk.bgra);
 
         // frame generation inputs
         bool fg = fg_on && !guide_view && vk.fg.feature;

@@ -5,6 +5,11 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +49,34 @@ inline void barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, VkImageL
     vkCmdPipelineBarrier(c, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
+inline void begin_cmd(VkCommandBuffer c) {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    checkVk(vkBeginCommandBuffer(c, &bi));
+}
+
+inline void make_image_2d(VkDevice dev, VkPhysicalDevice phys, int w, int h, VkFormat fmt, VkImageUsageFlags usage, VkImage& img, VkDeviceMemory& mem) {
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = fmt;
+    ici.extent = { (uint32_t)w, (uint32_t)h, 1 };
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = usage;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    checkVk(vkCreateImage(dev, &ici, nullptr, &img));
+
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(dev, img, &mr);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = memory_type(phys, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    checkVk(vkAllocateMemory(dev, &mai, nullptr, &mem));
+    checkVk(vkBindImageMemory(dev, img, mem, 0));
+}
+
 #include "viewer/framegen_vk.h"
 
 struct present_vk {
@@ -55,6 +88,7 @@ struct present_vk {
     VkQueue          queue = VK_NULL_HANDLE;
     VkSurfaceKHR     surface = VK_NULL_HANDLE;
     VkFormat         format = VK_FORMAT_UNDEFINED;
+    bool             bgra = false;                   // the frame buffer's channel order
     VkRenderPass     render_pass = VK_NULL_HANDLE;   // ImGui draws onto the blitted swapchain image
     VkCommandPool    pool = VK_NULL_HANDLE;
     VkCommandBuffer  cmd = VK_NULL_HANDLE;
@@ -63,7 +97,27 @@ struct present_vk {
     VkFence          fence = VK_NULL_HANDLE;
     bool             recording = false;
     float            ms_present = 0;
-    long             presented = 0;
+    std::atomic<long> presented{0};
+
+    // pacer
+    struct pace_set { std::vector<VkImage> imgs; std::chrono::steady_clock::time_point t0; };
+    std::thread             pacer;
+    std::mutex              mtx, qmtx;
+    std::condition_variable cv;
+    bool                    pacer_run = false, pacer_busy = false, has_pending = false;
+    pace_set                pending;
+    std::atomic<bool>       stale{false};            // the pacer hit an out-of-date swapchain
+    double                  interval = 0;
+    std::chrono::steady_clock::time_point last_handoff{};
+    VkSemaphore             sem_render = VK_NULL_HANDLE;
+    VkCommandPool           pool_p = VK_NULL_HANDLE;
+    VkCommandBuffer         cmd_p = VK_NULL_HANDLE;
+    VkFence                 fence_p = VK_NULL_HANDLE;
+    VkImage                 present_img = VK_NULL_HANDLE;
+    VkDeviceMemory          present_mem = VK_NULL_HANDLE;
+    VkImageView             present_view = VK_NULL_HANDLE;
+    VkFramebuffer           present_fb = VK_NULL_HANDLE;
+    std::vector<VkFramebuffer> out_fbs;
     char             device_name[256] = "";
     bool             same_gpu = false;               // the Vulkan device is the CUDA device (UUID match)
     bool             fg_capable = false;             // the device offers NGX's extensions
@@ -148,6 +202,23 @@ struct present_vk {
             }
         }
 
+        // surface format
+        uint32_t nf = 0;
+        vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, &nf, nullptr);
+        std::vector<VkSurfaceFormatKHR> fmts(nf); 
+        vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, &nf, fmts.data());
+        format = VK_FORMAT_UNDEFINED;
+        for (auto& f : fmts)
+            if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) {
+                format = f.format;
+                break;
+            }
+        if (format == VK_FORMAT_UNDEFINED) {
+            fprintf(stderr, "Vulkan: the surface offers no 8-bit UNORM format\n");
+            exit(97);
+        }
+        bgra = format == VK_FORMAT_B8G8R8A8_UNORM;
+
         // logical device
         // device queue
         float prio = 1.f;
@@ -183,18 +254,6 @@ struct present_vk {
         vkGetDeviceQueue(dev, qfam, 0, &queue);
         if (same_gpu) vkGetMemoryFdKHR = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(dev, "vkGetMemoryFdKHR");
         if (fg_capable) fg.init(instance, phys, dev, queue, qfam, vkGetMemoryFdKHR);
-
-        // surface format
-        uint32_t nf = 0; 
-        vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, &nf, nullptr);
-        std::vector<VkSurfaceFormatKHR> fmts(nf); 
-        vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, &nf, fmts.data());
-        format = fmts[0].format;
-        for (auto& f : fmts)
-            if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) {
-                format = f.format;
-                break;
-            }
 
         // render pass for ImGui
         // attachment
@@ -248,7 +307,17 @@ struct present_vk {
         fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         checkVk(vkCreateFence(dev, &fci, nullptr, &fence));
 
+        // the pacer's command buffer
+        checkVk(vkCreateCommandPool(dev, &pci, nullptr, &pool_p));
+        cai.commandPool = pool_p;
+        checkVk(vkAllocateCommandBuffers(dev, &cai, &cmd_p));
+        // the pacer's sync objects
+        checkVk(vkCreateFence(dev, &fci, nullptr, &fence_p));
+        checkVk(vkCreateSemaphore(dev, &sci, nullptr, &sem_render));
+
         create_swapchain();
+        pacer_run = true;
+        pacer = std::thread([this] { pacer_loop(); });
 
         // ImGui
         ImGui_ImplVulkan_InitInfo ii{};
@@ -260,7 +329,7 @@ struct present_vk {
         ii.Queue = queue;
         ii.DescriptorPoolSize = 8;
         ii.MinImageCount = 2;
-        ii.ImageCount = (uint32_t)images.size();
+        ii.ImageCount = (uint32_t)images.size() + fg.max_frames + 1;
         ii.PipelineInfoMain.RenderPass = render_pass;
         ii.CheckVkResultFn = [](VkResult r) { check_vk(r, "ImGui_ImplVulkan", __FILE__, __LINE__); };
         ImGui_ImplVulkan_Init(&ii);
@@ -312,14 +381,7 @@ struct present_vk {
             vci.format = format;
             vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             checkVk(vkCreateImageView(dev, &vci, nullptr, &views[i]));
-            VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-            fbi.renderPass = render_pass;
-            fbi.attachmentCount = 1;
-            fbi.pAttachments = &views[i];
-            fbi.width = extent.width;
-            fbi.height = extent.height;
-            fbi.layers = 1;
-            checkVk(vkCreateFramebuffer(dev, &fbi, nullptr, &framebuffers[i]));
+            framebuffers[i] = make_fb(views[i], extent.width, extent.height);
         }
     }
 
@@ -337,7 +399,14 @@ struct present_vk {
 
     // create or recreate the swapchain
     void resize(int fw, int fh, int rw, int rh) {
+        drain();
         vkDeviceWaitIdle(dev);
+        stale = false;
+
+        vkDestroySemaphore(dev, sem_render, nullptr);
+        VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        checkVk(vkCreateSemaphore(dev, &sci, nullptr, &sem_render));
+
         destroy_swapchain();
         release_frame();
         create_swapchain();
@@ -348,26 +417,11 @@ struct present_vk {
         VkDeviceSize bytes = (VkDeviceSize)FW * FH * 4;
 
         // frame image
-        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = VK_FORMAT_R8G8B8A8_UNORM;
-        ici.extent = { (uint32_t)FW, (uint32_t)FH, 1 };
-        ici.mipLevels = 1;
-        ici.arrayLayers = 1;
-        ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        checkVk(vkCreateImage(dev, &ici, nullptr, &frame_img));
-        VkMemoryRequirements mr;
-        vkGetImageMemoryRequirements(dev, frame_img, &mr);
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        mai.allocationSize = mr.size;
-        mai.memoryTypeIndex = memory_type(phys, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        checkVk(vkAllocateMemory(dev, &mai, nullptr, &frame_img_mem));
-        checkVk(vkBindImageMemory(dev, frame_img, frame_img_mem, 0));
+        make_image_2d(dev, phys, FW, FH, format, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, frame_img, frame_img_mem);
 
         // frame buffer
+        VkMemoryRequirements mr;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         VkExternalMemoryBufferCreateInfo ebi{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         ebi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -408,29 +462,104 @@ struct present_vk {
             checkVk(vkMapMemory(dev, frame_mem, 0, bytes, 0, &h_frame));
             checkCudaErrors(cudaMalloc(&d_rgba, bytes));
         }
-        if (fg.wanted) fg.resize(FW, FH, RW, RH, frame_img);
+        if (fg.wanted) { fg.resize(FW, FH, RW, RH, frame_img, format); make_fg_targets(); }
     }
 
     // enable/disable frame generation
     void enable_fg(bool on) {
         if (on == fg.wanted) return;
         fg.wanted = on;
-        
+        drain();
         vkDeviceWaitIdle(dev);
-        if (on) fg.resize(FW, FH, RW, RH, frame_img);
-        else    fg.release_feature();
+        if (on) { fg.resize(FW, FH, RW, RH, frame_img, format); make_fg_targets(); }
+        else    { free_fg_targets(); fg.release_feature(); }
+    }
+
+    VkFramebuffer make_fb(VkImageView view, uint32_t w, uint32_t h) {
+        VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fbi.renderPass = render_pass;
+        fbi.attachmentCount = 1;
+        fbi.pAttachments = &view;
+        fbi.width = w;
+        fbi.height = h;
+        fbi.layers = 1;
+        VkFramebuffer fb;
+        checkVk(vkCreateFramebuffer(dev, &fbi, nullptr, &fb));
+        return fb;
+    }
+
+    void make_fg_targets() {
+        free_fg_targets();
+        make_image_2d(dev, phys, FW, FH, format, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, present_img, present_mem);
+        fg.make_view(present_img, format, present_view);
+        present_fb = make_fb(present_view, FW, FH);
+        for (auto& im : fg.out) out_fbs.push_back(make_fb(im.view, FW, FH));
+    }
+
+    void free_fg_targets() {
+        for (auto fb : out_fbs) vkDestroyFramebuffer(dev, fb, nullptr);
+        out_fbs.clear();
+        if (present_fb)   vkDestroyFramebuffer(dev, present_fb, nullptr);
+        if (present_view) vkDestroyImageView(dev, present_view, nullptr);
+        if (present_img)  vkDestroyImage(dev, present_img, nullptr);
+        if (present_mem)  vkFreeMemory(dev, present_mem, nullptr);
+        present_fb = VK_NULL_HANDLE; present_view = VK_NULL_HANDLE; present_img = VK_NULL_HANDLE; present_mem = VK_NULL_HANDLE;
+    }
+
+    // wait until the pacer has shown the previous set
+    void drain() {
+        std::unique_lock<std::mutex> lk(mtx);   // lock mtx
+        cv.wait(lk, [&] { return !pacer_busy && !has_pending; });   // unlock mtx, wait until (!pacer_busy && !has_pending)
     }
 
     // begin recording after the previous submit finished
     void begin() {
-        checkVk(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
-        checkVk(vkResetFences(dev, 1, &fence));
-
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        checkVk(vkBeginCommandBuffer(cmd, &bi));
-        
+        wait_fence(fence);
+        begin_cmd(cmd);
         recording = true;
+    }
+
+    void wait_fence(VkFence f) {
+        checkVk(vkWaitForFences(dev, 1, &f, VK_TRUE, UINT64_MAX));
+        checkVk(vkResetFences(dev, 1, &f));
+    }
+
+    bool acquire(uint32_t& idx) {
+        return vkAcquireNextImageKHR(dev, swapchain, UINT64_MAX, sem_acquire, VK_NULL_HANDLE, &idx) != VK_ERROR_OUT_OF_DATE_KHR;
+    }
+
+    void blit_to_swapchain(VkCommandBuffer c, VkImage src, uint32_t idx) {
+        barrier(c, images[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageBlit blit{};
+        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.srcOffsets[1] = { FW, FH, 1 };
+        blit.dstOffsets[1] = { (int)extent.width, (int)extent.height, 1 };
+        vkCmdBlitImage(c, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    }
+
+    VkResult submit_present(VkCommandBuffer c, VkFence f, uint32_t idx, bool wait_render) {
+        VkSemaphore waits[2] = { sem_acquire, sem_render };
+        VkPipelineStageFlags stages[2] = { VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT };
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.waitSemaphoreCount = wait_render ? 2 : 1;
+        si.pWaitSemaphores = waits;
+        si.pWaitDstStageMask = stages;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &c;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &sem_done[idx];
+        std::lock_guard<std::mutex> lk(qmtx);
+        checkVk(vkQueueSubmit(queue, 1, &si, f));
+        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &sem_done[idx];
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &swapchain;
+        pi.pImageIndices = &idx;
+        VkResult r = vkQueuePresentKHR(queue, &pi);
+        presented++;
+        return r;
     }
 
     // the CUDA-written frame → frame_img
@@ -452,75 +581,125 @@ struct present_vk {
         barrier(cmd, frame_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     }
 
-    // blit, draw ImGui, submit, present. returns false when the swapchain was out of date
-    bool show(VkImage src, ImDrawData* ui) {
-        if (!recording) begin();
-
+    bool show(VkImage src, ImDrawData* ui, VkCommandBuffer c, VkFence f, bool wait_render) {
         uint32_t idx;
-        VkResult r = vkAcquireNextImageKHR(dev, swapchain, UINT64_MAX, sem_acquire, VK_NULL_HANDLE, &idx);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR) {
-            checkVk(vkEndCommandBuffer(cmd));
-            recording = false;
-            checkVk(vkQueueSubmit(queue, 0, nullptr, fence));
-            resize(FW, FH, RW, RH);
+        if (!acquire(idx)) {
+            checkVk(vkEndCommandBuffer(c));
+            std::lock_guard<std::mutex> lk(qmtx);
+            checkVk(vkQueueSubmit(queue, 0, nullptr, f));   // the fence was reset for this submit; signal it without work
             return false;
         }
-
-        barrier(cmd, images[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        VkImageBlit blit{};
-        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        blit.srcOffsets[1] = { FW, FH, 1 };
-        blit.dstOffsets[1] = { (int)extent.width, (int)extent.height, 1 };
-        vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
-        
-        // ImGui
-        VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-        rbi.renderPass = render_pass;
-        rbi.framebuffer = framebuffers[idx];
-        rbi.renderArea.extent = extent;
-        vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-        ImGui_ImplVulkan_RenderDrawData(ui, cmd);
-        vkCmdEndRenderPass(cmd);
-        checkVk(vkEndCommandBuffer(cmd));
-        recording = false;
-
-        // submit
-        VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &sem_acquire;
-        si.pWaitDstStageMask = &wait_stage;
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd;
-        si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &sem_done[idx];
-        checkVk(vkQueueSubmit(queue, 1, &si, fence));
-
-        // present
-        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-        pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &sem_done[idx];
-        pi.swapchainCount = 1;
-        pi.pSwapchains = &swapchain;
-        pi.pImageIndices = &idx;
-        r = vkQueuePresentKHR(queue, &pi);
-        presented++;
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { resize(FW, FH, RW, RH); return false; }
+        blit_to_swapchain(c, src, idx);
+        if (ui) {                                            // the render pass ends in PRESENT_SRC
+            VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            rbi.renderPass = render_pass;
+            rbi.framebuffer = framebuffers[idx];
+            rbi.renderArea.extent = extent;
+            vkCmdBeginRenderPass(c, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+            { std::lock_guard<std::mutex> lk(qmtx); ImGui_ImplVulkan_RenderDrawData(ui, c); }   // may upload a texture (queue submit + wait)
+            vkCmdEndRenderPass(c);
+        } else {
+            barrier(c, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
+        }
+        checkVk(vkEndCommandBuffer(c));
+        VkResult r = submit_present(c, f, idx, wait_render);
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) return false;
         checkVk(r);
         return true;
     }
 
+    void draw_ui(VkImage img, VkFramebuffer fb, ImDrawData* ui, VkImageLayout from, VkAccessFlags from_access) {
+        barrier(cmd, img, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, from_access, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);   // the render pass's initialLayout
+        VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rbi.renderPass = render_pass;
+        rbi.framebuffer = fb;
+        rbi.renderArea.extent = { (uint32_t)FW, (uint32_t)FH };
+        vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        { std::lock_guard<std::mutex> lk(qmtx); ImGui_ImplVulkan_RenderDrawData(ui, cmd); }
+        vkCmdEndRenderPass(cmd);
+        barrier(cmd, img, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    }
+
     void present(ImDrawData* ui, NVSDK_NGX_DLSSG_Opt_Eval_Params* fgp = nullptr, int fg_count = 0) {
         double t0 = SDL_GetPerformanceCounter() * 1000.0 / SDL_GetPerformanceFrequency();
+        drain();
+        if (stale) { resize(FW, FH, RW, RH); return; }             // the pacer found the swapchain out of date
         upload();
         if (fgp && fg.feature) {
             fg.evaluate(cmd, frame_img, *fgp, fg_count);
-            for (int k = 0; k < fg_count; k++)
-                if (!show(fg.out[k].img, ui)) return;
+            barrier(cmd, present_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            
+            VkImageCopy region{};
+            region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.extent = { (uint32_t)FW, (uint32_t)FH, 1 };
+            vkCmdCopyImage(cmd, frame_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, present_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            
+            pace_set set;
+            for (int k = 0; k < fg_count; k++) {
+                draw_ui(fg.out[k].img, out_fbs[k], ui, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT);
+                set.imgs.push_back(fg.out[k].img);
+            }
+            draw_ui(present_img, present_fb, ui, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT);
+            set.imgs.push_back(present_img);
+
+            checkVk(vkEndCommandBuffer(cmd));
+            recording = false;
+
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &cmd;
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores = &sem_render;
+            { std::lock_guard<std::mutex> lk(qmtx); checkVk(vkQueueSubmit(queue, 1, &si, fence)); }
+
+            auto now = std::chrono::steady_clock::now();
+            if (last_handoff.time_since_epoch().count()) {
+                double dt = std::chrono::duration<double>(now - last_handoff).count();
+                interval = interval == 0 ? dt : 0.8 * interval + 0.2 * dt;
+            }
+            last_handoff = now;
+            set.t0 = now;
+            { std::lock_guard<std::mutex> lk(mtx); pending = std::move(set); has_pending = true; }
+            cv.notify_all();
+        } else {
+            last_handoff = {};
+            interval = 0;
+            if (!recording) begin();
+            bool ok = show(frame_img, ui, cmd, fence, false);
+            recording = false;
+            if (!ok) resize(FW, FH, RW, RH);
         }
-        show(frame_img, ui);
         ms_present = (float)(SDL_GetPerformanceCounter() * 1000.0 / SDL_GetPerformanceFrequency() - t0);
+    }
+
+    void pacer_loop() {
+        for (;;) {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv.wait(lk, [&] { return has_pending || !pacer_run; });
+
+            if (!pacer_run) return;
+
+            pace_set set = std::move(pending);
+            has_pending = false;
+            pacer_busy = true;
+
+            lk.unlock();
+            
+            int n = (int)set.imgs.size();
+            for (int k = 0; k < n; k++) {
+                std::this_thread::sleep_until(set.t0 + std::chrono::duration<double>(interval * k / n));
+                wait_fence(fence_p);
+                begin_cmd(cmd_p);
+                if (!show(set.imgs[k], nullptr, cmd_p, fence_p, k == 0)) { stale = true; break; }
+            }
+
+            lk.lock();
+            pacer_busy = false;
+            lk.unlock();
+            cv.notify_all();
+        }
     }
 
     void release_frame() {
@@ -538,14 +717,22 @@ struct present_vk {
     }
 
     void release() {
+        drain();
+        { std::lock_guard<std::mutex> lk(mtx); pacer_run = false; }
+        cv.notify_all();
+        pacer.join();
         vkDeviceWaitIdle(dev);
         ImGui_ImplVulkan_Shutdown();
+        free_fg_targets();
         if (fg_capable) fg.release();
         release_frame();
         destroy_swapchain();
         vkDestroyFence(dev, fence, nullptr);
+        vkDestroyFence(dev, fence_p, nullptr);
         vkDestroySemaphore(dev, sem_acquire, nullptr);
+        vkDestroySemaphore(dev, sem_render, nullptr);
         vkDestroyCommandPool(dev, pool, nullptr);
+        vkDestroyCommandPool(dev, pool_p, nullptr);
         vkDestroyRenderPass(dev, render_pass, nullptr);
         vkDestroyDevice(dev, nullptr);
         vkDestroySurfaceKHR(instance, surface, nullptr);

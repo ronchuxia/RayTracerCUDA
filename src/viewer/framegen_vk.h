@@ -41,6 +41,7 @@ struct framegen_vk {
     bool     wanted = false;
     unsigned max_frames = 1;
     int      FW = 0, FH = 0, RW = 0, RH = 0;
+    VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
     NVSDK_NGX_Result r_last = NVSDK_NGX_Result_Success;
 
     struct image {
@@ -125,27 +126,7 @@ struct framegen_vk {
     }
 
     void make_image(image& im, int w, int h, VkFormat fmt, VkImageUsageFlags usage) {
-        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = fmt;
-        ici.extent = { (uint32_t)w, (uint32_t)h, 1 };
-        ici.mipLevels = 1;
-        ici.arrayLayers = 1;
-        ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = usage;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        checkVk(vkCreateImage(dev, &ici, nullptr, &im.img));
-
-        VkMemoryRequirements mr;
-        vkGetImageMemoryRequirements(dev, im.img, &mr);
-
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        mai.allocationSize = mr.size;
-        mai.memoryTypeIndex = memory_type(phys, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        checkVk(vkAllocateMemory(dev, &mai, nullptr, &im.mem));
-        checkVk(vkBindImageMemory(dev, im.img, im.mem, 0));
-
+        make_image_2d(dev, phys, w, h, fmt, usage, im.img, im.mem);
         make_view(im.img, fmt, im.view);
         describe(im.res, im.view, im.img, fmt, w, h, (usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0);
     }
@@ -197,7 +178,8 @@ struct framegen_vk {
         b = xbuf{};
     }
 
-    void resize(int w, int h, int rw, int rh, VkImage frame_img) {
+    void resize(int w, int h, int rw, int rh, VkImage frame_img, VkFormat format) {
+        fmt = format;
         release_feature();
 
         FW = w; FH = h; RW = rw; RH = rh;
@@ -206,19 +188,16 @@ struct framegen_vk {
         
         out.resize(max_frames);
         
-        for (image& im : out) make_image(im, FW, FH, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        for (image& im : out) make_image(im, FW, FH, fmt, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);   // the HUD is drawn onto them
         
-        make_view(frame_img, VK_FORMAT_R8G8B8A8_UNORM, backbuffer_view);
-        describe(backbuffer, backbuffer_view, frame_img, VK_FORMAT_R8G8B8A8_UNORM, FW, FH, false);
+        make_view(frame_img, fmt, backbuffer_view);
+        describe(backbuffer, backbuffer_view, frame_img, fmt, FW, FH, false);
         
         make_xbuf(depth_buf, (VkDeviceSize)RW * RH * sizeof(float));
         make_xbuf(mv_buf,    (VkDeviceSize)RW * RH * sizeof(float2));
 
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        checkVk(vkBeginCommandBuffer(cmd, &bi));
-
-        NVSDK_NGX_DLSSG_Create_Params cp{ (unsigned)FW, (unsigned)FH, (unsigned)VK_FORMAT_R8G8B8A8_UNORM, (unsigned)RW, (unsigned)RH, false };
+        begin_cmd(cmd);
+        NVSDK_NGX_DLSSG_Create_Params cp{ (unsigned)FW, (unsigned)FH, (unsigned)fmt, (unsigned)RW, (unsigned)RH, false };
         NVSDK_NGX_Result r = NGX_VK_CREATE_DLSSG(cmd, 0, 0, &feature, params, &cp);
         
         checkVk(vkEndCommandBuffer(cmd));
