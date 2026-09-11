@@ -10,52 +10,30 @@
 #include "scenes/scene_utils.h"
 #include "loaders/stl_loader.h"
 
-// Badge scene (Phase 4 parity milestone): the fork's sphere scene — ground,
-// a field of random small spheres, three big spheres (glass / diffuse /
-// mirror), an emissive sphere light — plus the school-badge STL mesh, loaded
-// into a contiguous triangle array, BVH'd, and placed with transforms exactly
-// like the fork (uniform_scale 0.033, translate(-3, 0, -5)).
-
-// Badge-scene knobs (the shared RT_* knobs live in main.cu):
 #ifndef RT_BADGE_STL
-#define RT_BADGE_STL "references/RayTracing/src/InOneWeekend/school_badge2.STL"
+#define RT_BADGE_STL "assets/cmu_badge.stl"
 #endif
 #ifndef RT_BADGE_FIELD
-#define RT_BADGE_FIELD 1   // 1: include the random sphere field; 0: skip it
-                           // (tests use 0 so the flat-list render path stays fast)
+#define RT_BADGE_FIELD 1
 #endif
 
 inline void badge() {
     auto start = std::chrono::system_clock::now();
     std::clog << "Creating Scene.\n" << std::flush;
 
-    // Increase CUDA stack size to prevent stack overflow. The badge is a
-    // nested BVH behind transforms (world BVH → translate → scale → mesh BVH
-    // → triangle), the deepest dispatch chain of the three scenes.
-    checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 4096));
-
     // world
-    hittable_list* world;
-    checkCudaErrors(cudaMallocManaged((void**)&world, sizeof(hittable_list)));
-    new(world) hittable_list();
-
-    hittable* world_hittable;
-    checkCudaErrors(cudaMallocManaged((void**)&world_hittable, sizeof(hittable)));
-    world_hittable->type = HITTABLE_LIST;
-    world_hittable->id = -1;
-    world_hittable->object = world;
+    world* w;
+    checkCudaErrors(cudaMallocManaged((void**)&w, sizeof(world)));
+    new(w) world();
 
     std::vector<void*> allocs;
-    std::vector<bvh*> bvh_dtors;   // mesh BVHs; dtors run at teardown
+    std::vector<mesh*> mesh_dtors;
 
     // ground
     material* ground = new_lambertian(color(0.5, 0.5, 0.5), allocs);
-    add_sphere(world, point3(0, -1000, 0), 1000, ground, allocs);
+    add_sphere(w, point3(0, -1000, 0), 1000, ground, allocs);
 
 #if RT_BADGE_FIELD
-    // Random sphere field, following the fork's loop. The fork uses the book's
-    // rand()-based random_double(), so the exact layout differs; a fixed-seed
-    // mt19937 keeps OUR layout deterministic (byte-identical test renders).
     {
         std::mt19937 rng(20240713);
         std::uniform_real_distribution<double> rd(0.0, 1.0);
@@ -69,53 +47,39 @@ inline void badge() {
                     if (choose_mat < 0.8) {
                         // diffuse
                         auto albedo = color(rd(rng)*rd(rng), rd(rng)*rd(rng), rd(rng)*rd(rng));
-                        add_sphere(world, center, 0.2, new_lambertian(albedo, allocs), allocs);
+                        add_sphere(w, center, 0.2, new_lambertian(albedo, allocs), allocs);
                     } else if (choose_mat < 0.95) {
                         // metal
                         auto albedo = color(0.5 + 0.5*rd(rng), 0.5 + 0.5*rd(rng), 0.5 + 0.5*rd(rng));
                         auto fuzz = 0.5*rd(rng);
-                        add_sphere(world, center, 0.2, new_metal(albedo, fuzz, allocs), allocs);
+                        add_sphere(w, center, 0.2, new_metal(albedo, fuzz, allocs), allocs);
                     } else {
                         // glass
-                        add_sphere(world, center, 0.2, new_dielectric(1.5, allocs), allocs);
+                        add_sphere(w, center, 0.2, new_dielectric(1.5, allocs), allocs);
                     }
                 }
             }
         }
-        std::clog << "Number of spheres: " << world->size << "\n" << std::flush;
+        std::clog << "Number of spheres: " << w->item_count << "\n" << std::flush;
     }
 #endif
 
     // the three big spheres
-    add_sphere(world, point3(0, 1, 0),  1.0, new_dielectric(1.5, allocs), allocs);
-    add_sphere(world, point3(-4, 1, 0), 1.0, new_lambertian(color(0.4, 0.2, 0.1), allocs), allocs);
-    add_sphere(world, point3(4, 1, 0),  1.0, new_metal(color(0.7, 0.6, 0.5), 0.0, allocs), allocs);
+    add_sphere(w, point3(0, 1, 0),  1.0, new_dielectric(1.5, allocs), allocs);
+    add_sphere(w, point3(-4, 1, 0), 1.0, new_lambertian(color(0.4, 0.2, 0.1), allocs), allocs);
+    add_sphere(w, point3(4, 1, 0),  1.0, new_metal(color(0.7, 0.6, 0.5), 0.0, allocs), allocs);
 
-    // school-badge STL mesh: contiguous triangles + dedicated BVH, placed with
-    // transforms (fork values: scale 0.033, translate(-3, 0, -5))
+    // badge
     material* badge_mat = new_metal(color(0.7, 0.6, 0.5), 0.5, allocs);
-    hittable* badge_mesh = load_stl(RT_BADGE_STL, badge_mat, allocs, bvh_dtors);
-    badge_mesh = new_uniform_scale(badge_mesh, 0.033, allocs);
-    badge_mesh = new_translate(badge_mesh, vec3(-3, 0, -5), allocs);
-    world->add(badge_mesh);
+    mesh* badge_mesh = load_stl(RT_BADGE_STL, badge_mat, allocs, mesh_dtors);
+    w->add(make_instance(badge_mesh, vec3(-3, 0, -5), vec3(0, 0, 0), vec3(0.033, 0.033, 0.033)));
 
     // diffuse_light
     material* light = new_diffuse_light(color(10, 10, 10), allocs);
-    add_sphere(world, point3(0, 30, -30), 10.0, light, allocs);
+    add_sphere(w, point3(0, 30, -30), 10.0, light, allocs);
 
-    // world_bvh over the same objects
-    bvh* world_bvh;
-    checkCudaErrors(cudaMallocManaged((void**)&world_bvh, sizeof(bvh)));
-    new(world_bvh) bvh();
-    for (int i = 0; i < world->size; i++)
-        world_bvh->add(*world->objects[i]);
-    world_bvh->build();
-
-    hittable* world_bvh_hittable;
-    checkCudaErrors(cudaMallocManaged((void**)&world_bvh_hittable, sizeof(hittable)));
-    world_bvh_hittable->type = BVH;
-    world_bvh_hittable->id = -1;
-    world_bvh_hittable->object = world_bvh;
+    // build bvh
+    w->build();
 
     // camera (same as the fork's badge scene)
     camera* cam;
@@ -141,11 +105,7 @@ inline void badge() {
     std::clog << "Rendering.\n" << std::flush;
 
     auto render_start = std::chrono::system_clock::now();
-#if USE_BVH
-    cam->render(*world_bvh_hittable);
-#else
-    cam->render(*world_hittable);
-#endif
+    cam->render(*w);
 
     auto end = std::chrono::system_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
@@ -155,16 +115,12 @@ inline void badge() {
     std::clog << "Render time: " << render_duration.count() << "ms.\n" << std::flush;
 
     // clean up
-    for (bvh* m : bvh_dtors)
-        m->~bvh();       // frees each mesh BVH's internal buffers
+    for (mesh* m : mesh_dtors)
+        m->~mesh();
     for (void* p : allocs)
         cudaFree(p);
-    world_bvh->~bvh();         // frees its nodes/prim_index/prims buffers
-    cudaFree(world_bvh);
-    cudaFree(world_bvh_hittable);
-    world->~hittable_list();   // frees its objects array
-    cudaFree(world);
-    cudaFree(world_hittable);
+    w->~world();
+    cudaFree(w);
     cudaFree(cam);
 }
 

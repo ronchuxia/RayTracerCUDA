@@ -42,7 +42,7 @@ struct primary_hits {
 
 static constexpr real delta_roughness = real(0.08);
 
-__device__ inline void hit_through_pixel(const camera& cam, int i, int j, const hittable& world, curandState* state, bool psr,
+__device__ inline void hit_through_pixel(const camera& cam, int i, int j, const world& w, curandState* state, bool psr,
                                          primary_hits ph, int idx) {
     ray r = cam.get_ray_through_pixel(i, j);
     point3 origin = r.origin();
@@ -55,7 +55,7 @@ __device__ inline void hit_through_pixel(const camera& cam, int i, int j, const 
     hit_record rec;
     bool hit;
     for (;; k++) {
-        hit = world.hit(r, interval(real(0.001), infinity), rec, state);
+        hit = w.hit(r, interval(real(0.001), infinity), rec, state);
         if (!hit) break;
 
         len += (rec.p - r.origin()).length();
@@ -118,7 +118,7 @@ __device__ inline void hit_through_pixel(const camera& cam, int i, int j, const 
         if (psr && k == 0 && (rec.mat->type == METAL || rec.mat->type == DIELECTRIC)) {
             r = ray(rec.p, reflect(unit_vector(r.direction()), rec.normal));
             hit_record rec1;
-            ph.spec_dist[idx] = world.hit(r, interval(real(0.001), infinity), rec1, state) ? (rec1.p - rec.p).length() : real(1e4);
+            ph.spec_dist[idx] = w.hit(r, interval(real(0.001), infinity), rec1, state) ? (rec1.p - rec.p).length() : real(1e4);
         } else{
             ph.spec_dist[idx] = 0;
         }

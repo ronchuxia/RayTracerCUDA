@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dense-scene render benchmark: flat hittable_list vs. flattened BVH.
+# Dense-scene render benchmark: flat instance walk vs. flattened BVH.
 # Timings print to stderr; the PPM output is discarded.
 #   ARCH=sm_75 tests/run_benchmark.sh   # override the auto-detected GPU arch
 set -euo pipefail

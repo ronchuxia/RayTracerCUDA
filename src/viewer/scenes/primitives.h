@@ -16,20 +16,20 @@ inline void build_primitives_scene(scene& sc) {
     material* box_mat = new_lambertian(color(0.2, 0.4, 0.7), sc.allocs);
     material* tri_mat = new_lambertian(color(0.9, 0.75, 0.2), sc.allocs);
 
-    sc.add(new_transform(make_sphere(point3(0,0,0), 1000, ground, sc.allocs),
-                         vec3(0, -1000, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));  // id 0: floor
+    sc.add(make_instance(make_sphere(point3(0,0,0), 1000, ground, sc.allocs),
+                         vec3(0, -1000, 0), vec3(0,0,0), vec3(1,1,1)));     // id 0: floor
 
-    int s1 = sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, diffuse, sc.allocs),
-                         vec3(-4, 1, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 1: diffuse sphere
-    int s2 = sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, glass, sc.allocs),
-                         vec3(0, 1, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));    // id 2: glass sphere
-    int s3 = sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, metal_m, sc.allocs),
-                         vec3(4, 1, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));    // id 3: metal sphere
-    int bx = sc.add(new_transform(new_box(point3(-0.6,-0.6,-0.6), point3(0.6,0.6,0.6), box_mat, sc.allocs, sc.list_dtors),
-                         vec3(-2, 0.6, -3), vec3(0, 35, 0), vec3(1,1,1), sc.allocs));  // id 4: box
-    sc.add(new_transform(make_triangle(point3(-0.8,-0.6,0), point3(0.8,-0.6,0), point3(0,0.9,0),
+    int s1 = sc.add(make_instance(make_sphere(point3(0,0,0), 1.0, diffuse, sc.allocs),
+                         vec3(-4, 1, 0), vec3(0,0,0), vec3(1,1,1)));        // id 1: diffuse sphere
+    int s2 = sc.add(make_instance(make_sphere(point3(0,0,0), 1.0, glass, sc.allocs),
+                         vec3(0, 1, 0), vec3(0,0,0), vec3(1,1,1)));         // id 2: glass sphere
+    int s3 = sc.add(make_instance(make_sphere(point3(0,0,0), 1.0, metal_m, sc.allocs),
+                         vec3(4, 1, 0), vec3(0,0,0), vec3(1,1,1)));         // id 3: metal sphere
+    int bx = sc.add(make_instance(new_box(point3(-0.6,-0.6,-0.6), point3(0.6,0.6,0.6), box_mat, sc.allocs, sc.mesh_dtors),
+                         vec3(-2, 0.6, -3), vec3(0, 35, 0), vec3(1,1,1)));  // id 4: box
+    sc.add(make_instance(make_triangle(point3(-0.8,-0.6,0), point3(0.8,-0.6,0), point3(0,0.9,0),
                                        vec3(0,0,1), tri_mat, sc.allocs),
-                         vec3(2, 1.3, -3), vec3(0,0,0), vec3(1,1,1), sc.allocs));      // id 5: triangle
+                         vec3(2, 1.3, -3), vec3(0,0,0), vec3(1,1,1)));      // id 5: triangle
 
     // physics bodies
     sc.bodies.push_back(make_sphere_body(sc, 0, STATIC));

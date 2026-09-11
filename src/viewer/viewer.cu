@@ -50,7 +50,7 @@
 #include "viewer/scenes/primitives.h"
 #include "viewer/scenes/ball_pit.h"
 #include "viewer/scenes/spin.h"
-#include "viewer/scenes/denoise_room.h"
+#include "viewer/scenes/room.h"
 #include "viewer/scenes/hull_pit.h"
 
 // Halton sequence in [0,1)
@@ -94,7 +94,7 @@ __global__ void tonemap_frame(const color* accum, gbuffer gb, flow_field ff, pri
 }
 
 // frame accumulation
-__global__ void accumulate_frame(const camera& cam, int max_depth, const hittable& world,
+__global__ void accumulate_frame(const camera& cam, int max_depth, const world& w,
                                  color* accum, gbuffer gb, primary_hits ph, curandState* rand_states, int spp,
                                  bool dlss_beauty, bool psr) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -107,22 +107,22 @@ __global__ void accumulate_frame(const camera& cam, int max_depth, const hittabl
     camera::first_hit fh;
     for (int sample = 0; sample < spp; ++sample) {
         ray r = dlss_beauty ? cam.get_ray_through_pixel(i, j) : cam.get_ray(i, j, rand_state);
-        color c = cam.ray_color(r, world, max_depth, rand_state, &fh, accum == nullptr);
+        color c = cam.ray_color(r, w, max_depth, rand_state, &fh, accum == nullptr);
         if (accum) accum[pixel_index] += c;
         gb.albedo[pixel_index] += fh.albedo;
         gb.normal[pixel_index] += fh.normal;
     }
 
     // fixed ray through pixel for stable estimation
-    hit_through_pixel(cam, i, j, world, rand_state, psr, ph, pixel_index);
+    hit_through_pixel(cam, i, j, w, rand_state, psr, ph, pixel_index);
 }
 
 // object picking
-__global__ void pick(const camera& cam, const hittable& world, int px, int py,
+__global__ void pick(const camera& cam, const world& w, int px, int py,
                      curandState* state, int* out_id) {
     ray r = cam.get_ray_through_pixel(px, py);
     hit_record rec;
-    *out_id = world.hit(r, interval(real(0.001), infinity), rec, state) ? rec.id : -1;
+    *out_id = w.hit(r, interval(real(0.001), infinity), rec, state) ? rec.id : -1;
 }
 
 __global__ void initialize_rand_pick(curandState* state, unsigned long seed) {
@@ -153,7 +153,7 @@ int main() {
 #else
     build_primitives_scene(sc);
 #endif
-    hittable& world = sc.root();
+    world& wld = sc.root();
 
     // camera
     camera* cam;
@@ -200,8 +200,6 @@ int main() {
     dim3 threads(16, 16), blocks, blocks_out;   // trace grid, tonemap grid
 
     // rendering configs
-    checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
-
     int spp_per_frame = RT_SAMPLES;
     int total_samples = 0;
     int target_samples = RT_TARGET_SAMPLES;
@@ -267,11 +265,11 @@ int main() {
     camera prev_cam = *cam;
     const transform** tr;                     // by scene id, live
     transform* tr_prev;                       // by scene id, previous frame
-    checkCudaErrors(cudaMallocManaged((void**)&tr,      sc.objects.size() * sizeof(transform*)));
-    checkCudaErrors(cudaMallocManaged((void**)&tr_prev, sc.objects.size() * sizeof(transform)));
+    checkCudaErrors(cudaMallocManaged((void**)&tr,      sc.size() * sizeof(transform*)));
+    checkCudaErrors(cudaMallocManaged((void**)&tr_prev, sc.size() * sizeof(transform)));
     
-    for (int id = 0; id < (int)sc.objects.size(); id++)
-        tr[id] = static_cast<const transform*>(sc.get(id)->object);
+    for (int id = 0; id < (int)sc.size(); id++)
+        tr[id] = &sc.get(id)->xf;
 
     unsigned long rng_seed = (cam->seed < 0) ? (unsigned long)time(0) : (unsigned long)cam->seed;
 
@@ -325,9 +323,9 @@ int main() {
     // store each object's initial T/R/S
     struct init_trs { vec3 t, r, s; };
     std::vector<init_trs> initial_trs;
-    for (int id = 0; id < (int)sc.objects.size(); id++) {
-        transform* tr = static_cast<transform*>(sc.get(id)->object);
-        initial_trs.push_back({tr->translation, tr->rotation, tr->scale});
+    for (int id = 0; id < (int)sc.size(); id++) {
+        const transform& tr = sc.get(id)->xf;
+        initial_trs.push_back({tr.translation, tr.rotation, tr.scale});
     }
 
     // store inital rendering configs
@@ -379,7 +377,7 @@ int main() {
     std::vector<phys_body>& bodies = sc.bodies;
     const std::vector<phys_body> initial_bodies = bodies;   // authored snapshot for reset
 
-    std::vector<int> body_of_scene_id((size_t)sc.objects.size(), -1);
+    std::vector<int> body_of_scene_id((size_t)sc.size(), -1);
     for (int i = 0; i < (int)bodies.size(); i++)
         if (bodies[i].scene_id >= 0) body_of_scene_id[bodies[i].scene_id] = i;
 
@@ -418,31 +416,29 @@ int main() {
 
     auto sync_body_from_transform = [&](int scene_id) {
         if (scene_id < 0 || body_of_scene_id[scene_id] < 0) return; // not simulated
-        transform* tr = static_cast<transform*>(sc.get(scene_id)->object);
+        const instance* in = sc.get(scene_id);
         phys_body& b = bodies[body_of_scene_id[scene_id]];
         b.vel   = vec3(0, 0, 0);
         b.omega = vec3(0, 0, 0);
-        b.scale = tr->scale;
+        b.scale = in->xf.scale;
         quat orient;
-        if (b.shape == COLLIDER_SPHERE)    sphere_collider_of(tr, b.pos, b.radius, orient, b.offset);
-        else if (b.shape == COLLIDER_BOX)  box_collider_of(tr, b.pos, b.half, orient, b.offset);
-        else                               hull_collider_of(tr, b.hull, b.pos, orient, b.offset);
+        if (b.shape == COLLIDER_SPHERE)    sphere_collider_of(in, b.pos, b.radius, orient, b.offset);
+        else if (b.shape == COLLIDER_BOX)  box_collider_of(in, b.pos, b.half, orient, b.offset);
+        else                               hull_collider_of(in, b.hull, b.pos, orient, b.offset);
         set_orientation(b, orient);
         asleep = false; still_steps = 0;   // a moved body disturbs the pile -> resume stepping
     };
 
     auto sync_transform_from_body = [&](const phys_body& b) {
-        transform* tr = static_cast<transform*>(sc.get(b.scene_id)->object);
-        new(tr) transform(tr->child, transform_translation_of(b), quat_to_euler_zyx_degrees(b.orient), b.scale);
+        sc.get(b.scene_id)->set_transform(transform_translation_of(b), quat_to_euler_zyx_degrees(b.orient), b.scale);
     };
 
     // reset simulation
     auto reset_sim = [&]() {
         // reset scene object transforms
-        for (int id = 0; id < (int)sc.objects.size(); id++) {
+        for (int id = 0; id < (int)sc.size(); id++) {
             const init_trs& in = initial_trs[id];
-            transform* tr = static_cast<transform*>(sc.get(id)->object);
-            new(tr) transform(tr->child, in.t, in.r, in.s);
+            sc.get(id)->set_transform(in.t, in.r, in.s);
         }
         // reset physics bodies
         bodies = initial_bodies;
@@ -495,7 +491,7 @@ int main() {
             else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) {
                 // picking
                 if (maybe_click && abs(e.button.x - press_x) <= 2 && abs(e.button.y - press_y) <= 2) {
-                    pick<<<1, 1>>>(*cam, world, e.button.x * RW / FW, e.button.y * RH / FH, pick_state, pick_result);
+                    pick<<<1, 1>>>(*cam, wld, e.button.x * RW / FW, e.button.y * RH / FH, pick_state, pick_result);
                     checkCudaErrors(cudaDeviceSynchronize());
                     selected_id = *pick_result;
                 }
@@ -690,7 +686,8 @@ int main() {
                 if (selected_id >= 0) {
                     ImGui::Text("selected  id %d", selected_id);
 
-                    transform* tr = static_cast<transform*>(sc.get(selected_id)->object);
+                    instance* obj = sc.get(selected_id);
+                    const transform* tr = &obj->xf;
                     float t[3] = {(float)tr->translation.x(), (float)tr->translation.y(), (float)tr->translation.z()};
                     float r[3] = {(float)tr->rotation.x(),    (float)tr->rotation.y(),    (float)tr->rotation.z()};
                     float s[3] = {(float)tr->scale.x(),       (float)tr->scale.y(),       (float)tr->scale.z()};
@@ -709,14 +706,14 @@ int main() {
                     }
                     if (edited) {
                         for (int c = 0; c < 3; c++) s[c] = fmaxf(s[c], 0.01f);
-                        new(tr) transform(tr->child, point3(t[0], t[1], t[2]), vec3(r[0], r[1], r[2]), vec3(s[0], s[1], s[2]));
+                        obj->set_transform(point3(t[0], t[1], t[2]), vec3(r[0], r[1], r[2]), vec3(s[0], s[1], s[2]));
                         sc.refit();
                         reset_accumulation();
                         sync_body_from_transform(selected_id);
                     }
                     if (ImGui::Button("Reset transform")) {
                         const init_trs& in = initial_trs[selected_id];
-                        new(tr) transform(tr->child, in.t, in.r, in.s);
+                        obj->set_transform(in.t, in.r, in.s);
                         sc.refit();
                         reset_accumulation();
                         sync_body_from_transform(selected_id);
@@ -896,7 +893,7 @@ int main() {
             accumulate_frame<<<blocks, threads>>>(
                 *cam, 
                 guide_view ? guide_depth : cam->max_depth,
-                world,
+                wld,
                 guide_view ? nullptr : accum, 
                 gb, 
                 ph,
@@ -958,7 +955,7 @@ int main() {
         if (did_flow) {
             checkCudaErrors(cudaEventSynchronize(ev_flow1));
             checkCudaErrors(cudaEventElapsedTime(&ms_flow, ev_flow0, ev_flow1));
-            for (int id = 0; id < (int)sc.objects.size(); id++)
+            for (int id = 0; id < (int)sc.size(); id++)
                 tr_prev[id] = *tr[id];
             prev_cam = *cam;
             ff.advance();

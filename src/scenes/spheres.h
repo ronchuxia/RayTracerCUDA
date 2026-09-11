@@ -9,58 +9,33 @@
 #include "scenes/scene_utils.h"
 #include "loaders/image_loader.h"
 
-// Default scene: a checkered ground, one diffuse sphere, an earth-textured
-// sphere (A1 texture validation), and an emissive sphere lighting them.
-// Compile-time knobs (RT_IMAGE_WIDTH, RT_SAMPLES, RT_SEED, USE_BVH) come from
-// main.cu, included before this header.
-
 #ifndef RT_EARTH_IMG
 #define RT_EARTH_IMG "assets/earthmap.jpg"   // root-relative
 #endif
+
 inline void spheres() {
     auto start = std::chrono::system_clock::now();
     std::clog << "Creating Scene.\n" << std::flush;
 
-    // Increase CUDA stack size to prevent stack overflow
-    checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
-
     // world
-    hittable_list* world;
-    checkCudaErrors(cudaMallocManaged((void**)&world, sizeof(hittable_list)));
-    new(world) hittable_list();
-
-    hittable* world_hittable;
-    checkCudaErrors(cudaMallocManaged((void**)&world_hittable, sizeof(hittable)));
-    world_hittable->type = HITTABLE_LIST;
-    world_hittable->id = -1;
-    world_hittable->object = world;
+    world* w;
+    checkCudaErrors(cudaMallocManaged((void**)&w, sizeof(world)));
+    new(w) world();
 
     std::vector<void*> allocs;
 
-    material* ground = new_lambertian(
-        make_checker(0.32, color(.2, .3, .1), color(.9, .9, .9)), allocs);
+    material* ground = new_lambertian(make_checker(0.32, color(.2, .3, .1), color(.9, .9, .9)), allocs);
     material* red    = new_lambertian(color(0.7, 0.3, 0.3), allocs);
     material* earth  = new_lambertian(load_image_texture(RT_EARTH_IMG, allocs), allocs);
     material* light  = new_diffuse_light(color(10, 10, 10), allocs);
 
-    add_sphere(world, point3(0, -1000, 0), 1000, ground, allocs);
-    add_sphere(world, point3(0, 1, 0),     1.0,  red,    allocs);
-    add_sphere(world, point3(-2.5, 1, 1),  1.0,  earth,  allocs);
-    add_sphere(world, point3(0, 30, -30),  10.0, light,  allocs);
+    add_sphere(w, point3(0, -1000, 0), 1000, ground, allocs);
+    add_sphere(w, point3(0, 1, 0),     1.0,  red,    allocs);
+    add_sphere(w, point3(-2.5, 1, 1),  1.0,  earth,  allocs);
+    add_sphere(w, point3(0, 30, -30),  10.0, light,  allocs);
 
-    // world_bvh over the same objects
-    bvh* world_bvh;
-    checkCudaErrors(cudaMallocManaged((void**)&world_bvh, sizeof(bvh)));
-    new(world_bvh) bvh();
-    for (int i = 0; i < world->size; i++)
-        world_bvh->add(*world->objects[i]);
-    world_bvh->build();
-
-    hittable* world_bvh_hittable;
-    checkCudaErrors(cudaMallocManaged((void**)&world_bvh_hittable, sizeof(hittable)));
-    world_bvh_hittable->type = BVH;
-    world_bvh_hittable->id = -1;
-    world_bvh_hittable->object = world_bvh;
+    // build bvh
+    w->build();
 
     // camera
     camera* cam;
@@ -86,11 +61,7 @@ inline void spheres() {
     std::clog << "Rendering.\n" << std::flush;
 
     auto render_start = std::chrono::system_clock::now();
-#if USE_BVH
-    cam->render(*world_bvh_hittable);
-#else
-    cam->render(*world_hittable);
-#endif
+    cam->render(*w);
 
     auto end = std::chrono::system_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
@@ -102,12 +73,8 @@ inline void spheres() {
     // clean up
     for (void* p : allocs)
         cudaFree(p);
-    world_bvh->~bvh();         // frees its nodes/prim_index/prims buffers
-    cudaFree(world_bvh);
-    cudaFree(world_bvh_hittable);
-    world->~hittable_list();   // frees its objects array
-    cudaFree(world);
-    cudaFree(world_hittable);
+    w->~world();
+    cudaFree(w);
     cudaFree(cam);
 }
 

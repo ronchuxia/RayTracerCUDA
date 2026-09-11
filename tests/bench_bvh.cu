@@ -1,7 +1,7 @@
-// Benchmark: flat hittable_list vs. flattened BVH on a dense sphere grid.
+// Benchmark: single-leaf (brute-force) world vs. flattened BVH on a dense sphere grid.
 //
 // Builds one scene (ground + BENCH_GRID×BENCH_GRID jittered spheres + light),
-// renders it twice with the same fixed seed — once through the flat list, once
+// renders it twice with the same fixed seed — once through a single-leaf world, once
 // through the BVH — and reports both render times on stderr. The PPM images go
 // to stdout; redirect it away:
 //
@@ -16,8 +16,8 @@
 #include <vector>
 
 #include "camera.h"
-#include "hittable.h"   // also pulls in hittables/tree.h
-#include "hittables/sphere.h"
+#include "hittable.h"
+#include "single_leaf.h"
 #include "material.h"
 #include "cuda_helper.h"
 
@@ -39,22 +39,21 @@ material* make_lambertian(color albedo) {
     return m;
 }
 
-hittable* make_sphere_hittable(point3 c, double r, material* m,
-                               std::vector<void*>& allocations) {
+instance make_sphere_instance(point3 c, double r, material* m,
+                              std::vector<void*>& allocations) {
     sphere* s;
     checkCudaErrors(cudaMallocManaged((void**)&s, sizeof(sphere)));
     new(s) sphere(c, r, m);
-    hittable* h;
-    checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
-    h->type = SPHERE;
-    h->id = -1;
-    h->object = s;
+    primitive* p;
+    checkCudaErrors(cudaMallocManaged((void**)&p, sizeof(primitive)));
+    p->type = SPHERE;
+    p->object = s;
     allocations.push_back(s);
-    allocations.push_back(h);
-    return h;
+    allocations.push_back(p);
+    return instance(p, vec3(0,0,0), vec3(0,0,0), vec3(1,1,1));
 }
 
-long render_ms(camera* cam, const hittable& root) {
+long render_ms(camera* cam, const world& root) {
     auto t0 = std::chrono::steady_clock::now();
     cam->render(root);
     auto t1 = std::chrono::steady_clock::now();
@@ -67,9 +66,9 @@ int main() {
     std::vector<void*> allocations;  // everything cudaMallocManaged'd below
 
     // world: ground + grid of jittered spheres + one light
-    hittable_list* world;
-    checkCudaErrors(cudaMallocManaged((void**)&world, sizeof(hittable_list)));
-    new(world) hittable_list();
+    world* w;
+    checkCudaErrors(cudaMallocManaged((void**)&w, sizeof(world)));
+    new(w) world();
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<double> jitter(-0.3, 0.3);
@@ -77,14 +76,14 @@ int main() {
 
     material* ground_mat = make_lambertian(color(0.5, 0.5, 0.5));
     allocations.push_back(ground_mat);
-    world->add(make_sphere_hittable(point3(0, -1000, 0), 1000, ground_mat, allocations));
+    w->add(make_sphere_instance(point3(0, -1000, 0), 1000, ground_mat, allocations));
 
     for (int a = 0; a < BENCH_GRID; a++) {
         for (int b = 0; b < BENCH_GRID; b++) {
             material* m = make_lambertian(color(chan(rng), chan(rng), chan(rng)));
             allocations.push_back(m);
             point3 c(a - BENCH_GRID / 2 + jitter(rng), 0.25, b - BENCH_GRID / 2 + jitter(rng));
-            world->add(make_sphere_hittable(c, 0.25, m, allocations));
+            w->add(make_sphere_instance(c, 0.25, m, allocations));
         }
     }
 
@@ -93,31 +92,19 @@ int main() {
     light_mat->type = DIFFUSE_LIGHT;
     light_mat->light = diffuse_light(color(10, 10, 10));
     allocations.push_back(light_mat);
-    world->add(make_sphere_hittable(point3(0, 40, 0), 15.0, light_mat, allocations));
-
-    hittable* flat_root;
-    checkCudaErrors(cudaMallocManaged((void**)&flat_root, sizeof(hittable)));
-    flat_root->type = HITTABLE_LIST;
-    flat_root->id = -1;
-    flat_root->object = world;
-
-    // tree over the same objects
-    bvh* tree;
-    checkCudaErrors(cudaMallocManaged((void**)&tree, sizeof(bvh)));
-    new(tree) bvh();
-    for (int i = 0; i < world->size; i++)
-        tree->add(*world->objects[i]);
+    w->add(make_sphere_instance(point3(0, 40, 0), 15.0, light_mat, allocations));
 
     auto build_t0 = std::chrono::steady_clock::now();
-    tree->build();
+    w->build();
     auto build_t1 = std::chrono::steady_clock::now();
-    long build_us = (long)std::chrono::duration_cast<std::chrono::microseconds>(build_t1 - build_t0).count();
 
-    hittable* bvh_root;
-    checkCudaErrors(cudaMallocManaged((void**)&bvh_root, sizeof(hittable)));
-    bvh_root->type = BVH;
-    bvh_root->id = -1;
-    bvh_root->object = tree;
+    // the single-leaf reference over the same instances
+    world* flat;
+    checkCudaErrors(cudaMallocManaged((void**)&flat, sizeof(world)));
+    new(flat) world();
+    for (int i = 0; i < w->item_count; i++) flat->add(w->items[i]);
+    single_leaf(flat);
+    long build_us = (long)std::chrono::duration_cast<std::chrono::microseconds>(build_t1 - build_t0).count();
 
     // camera
     camera* cam;
@@ -135,31 +122,29 @@ int main() {
     cam->focus_dist    = 30.0;
     cam->seed = 42;  // identical sampling for both renders
 
-    int n_objects = world->size;
+    int n_objects = w->item_count;
     std::fprintf(stderr, "bench: %d objects, %dx%d, %d spp, BVH nodes %d, build %ld us\n",
                  n_objects, cam->image_width,
                  (int)(cam->image_width / cam->aspect_ratio), BENCH_SPP,
-                 tree->node_count, build_us);
+                 w->node_count, build_us);
 
     // warm-up (context/clock ramp), then timed renders
     cam->samples_per_pixel = 1;
-    cam->render(*bvh_root);
+    cam->render(*w);
     cam->samples_per_pixel = BENCH_SPP;
 
-    long flat_ms = render_ms(cam, *flat_root);
-    long bvh_ms  = render_ms(cam, *bvh_root);
+    long flat_ms = render_ms(cam, *flat);
+    long bvh_ms  = render_ms(cam, *w);
 
     std::fprintf(stderr, "flat list: %ld ms\n", flat_ms);
     std::fprintf(stderr, "tree:       %ld ms\n", bvh_ms);
     std::fprintf(stderr, "speedup:   %.2fx\n", bvh_ms > 0 ? (double)flat_ms / bvh_ms : 0.0);
 
     // clean up
-    tree->~bvh();
-    cudaFree(tree);
-    cudaFree(bvh_root);
-    world->~hittable_list();
-    cudaFree(world);
-    cudaFree(flat_root);
+    w->~world();
+    cudaFree(w);
+    flat->~world();
+    cudaFree(flat);
     cudaFree(cam);
     for (void* p : allocations) cudaFree(p);
     return 0;

@@ -27,7 +27,13 @@
 // ingredients added stays clean), so treat it as one known-triggering
 // configuration, not a general rule for which scenes are unsafe.
 //
-// See docs/rdc-corruption.md for the full investigation.
+// See docs/issues/rdc-recursive-dispatch-corruption.md for the full investigation.
+//
+// 2026-09-09: the scene has no recursive dispatch any more — it is the
+// two-level scene of docs/finished-plans/two-level-scene.md (instances over a BVH,
+// meshes below). The scene, materials and loop are kept as they were so the
+// guard stage keeps compiling the same kernel both ways; whether whole-program
+// compilation still miscompiles it is what stage 10 reports.
 #define RT_SKY 1
 #include <cstdio>
 #include <vector>
@@ -39,7 +45,7 @@
 #define SPP 8
 #define MAX_DEPTH 12
 
-__global__ void trace(const camera& cam, int md, const hittable& world, color* accum,
+__global__ void trace(const camera& cam, int md, const world& w, color* accum,
                       curandState* rs, int spp, int* nsamp, int* trips, int* spp_seen) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -49,7 +55,7 @@ __global__ void trace(const camera& cam, int md, const hittable& world, color* a
     int t = 0;
     for (int s = 0; s < spp; ++s) {
         ray r = cam.get_ray(i, j, &rs[idx]);
-        accum[idx] += cam.ray_color(r, world, md, &rs[idx]);
+        accum[idx] += cam.ray_color(r, w, md, &rs[idx]);
         nsamp[idx]++;   // global-memory counter, incremented inside the loop
         t++;            // register counter
     }
@@ -69,20 +75,20 @@ static void build_repro_scene(scene& sc) {
     material* box_mat = new_lambertian(color(0.2, 0.4, 0.7), sc.allocs);
     material* tri_mat = new_lambertian(color(0.9, 0.75, 0.2), sc.allocs);
 
-    sc.add(new_transform(make_sphere(point3(0,0,0), 1000, ground, sc.allocs),
-                         vec3(0,-1000,0), vec3(0,0,0), vec3(1,1,1), sc.allocs));
-    sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, diffuse, sc.allocs),
-                         vec3(-4,1,0), vec3(0,0,0), vec3(1,1,1), sc.allocs));
-    sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, glass, sc.allocs),
-                         vec3(0,1,0), vec3(0,0,0), vec3(1,1,1), sc.allocs));
-    sc.add(new_transform(make_sphere(point3(0,0,0), 1.0, metal_m, sc.allocs),
-                         vec3(4,1,0), vec3(0,0,0), vec3(1,1,1), sc.allocs));
-    sc.add(new_transform(new_box(point3(-0.6,-0.6,-0.6), point3(0.6,0.6,0.6),
-                                 box_mat, sc.allocs, sc.list_dtors),
-                         vec3(-2,0.6,-3), vec3(0,35,0), vec3(1,1,1), sc.allocs));
-    sc.add(new_transform(make_triangle(point3(-0.8,-0.6,0), point3(0.8,-0.6,0),
+    sc.add(make_instance(make_sphere(point3(0,0,0), 1000, ground, sc.allocs),
+                         vec3(0,-1000,0), vec3(0,0,0), vec3(1,1,1)));
+    sc.add(make_instance(make_sphere(point3(0,0,0), 1.0, diffuse, sc.allocs),
+                         vec3(-4,1,0), vec3(0,0,0), vec3(1,1,1)));
+    sc.add(make_instance(make_sphere(point3(0,0,0), 1.0, glass, sc.allocs),
+                         vec3(0,1,0), vec3(0,0,0), vec3(1,1,1)));
+    sc.add(make_instance(make_sphere(point3(0,0,0), 1.0, metal_m, sc.allocs),
+                         vec3(4,1,0), vec3(0,0,0), vec3(1,1,1)));
+    sc.add(make_instance(new_box(point3(-0.6,-0.6,-0.6), point3(0.6,0.6,0.6),
+                                 box_mat, sc.allocs, sc.mesh_dtors),
+                         vec3(-2,0.6,-3), vec3(0,35,0), vec3(1,1,1)));
+    sc.add(make_instance(make_triangle(point3(-0.8,-0.6,0), point3(0.8,-0.6,0),
                                        point3(0,0.9,0), vec3(0,0,1), tri_mat, sc.allocs),
-                         vec3(2,1.3,-3), vec3(0,0,0), vec3(1,1,1), sc.allocs));
+                         vec3(2,1.3,-3), vec3(0,0,0), vec3(1,1,1)));
     sc.build();
 }
 

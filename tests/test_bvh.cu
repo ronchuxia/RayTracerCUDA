@@ -1,31 +1,32 @@
-// Unit tests for the flattened BVH (tree.h).
+// Unit tests for the flattened BVH (hittables/bvh.h), in its mesh role.
 //
-// Strategy: build the SAME set of spheres into a flat hittable_list and a
-// bvh, shoot a deterministic batch of rays through both via the
-// hittable::hit dispatch on the device, and require exactly equal results.
-// Both paths run the identical sphere::hit arithmetic on identical inputs and
-// the closest hit is unique, so t / p / normal must match bit-for-bit —
-// traversal order cannot change the answer, only which primitives get tested.
+// Strategy: build the SAME set of spheres into two meshes (bvh<primitive>) —
+// one built, one a single leaf walked in insertion order (tests/single_leaf.h,
+// the brute-force reference) — shoot a deterministic batch of rays through
+// both on the device and require exactly equal results. Both paths run the identical sphere::hit
+// arithmetic on identical inputs and the closest hit is unique, so
+// t / p / normal must match bit-for-bit — traversal order cannot change the
+// answer, only which primitives get tested.
 //
 // Also checked, host-side, after every build: structural invariants
-// (prim_index is a permutation, child_index > parent_index, leaves disjointly
+// (item_index is a permutation, child_index > parent_index, leaves disjointly
 // cover [0, N), every internal bbox is exactly the union of its children).
 //
 // All randomness is host-side std::mt19937 with fixed seeds — no cuRAND, so
 // every run is deterministic.
 //
 // Build & run (from the repo root):
-//   nvcc tests/test_bvh.cu -o build/test_bvh -std=c++14 -arch=sm_86 -I. && ./build/test_bvh
+//   nvcc tests/test_bvh.cu -o build/test_bvh -std=c++14 -arch=sm_86 -Isrc && ./build/test_bvh
 
 #include <cstdio>
 #include <random>
 #include <vector>
 #include <algorithm>
 
-#include "hittable.h"   // also pulls in hittables/tree.h
-#include "hittables/sphere.h"
+#include "hittable.h"
 #include "material.h"
 #include "cuda_helper.h"
+#include "single_leaf.h"
 
 static int g_failures = 0;
 
@@ -55,68 +56,51 @@ sphere* make_sphere(point3 c, double r, material* m) {
     return s;
 }
 
-hittable* wrap_sphere(sphere* s) {
-    hittable* h;
-    checkCudaErrors(cudaMallocManaged((void**)&h, sizeof(hittable)));
-    h->type = SPHERE;
-    h->id = -1;
-    h->object = s;
-    return h;
+primitive wrap_sphere(sphere* s) {
+    primitive p;
+    p.type = SPHERE;
+    p.object = s;
+    return p;
 }
 
-// A flat list and a BVH over the same sphere objects.
+// Two meshes over a set of sphere objects: the tree and the single-leaf reference.
 struct test_scene {
     std::vector<material*> materials;
     std::vector<sphere*>   spheres;
-    std::vector<hittable*> wrappers;
+    std::vector<primitive> items;
 
-    hittable_list* list;
-    hittable* list_root;
-    bvh* tree;
-    hittable* bvh_root;
+    mesh* tree;
+    mesh* flat;
 
     void add_sphere(point3 c, double r, material* m) {
         sphere* s = make_sphere(c, r, m);
         spheres.push_back(s);
-        wrappers.push_back(wrap_sphere(s));
+        items.push_back(wrap_sphere(s));
     }
 
-    // Build list + BVH from the spheres added so far.
+    // Build the mesh from the spheres added so far.
     void build_structures() {
-        checkCudaErrors(cudaMallocManaged((void**)&list, sizeof(hittable_list)));
-        new(list) hittable_list();
-        for (auto* w : wrappers) list->add(w);
-        checkCudaErrors(cudaMallocManaged((void**)&list_root, sizeof(hittable)));
-        list_root->type = HITTABLE_LIST;
-        list_root->id = -1;
-        list_root->object = list;
-
-        checkCudaErrors(cudaMallocManaged((void**)&tree, sizeof(bvh)));
-        new(tree) bvh();
-        for (auto* w : wrappers) tree->add(*w);
+        checkCudaErrors(cudaMallocManaged((void**)&tree, sizeof(mesh)));
+        new(tree) mesh();
+        for (const primitive& p : items) tree->add(p);
         tree->build();
-        checkCudaErrors(cudaMallocManaged((void**)&bvh_root, sizeof(hittable)));
-        bvh_root->type = BVH;
-        bvh_root->id = -1;
-        bvh_root->object = tree;
+        checkCudaErrors(cudaMallocManaged((void**)&flat, sizeof(mesh)));
+        new(flat) mesh();
+        for (const primitive& p : items) flat->add(p);
+        single_leaf(flat);
     }
 
-    // Rebuild ONLY the flat list (fresh bbox union) — used as ground truth
-    // after spheres move, since the old list's bbox would be stale.
-    void rebuild_list() {
-        list->~hittable_list();
-        new(list) hittable_list();
-        for (auto* w : wrappers) list->add(w);
+    // Refresh the reference after items moved or were added.
+    void rebuild_flat() {
+        while (flat->item_count < (int)items.size()) flat->add(items[flat->item_count]);
+        single_leaf(flat);
     }
 
     void destroy() {
-        list->~hittable_list();
-        cudaFree(list);
-        cudaFree(list_root);
-        tree->~bvh();
+        tree->~mesh();
         cudaFree(tree);
-        cudaFree(bvh_root);
-        for (auto* w : wrappers)  cudaFree(w);
+        flat->~mesh();
+        cudaFree(flat);
         for (auto* s : spheres)   cudaFree(s);
         for (auto* m : materials) cudaFree(m);
     }
@@ -167,11 +151,11 @@ struct hit_result {
     material* mat;
 };
 
-__global__ void hit_kernel(const hittable* root, const ray* rays, int n, hit_result* out) {
+__global__ void hit_kernel(const mesh* tree, const ray* rays, int n, hit_result* out) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     hit_record rec;
-    bool h = root->hit(rays[idx], interval(0.001, 1.0/0.0), rec, nullptr);
+    bool h = tree->hit(rays[idx], interval(0.001, infinity), rec, nullptr);
     out[idx].hit = h ? 1 : 0;
     out[idx].t = h ? rec.t : 0.0;
     out[idx].p = h ? rec.p : point3(0,0,0);
@@ -180,15 +164,15 @@ __global__ void hit_kernel(const hittable* root, const ray* rays, int n, hit_res
     out[idx].mat = h ? rec.mat : nullptr;
 }
 
-hit_result* run_hits(const hittable* root, const ray* rays_dev, int n) {
+hit_result* run_hits(const mesh* tree, const ray* rays_dev, int n) {
     hit_result* out;
     checkCudaErrors(cudaMallocManaged((void**)&out, n * sizeof(hit_result)));
-    hit_kernel<<<(n + 255) / 256, 256>>>(root, rays_dev, n, out);
+    hit_kernel<<<(n + 255) / 256, 256>>>(tree, rays_dev, n, out);
     checkCudaErrors(cudaDeviceSynchronize());
     return out;
 }
 
-// Shoot the rays through both structures and require exactly equal results.
+// Shoot the rays through both trees and require exactly equal results.
 // Returns the number of rays that hit (to sanity-check test coverage).
 int compare_hits(const test_scene& sc, const std::vector<ray>& rays, bool compare_mat = true) {
     int n = (int)rays.size();
@@ -196,8 +180,8 @@ int compare_hits(const test_scene& sc, const std::vector<ray>& rays, bool compar
     checkCudaErrors(cudaMallocManaged((void**)&rays_dev, n * sizeof(ray)));
     for (int i = 0; i < n; i++) rays_dev[i] = rays[i];
 
-    hit_result* flat_res = run_hits(sc.list_root, rays_dev, n);
-    hit_result* bvh_res  = run_hits(sc.bvh_root, rays_dev, n);
+    hit_result* flat_res = run_hits(sc.flat, rays_dev, n);
+    hit_result* bvh_res  = run_hits(sc.tree, rays_dev, n);
 
     int hits = 0, mismatches = 0;
     for (int i = 0; i < n; i++) {
@@ -217,7 +201,7 @@ int compare_hits(const test_scene& sc, const std::vector<ray>& rays, bool compar
         if (!same) mismatches++;
         if (a.hit) hits++;
     }
-    CHECK(mismatches == 0, "%d of %d rays disagree between flat list and BVH", mismatches, n);
+    CHECK(mismatches == 0, "%d of %d rays disagree between the single-leaf reference and the BVH", mismatches, n);
 
     cudaFree(rays_dev);
     cudaFree(flat_res);
@@ -227,8 +211,8 @@ int compare_hits(const test_scene& sc, const std::vector<ray>& rays, bool compar
 
 // ---------------------------------------------------- structural invariants --
 
-void check_invariants(const bvh* b) {
-    int N = b->prim_count;
+void check_invariants(const mesh* b) {
+    int N = b->item_count;
     if (N == 0) {
         CHECK(b->node_count == 0, "empty BVH should have 0 nodes, has %d", b->node_count);
         return;
@@ -236,30 +220,30 @@ void check_invariants(const bvh* b) {
     CHECK(b->node_count >= 1 && b->node_count <= 2 * N - 1,
           "node_count %d outside [1, %d]", b->node_count, 2 * N - 1);
 
-    // prim_index is a permutation of [0, N)
-    std::vector<int> idx(b->prim_index, b->prim_index + N);
+    // item_index is a permutation of [0, N)
+    std::vector<int> idx(b->item_index, b->item_index + N);
     std::sort(idx.begin(), idx.end());
     for (int i = 0; i < N; i++)
-        CHECK(idx[i] == i, "prim_index is not a permutation (slot %d)", i);
+        CHECK(idx[i] == i, "item_index is not a permutation (slot %d)", i);
 
     std::vector<int> covered(N, 0);
     for (int i = 0; i < b->node_count; i++) {
         const bvh_node& n = b->nodes[i];
-        if (n.prim_count > 0) {  // leaf
-            CHECK(n.first_prim >= 0 && n.first_prim + n.prim_count <= N,
-                  "leaf %d range [%d, %d) out of bounds", i, n.first_prim, n.first_prim + n.prim_count);
-            for (int j = n.first_prim; j < n.first_prim + n.prim_count; j++) {
-                CHECK(!covered[j], "prim_index slot %d covered by two leaves", j);
+        if (n.item_count > 0) {  // leaf
+            CHECK(n.first_item >= 0 && n.first_item + n.item_count <= N,
+                  "leaf %d range [%d, %d) out of bounds", i, n.first_item, n.first_item + n.item_count);
+            for (int j = n.first_item; j < n.first_item + n.item_count; j++) {
+                CHECK(!covered[j], "item_index slot %d covered by two leaves", j);
                 covered[j] = 1;
             }
-            // leaf bbox is exactly the union of its prims' boxes
+            // leaf bbox is exactly the union of its items' boxes
             aabb u;
-            for (int j = 0; j < n.prim_count; j++)
-                u = aabb(u, b->prims[b->prim_index[n.first_prim + j]].bounding_box());
+            for (int j = 0; j < n.item_count; j++)
+                u = aabb(u, b->items[b->item_index[n.first_item + j]].bounding_box());
             CHECK(u.x.min == n.bbox.x.min && u.x.max == n.bbox.x.max &&
                   u.y.min == n.bbox.y.min && u.y.max == n.bbox.y.max &&
                   u.z.min == n.bbox.z.min && u.z.max == n.bbox.z.max,
-                  "leaf %d bbox is not the union of its prims", i);
+                  "leaf %d bbox is not the union of its items", i);
         } else {                 // internal
             CHECK(n.left > i && n.left < b->node_count, "node %d left child %d violates child > parent", i, n.left);
             CHECK(n.right > i && n.right < b->node_count, "node %d right child %d violates child > parent", i, n.right);
@@ -271,7 +255,7 @@ void check_invariants(const bvh* b) {
         }
     }
     for (int j = 0; j < N; j++)
-        CHECK(covered[j], "prim_index slot %d not covered by any leaf", j);
+        CHECK(covered[j], "item_index slot %d not covered by any leaf", j);
 }
 
 // -------------------------------------------------------------------- tests --
@@ -290,8 +274,8 @@ void test_single() {
     std::printf("  test_single (N=1)\n");
     test_scene sc = make_random_scene(1, 3);
     check_invariants(sc.tree);
-    CHECK(sc.tree->node_count == 1, "single-prim BVH should be one leaf, has %d nodes", sc.tree->node_count);
-    CHECK(sc.tree->nodes[0].prim_count == 1, "root should be a leaf with 1 prim");
+    CHECK(sc.tree->node_count == 1, "single-item BVH should be one leaf, has %d nodes", sc.tree->node_count);
+    CHECK(sc.tree->nodes[0].item_count == 1, "root should be a leaf with 1 item");
     std::vector<ray> rays = make_rays(sc, 10000, 4);
     int hits = compare_hits(sc, rays);
     CHECK(hits > 0, "no rays hit the single sphere — weak test");
@@ -354,7 +338,7 @@ void test_refit_after_motion() {
     }
 
     sc.tree->refit();       // topology unchanged, boxes refreshed
-    sc.rebuild_list();     // fresh flat list = ground truth (old bbox was stale)
+    sc.rebuild_flat();
     check_invariants(sc.tree);
 
     std::vector<ray> rays = make_rays(sc, 50000, 12, 30.0);
@@ -376,7 +360,7 @@ void test_rebuild_after_motion() {
     }
 
     sc.tree->build();       // full rebuild reusing the same buffers
-    sc.rebuild_list();
+    sc.rebuild_flat();
     check_invariants(sc.tree);
 
     std::vector<ray> rays = make_rays(sc, 50000, 15, 30.0);
@@ -387,16 +371,16 @@ void test_rebuild_after_motion() {
 void test_incremental_add() {
     // Crosses the initial capacity (16) to exercise the growth path, then
     // rebuilds and revalidates.
-    std::printf("  test_incremental_add (10 prims, then +30, rebuild)\n");
+    std::printf("  test_incremental_add (10 items, then +30, rebuild)\n");
     test_scene sc = make_random_scene(10, 16);
     std::mt19937 rng(17);
     std::uniform_real_distribution<double> pos(-20.0, 20.0);
     for (int i = 0; i < 30; i++) {
         sc.add_sphere(point3(pos(rng), pos(rng), pos(rng)), 0.7, sc.materials[0]);
-        sc.tree->add(*sc.wrappers.back());
-        sc.list->add(sc.wrappers.back());
+        sc.tree->add(sc.items.back());
     }
     sc.tree->build();
+    sc.rebuild_flat();
     check_invariants(sc.tree);
     std::vector<ray> rays = make_rays(sc, 20000, 18);
     compare_hits(sc, rays);
@@ -404,8 +388,6 @@ void test_incremental_add() {
 }
 
 int main() {
-    checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
-
     std::printf("BVH unit tests\n");
     test_empty();
     test_single();

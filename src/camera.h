@@ -10,41 +10,32 @@
 #include "hittable.h"
 #include "material.h"
 
-// Background on ray miss: 0 (default) = black, so scenes are lit only by
-// diffuse_light objects; 1 = the book's sky gradient (the variant the fork
-// later commented out, including its 0.7 dimming factor) — build with
-// -DRT_SKY=1 to reproduce the fork's older sky-lit renders.
 #ifndef RT_SKY
 #define RT_SKY 0
 #endif
 
 struct camera;
 __global__ void initialize_rand(const camera& cam, curandState* state, unsigned long seed);
-__global__ void render_pixel(const camera& cam, int max_depth, const hittable& world, color* pixel_colors, curandState* rand_states);
+__global__ void render_pixel(const camera& cam, int max_depth, const world& w, color* pixel_colors, curandState* rand_states);
 
 struct camera {
-        real aspect_ratio      = 1.0;  // Ratio of image width over height
+        real   aspect_ratio      = 1.0;  // Ratio of image width over height
         int    image_width       = 100;  // Rendered image width in pixel count
         int    image_height;             // Rendered image height in pixel count
         int    samples_per_pixel = 10;   // Count of random samples for each pixel
         int    max_depth         = 10;   // Maximum number of ray bounces into scene
 
-        real vfov     = 90;              // Vertical view angle (field of view)
+        real   vfov     = 90;              // Vertical view angle (field of view)
         point3 lookfrom = point3(0,0,-1);  // Point camera is looking from
         point3 lookat   = point3(0,0,0);   // Point camera is looking at
         vec3   vup      = vec3(0,1,0);     // Camera-relative "up" direction
 
-        real defocus_angle = 0;  // Variation angle of rays through each pixel
-        real jitter_x = 0, jitter_y = 0;  // the frame's sub-pixel offset
-        real focus_dist = 10;    // Distance from camera lookfrom point to plane of perfect focus
+        real defocus_angle = 0;           // Variation angle of rays through each pixel
+        real jitter_x = 0, jitter_y = 0;  // A frame's sub-pixel offset
+        real focus_dist = 10;             // Distance from camera lookfrom point to plane of perfect focus
 
-        long long seed = -1;       // RNG seed; negative → seed from time(0). Fix it for reproducible renders (tests).
+        long long seed = -1;              // RNG seed
 
-        // Derived frame state — computed by initialize() from the config above,
-        // so valid only after it runs. Public like the rest of the repo's
-        // C-style structs (image_height above is already a public derived
-        // field); external users should prefer the ray/pixel methods over
-        // reading these directly.
         point3 center;          // Camera center
         point3 pixel00_loc;     // Location of pixel 0, 0
         vec3   pixel_delta_u;   // Offset to pixel to the right
@@ -53,7 +44,7 @@ struct camera {
         vec3   defocus_disk_u;  // Defocus disk horizontal radius
         vec3   defocus_disk_v;  // Defocus disk vertical radius
 
-        __host__ void render(const hittable& world) {
+        __host__ void render(const world& w) {
             initialize();
 
             // initialize random states
@@ -73,7 +64,7 @@ struct camera {
             // render the pixel colors
             dim3 threads(16, 16);
             dim3 blocks((image_width + threads.x - 1) / threads.x, (image_height + threads.y - 1) / threads.y);
-            render_pixel<<<blocks, threads>>>(*this, max_depth, world, pixel_colors, rand_states);
+            render_pixel<<<blocks, threads>>>(*this, max_depth, w, pixel_colors, rand_states);
 
             checkCudaErrors(cudaDeviceSynchronize());
 
@@ -143,18 +134,12 @@ struct camera {
             return ray(center, pixel_center - center);
         }
 
-        // Inverse of get_ray_through_pixel: project a world point to fractional
-        // pixel coordinates by intersecting the ray center→p with the viewport
-        // plane and decomposing along the pixel grid. Built on the SAME frame
-        // fields ray generation uses, so projection and rendering can never
-        // disagree. Returns false for points at or behind the camera plane.
-        // Used by the viewer's selection-highlight overlay (B4).
         __host__ __device__ bool world_to_pixel(const point3& p, real& px, real& py) const {
             vec3 d = p - center;
-            real denom = dot(d, w);                    // w points BACKWARD: visible => denom < 0
+            real denom = dot(d, w);
             if (denom >= real(-1e-6)) return false;
             real s = dot(pixel00_loc - center, w) / denom;
-            point3 q = center + s * d;                 // p projected onto the viewport plane
+            point3 q = center + s * d;
             vec3 offset = q - pixel00_loc;
             px = dot(offset, pixel_delta_u) / pixel_delta_u.length_squared();
             py = dot(offset, pixel_delta_v) / pixel_delta_v.length_squared();
@@ -169,7 +154,7 @@ struct camera {
 
         static constexpr real diffuse_roughness = real(0.15);
 
-        __device__ color ray_color(ray r, const hittable& world, int max_depth, curandState* state,
+        __device__ color ray_color(ray r, const world& w, int max_depth, curandState* state,
                                    first_hit* first = nullptr, bool gbuffer_only = false) const {
             ray current_ray = r;
             color current_color = color(0,0,0); // Total color until now
@@ -185,7 +170,7 @@ struct camera {
             };
 
             for (int i = 0; i < max_depth; i++) {
-                if (world.hit(current_ray, interval(real(0.001), infinity), rec, state)) {
+                if (w.hit(current_ray, interval(real(0.001), infinity), rec, state)) {
                     ray scattered;
                     color attenuation;
                     color emit = rec.mat->emitted();
@@ -244,9 +229,7 @@ __global__ void initialize_rand(const camera& cam, curandState* state, unsigned 
     curand_init(seed, idx, 0, &state[idx]); // same seed, different sequence number
 }
 
-// The default translation of the color function results in a stack overflow since it can call 
-// itself many times. But, the code can be simply be translated into a loop instead of recursion.
-__global__ void render_pixel(const camera& cam, int max_depth, const hittable& world, color* pixel_colors, curandState* rand_states) {
+__global__ void render_pixel(const camera& cam, int max_depth, const world& w, color* pixel_colors, curandState* rand_states) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -264,7 +247,7 @@ __global__ void render_pixel(const camera& cam, int max_depth, const hittable& w
         ray r = cam.get_ray(i, j, rand_state);
 
         // render along the ray
-        pixel_colors[pixel_index] += cam.ray_color(r, world, max_depth, rand_state);
+        pixel_colors[pixel_index] += cam.ray_color(r, w, max_depth, rand_state);
     }
 }
 

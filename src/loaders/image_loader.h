@@ -9,15 +9,10 @@
 #include "cuda_helper.h"
 #include "texture.h"
 
-// stb_image implementation lives in this header; the include guard keeps it
-// single-definition within each translation unit (this repo is single-TU).
 #define STB_IMAGE_IMPLEMENTATION
 #include "external/stb_image.h"
 
-// Host-side image loader: reads an image file (jpg/png/... via stb_image),
-// copies the RGB8 pixels into managed memory (recorded in `allocs`), and
-// returns an IMAGE texture pointing at them — embeddable by value in a
-// material like any other texture.
+// Host-side image loader
 inline texture load_image_texture(const char* path, std::vector<void*>& allocs) {
     int width, height, components;
     unsigned char* pixels = stbi_load(path, &width, &height, &components, 3);

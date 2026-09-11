@@ -8,30 +8,20 @@
 #include "scenes/scene_utils.h"
 #include "viewer/physics_utils.h"
 
-inline hittable* new_convex(const std::vector<vec3>& pts, material* mat,
-                            std::vector<void*>& allocs, std::vector<hittable_list*>& list_dtors) {
+// build a convex mesh object from a vector of points
+inline mesh* new_convex(const std::vector<vec3>& pts, material* mat,
+                        std::vector<void*>& allocs, std::vector<mesh*>& mesh_dtors) {
+    // build a convex hull
     hull_shape h;
     build_hull(pts, h);
 
-    hittable_list* faces;
-    checkCudaErrors(cudaMallocManaged((void**)&faces, sizeof(hittable_list)));
-    new(faces) hittable_list();
-
-    hittable* obj;
-    checkCudaErrors(cudaMallocManaged((void**)&obj, sizeof(hittable)));
-    obj->type = HITTABLE_LIST;
-    obj->id = -1;
-    obj->object = faces;
-
-    allocs.push_back(faces);
-    allocs.push_back(obj);
-    list_dtors.push_back(faces);
-
+    // add triangles on the convex hull's faces to the mesh
+    mesh* faces = new_mesh(allocs, mesh_dtors);
     for (const hull_shape::face& f : h.faces)
         for (size_t k = 1; k + 1 < f.loop.size(); k++)
-            add_triangle(faces, h.verts[f.loop[0]], h.verts[f.loop[k]], h.verts[f.loop[k + 1]], f.normal, mat, allocs);
-    
-    return obj;
+            mesh_add_triangle(faces, h.verts[f.loop[0]], h.verts[f.loop[k]], h.verts[f.loop[k + 1]], f.normal, mat, allocs);
+    faces->build();
+    return faces;
 }
 
 inline std::vector<vec3> prism_points(int sides, real r, real h) {
@@ -74,20 +64,9 @@ inline std::vector<vec3> icosahedron_points(real r) {
     return p;
 }
 
-inline hittable* new_spiky_ball(real r_core, real r_tip, material* mat,
-                                std::vector<void*>& allocs, std::vector<hittable_list*>& list_dtors) {
-    hittable_list* faces;
-    checkCudaErrors(cudaMallocManaged((void**)&faces, sizeof(hittable_list)));
-    new(faces) hittable_list();
-
-    hittable* obj;
-    checkCudaErrors(cudaMallocManaged((void**)&obj, sizeof(hittable)));
-    obj->type = HITTABLE_LIST;
-    obj->id = -1;
-    obj->object = faces;
-    allocs.push_back(faces);
-    allocs.push_back(obj);
-    list_dtors.push_back(faces);
+inline mesh* new_spiky_ball(real r_core, real r_tip, material* mat,
+                            std::vector<void*>& allocs, std::vector<mesh*>& mesh_dtors) {
+    mesh* faces = new_mesh(allocs, mesh_dtors);
     
     hull_shape core;
     build_hull(icosahedron_points(r_core), core);
@@ -96,10 +75,11 @@ inline hittable* new_spiky_ball(real r_core, real r_tip, material* mat,
         for (int k = 0; k < 3; k++) {
             const vec3& a = core.verts[f.loop[k]];
             const vec3& b = core.verts[f.loop[(k + 1) % 3]];
-            add_triangle(faces, a, b, tip, unit_vector(cross(b - a, tip - a)), mat, allocs);
+            mesh_add_triangle(faces, a, b, tip, unit_vector(cross(b - a, tip - a)), mat, allocs);
         }
     }
-    return obj;
+    faces->build();
+    return faces;
 }
 
 inline std::vector<vec3> dodecahedron_points(real r) {
@@ -125,18 +105,18 @@ inline void build_hull_pit_scene(scene& sc) {
     // quad floor (id 0) and four walls (ids 1..4)
     material* ground = new_lambertian(color(0.7, 0.7, 0.7), sc.allocs);
     material* wall   = new_lambertian(color(0.55, 0.55, 0.6), sc.allocs);
-    sc.add(new_transform(make_quad(point3(-1000, 0, -1000), vec3(2000, 0, 0), vec3(0, 0, 2000), ground, sc.allocs),
-                         vec3(0, 0, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 0: floor
+    sc.add(make_instance(make_quad(point3(-1000, 0, -1000), vec3(2000, 0, 0), vec3(0, 0, 2000), ground, sc.allocs),
+                         vec3(0, 0, 0), vec3(0,0,0), vec3(1,1,1)));   // id 0: floor
     const vec3 span_z(0, 0, 2*W), span_x(2*W, 0, 0), up(0, H, 0);
     const point3 corner_z(0, -H/2, -W), corner_x(-W, -H/2, 0);
-    sc.add(new_transform(make_quad(corner_z, span_z, up, wall, sc.allocs),
-                         vec3(-W, H/2, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 1: x = -W
-    sc.add(new_transform(make_quad(corner_z, span_z, up, wall, sc.allocs),
-                         vec3( W, H/2, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 2: x = +W
-    sc.add(new_transform(make_quad(corner_x, span_x, up, wall, sc.allocs),
-                         vec3(0, H/2, -W), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 3: z = -W
-    sc.add(new_transform(make_quad(corner_x, span_x, up, wall, sc.allocs),
-                         vec3(0, H/2,  W), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 4: z = +W
+    sc.add(make_instance(make_quad(corner_z, span_z, up, wall, sc.allocs),
+                         vec3(-W, H/2, 0), vec3(0,0,0), vec3(1,1,1)));   // id 1: x = -W
+    sc.add(make_instance(make_quad(corner_z, span_z, up, wall, sc.allocs),
+                         vec3( W, H/2, 0), vec3(0,0,0), vec3(1,1,1)));   // id 2: x = +W
+    sc.add(make_instance(make_quad(corner_x, span_x, up, wall, sc.allocs),
+                         vec3(0, H/2, -W), vec3(0,0,0), vec3(1,1,1)));   // id 3: z = -W
+    sc.add(make_instance(make_quad(corner_x, span_x, up, wall, sc.allocs),
+                         vec3(0, H/2,  W), vec3(0,0,0), vec3(1,1,1)));   // id 4: z = +W
     for (int id = 0; id <= 4; id++) sc.bodies.push_back(make_box_body(sc, id, STATIC, real(1), MU));
 
     struct solid { std::vector<vec3> pts; color col; vec3 rot; };
@@ -158,18 +138,18 @@ inline void build_hull_pit_scene(scene& sc) {
         if (i < n_solids) {
             const solid& s = solids[i];
             material* m = i == 5 ? new_metal(s.col, 0.05, sc.allocs) : new_lambertian(s.col, sc.allocs);
-            int id = sc.add(new_transform(new_convex(s.pts, m, sc.allocs, sc.list_dtors),
-                                          vec3(x, y, z), s.rot, vec3(1, 1, 1), sc.allocs));
+            int id = sc.add(make_instance(new_convex(s.pts, m, sc.allocs, sc.mesh_dtors),
+                                          vec3(x, y, z), s.rot, vec3(1, 1, 1)));
             sc.bodies.push_back(make_hull_body(sc, id, DYNAMIC, real(1), MU, E));
         } else if (i == n_solids) {
             material* m = new_lambertian(color(0.9, 0.8, 0.3), sc.allocs);
-            int id = sc.add(new_transform(new_spiky_ball(real(0.3), real(0.55), m, sc.allocs, sc.list_dtors),
-                                          vec3(x, y, z), vec3(0, 0, 0), vec3(1, 1, 1), sc.allocs));
+            int id = sc.add(make_instance(new_spiky_ball(real(0.3), real(0.55), m, sc.allocs, sc.mesh_dtors),
+                                          vec3(x, y, z), vec3(0, 0, 0), vec3(1, 1, 1)));
             sc.bodies.push_back(make_hull_body(sc, id, DYNAMIC, real(1), MU, E));
         } else {
             material* m = new_lambertian(color(0.5, 0.6, 0.9), sc.allocs);
-            int id = sc.add(new_transform(make_sphere(point3(0, 0, 0), real(0.4), m, sc.allocs),
-                                          vec3(x, y, z), vec3(0, 0, 0), vec3(1, 1, 1), sc.allocs));
+            int id = sc.add(make_instance(make_sphere(point3(0, 0, 0), real(0.4), m, sc.allocs),
+                                          vec3(x, y, z), vec3(0, 0, 0), vec3(1, 1, 1)));
             sc.bodies.push_back(make_sphere_body(sc, id, DYNAMIC, real(1), MU, E));
         }
     }

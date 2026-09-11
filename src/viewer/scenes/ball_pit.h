@@ -29,28 +29,28 @@ inline void build_ball_pit(scene& sc, real box_half, real pit_mu, bool mixed = f
     material* ground = new_lambertian(make_checker(0.6, color(.2, .3, .1), color(.9, .9, .9)), sc.allocs);
     material* wall   = new_lambertian(color(0.55, 0.55, 0.6), sc.allocs);
 
-    sc.add(new_transform(make_sphere(point3(0, 0, 0), 1000, ground, sc.allocs),
-                         vec3(0, -1000, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));  // id 0: floor
+    sc.add(make_instance(make_sphere(point3(0, 0, 0), 1000, ground, sc.allocs),
+                         vec3(0, -1000, 0), vec3(0,0,0), vec3(1,1,1)));  // id 0: floor
 
     // 4 walls
     const real W = box_half, H = BOX_H;
     const vec3 span_z(0, 0, 2*W), span_x(2*W, 0, 0), up(0, H, 0);
     const point3 corner_z(0, -H/2, -W), corner_x(-W, -H/2, 0);
-    sc.add(new_transform(make_quad(corner_z, span_z, up, wall, sc.allocs),
-                         vec3(-W, H/2, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 1: x = -W
-    sc.add(new_transform(make_quad(corner_z, span_z, up, wall, sc.allocs),
-                         vec3( W, H/2, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 2: x = +W
-    sc.add(new_transform(make_quad(corner_x, span_x, up, wall, sc.allocs),
-                         vec3(0, H/2, -W), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 3: z = -W
-    sc.add(new_transform(make_quad(corner_x, span_x, up, wall, sc.allocs),
-                         vec3(0, H/2,  W), vec3(0,0,0), vec3(1,1,1), sc.allocs));   // id 4: z = +W
+    sc.add(make_instance(make_quad(corner_z, span_z, up, wall, sc.allocs),
+                         vec3(-W, H/2, 0), vec3(0,0,0), vec3(1,1,1)));   // id 1: x = -W
+    sc.add(make_instance(make_quad(corner_z, span_z, up, wall, sc.allocs),
+                         vec3( W, H/2, 0), vec3(0,0,0), vec3(1,1,1)));   // id 2: x = +W
+    sc.add(make_instance(make_quad(corner_x, span_x, up, wall, sc.allocs),
+                         vec3(0, H/2, -W), vec3(0,0,0), vec3(1,1,1)));   // id 3: z = -W
+    sc.add(make_instance(make_quad(corner_x, span_x, up, wall, sc.allocs),
+                         vec3(0, H/2,  W), vec3(0,0,0), vec3(1,1,1)));   // id 4: z = +W
 
     // box obstacle in the center
     material* obs_mat = new_lambertian(color(0.7, 0.3, 0.2), sc.allocs);
-    int obs_id = sc.add(new_transform(new_box(point3(-OBS_HALF_XZ, -OBS_HALF_Y, -OBS_HALF_XZ),
+    int obs_id = sc.add(make_instance(new_box(point3(-OBS_HALF_XZ, -OBS_HALF_Y, -OBS_HALF_XZ),
                                               point3( OBS_HALF_XZ,  OBS_HALF_Y,  OBS_HALF_XZ),
-                                              obs_mat, sc.allocs, sc.list_dtors),
-                                      vec3(0, OBS_HALF_Y, 0), vec3(0,0,0), vec3(1,1,1), sc.allocs));
+                                              obs_mat, sc.allocs, sc.mesh_dtors),
+                                      vec3(0, OBS_HALF_Y, 0), vec3(0,0,0), vec3(1,1,1)));
 
     // physics
     sc.bodies.push_back(make_sphere_body(sc, 0, STATIC, real(1), PIT_MU));   // floor
@@ -72,8 +72,8 @@ inline void build_ball_pit(scene& sc, real box_half, real pit_mu, bool mixed = f
                     : i % 5 == 1 ? new_metal(col, 0.3, sc.allocs)
                     : i % 5 == 2 ? new_dielectric(1.5, sc.allocs)
                     :              new_lambertian(load_image_texture(RT_EARTH_IMG, sc.allocs), sc.allocs);
-        int ball_id = sc.add(new_transform(make_sphere(point3(0,0,0), BALL_R, m, sc.allocs),
-                                           vec3(x, y, z), vec3(0,0,0), vec3(1,1,1), sc.allocs));
+        int ball_id = sc.add(make_instance(make_sphere(point3(0,0,0), BALL_R, m, sc.allocs),
+                                           vec3(x, y, z), vec3(0,0,0), vec3(1,1,1)));
         sc.bodies.push_back(make_sphere_body(sc, ball_id, DYNAMIC, real(1),
                                           PIT_MU, BALL_E));
     }
@@ -93,7 +93,7 @@ inline void build_ball_pit_scene(scene& sc) {
 inline void build_ball_pit_tight_scene(scene& sc) {
     build_ball_pit(sc, real(1.3), real(0.0));
 }
-// ROLLING pit
+// ROLL pit
 inline void build_ball_pit_rolling_scene(scene& sc) {
     build_ball_pit(sc, real(1.5), real(0.5));
 }

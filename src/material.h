@@ -1,7 +1,7 @@
 #ifndef MATERIAL_H
 #define MATERIAL_H
 
-#include "hittable.h"
+#include "hit_record.h"
 #include "vec3.h"
 #include "ray.h"
 #include "color.h"
@@ -17,7 +17,7 @@ enum MaterialType {
 };
 
 struct lambertian {
-  texture albedo;   // solid / checker / image — plain colors convert implicitly
+  texture albedo;
 
   lambertian(const color& a) : albedo(a) {}
   lambertian(const texture& t) : albedo(t) {}
@@ -50,8 +50,8 @@ struct metal{
 };
 
 struct dielectric {
-  real ir;          // Index of Refraction
-  color  absorption;  // Beer-Lambert coefficient per RGB channel; (0,0,0) = clear glass
+  real   ir;          // Index of refraction
+  color  absorption;  // Beer-Lambert coefficient per RGB channel
 
   dielectric(real index_of_refraction)
     : ir(index_of_refraction), absorption(0, 0, 0) {}
@@ -59,11 +59,6 @@ struct dielectric {
     : ir(index_of_refraction), absorption(absorb) {}
 
   __device__ bool scatter(const ray& r_in, const hit_record& rec, color& attenuation, ray& scattered, curandState* state) const {
-    // Beer-Lambert tint: only the leg *inside* the glass absorbs. We reach an
-    // interior surface with front_face == false, having traveled rec.t through
-    // the glass since the last hit — and because the refracted ray is unit-length,
-    // rec.t is a true distance. Clear glass (absorption 0) => exp(0) = white,
-    // byte-identical to the original clear dielectric.
     if (!rec.front_face)
         attenuation = color(exp(-absorption.x() * rec.t),
                             exp(-absorption.y() * rec.t),
@@ -90,7 +85,6 @@ struct dielectric {
 
   __host__ __device__ static real reflectance(real cosine, real ref_idx) {
       // Use Schlick's approximation for reflectance.
-      // Reflectance measures the probability that the ray reflects instead of refracting.
       auto r0 = (1-ref_idx) / (1+ref_idx);
       r0 = r0*r0;
       return r0 + (1-r0)*pow((real(1.0) - cosine), real(5.0));
@@ -111,10 +105,8 @@ struct diffuse_light {
   }
 };
 
-// Phase function of a constant_medium volume: scatters uniformly in all
-// directions (no dependence on the incoming ray), tinted by the albedo.
 struct isotropic {
-  texture albedo;   // solid / checker / image — plain colors convert implicitly
+  texture albedo;
 
   isotropic(const color& a) : albedo(a) {}
   isotropic(const texture& t) : albedo(t) {}

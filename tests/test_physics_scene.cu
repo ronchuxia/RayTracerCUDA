@@ -50,7 +50,7 @@ int main() {
     scene sc;
     build_ball_pit(sc, BOX_HALF, real(0));   // the frictionless tight pit
     std::vector<phys_body> bodies = sc.bodies;
-    std::vector<int> body_of_scene_id = index_bodies(bodies, (int)sc.objects.size());
+    std::vector<int> body_of_scene_id = index_bodies(bodies, (int)sc.size());
 
     int boxes = 0, spheres = 0, unlinked = 0, box_i = -1, box_id = -1;
     for (int i = 0; i < (int)bodies.size(); i++) {
@@ -142,12 +142,12 @@ int main() {
     //    collider must TURN, not grow — a 45-degree turn makes the enclosing
     //    world AABB 0.707 half-wide while the box is still 0.5.
     {
-        transform* tr = static_cast<transform*>(sc.get(box_id)->object);
-        new(tr) transform(tr->child, tr->translation, vec3(0, 45, 0), tr->scale);
+        instance* in = sc.get(box_id);
+        in->set_transform(in->xf.translation, vec3(0, 45, 0), in->xf.scale);
         sc.refit();
         std::vector<phys_body> b = bodies;
         quat orient;
-        box_collider_of(tr, b[box_i].pos, b[box_i].half, orient, b[box_i].offset);
+        box_collider_of(in, b[box_i].pos, b[box_i].half, orient, b[box_i].offset);
         set_orientation(b[box_i], orient);
 
         const real rt = real(std::sqrt(0.5));
@@ -235,15 +235,15 @@ int main() {
     {
         scene sc2;
         build_primitives_scene(sc2);
-        std::vector<int> idx = index_bodies(sc2.bodies, (int)sc2.objects.size());
+        std::vector<int> idx = index_bodies(sc2.bodies, (int)sc2.size());
         int linked = 0, unlinked = 0;
         for (const phys_body& b : sc2.bodies) (b.scene_id >= 0 ? linked : unlinked)++;
         int without_body = 0;
-        for (int id = 0; id < (int)sc2.objects.size(); id++) if (idx[id] < 0) without_body++;
+        for (int id = 0; id < (int)sc2.size(); id++) if (idx[id] < 0) without_body++;
 
         CHECK(sc2.bodies.size() == 5 && linked == 5 && unlinked == 0,
               "showcase authors 5 bodies, all linked to their objects");
-        CHECK((int)sc2.objects.size() == 6 && without_body == 1,
+        CHECK((int)sc2.size() == 6 && without_body == 1,
               "6 objects, 1 with no body: the decorative triangle");
         sc2.release();
     }
@@ -257,14 +257,16 @@ int main() {
         scene sc3; sc3.init();
         material* m = new_lambertian(color(0.5, 0.5, 0.5), sc3.allocs);
         const vec3 T_box(2, 0, 0), T_sph(0, 3, 0), S(1, 2, 1);
-        int box_id = sc3.add(new_transform(new_box(point3(0,0,0), point3(1,1,1), m, sc3.allocs, sc3.list_dtors),
-                                           T_box, vec3(0, 45, 0), S, sc3.allocs));
-        int sph_id = sc3.add(new_transform(make_sphere(point3(1, 0, 0), 0.5, m, sc3.allocs),
-                                           T_sph, vec3(0, 90, 0), vec3(1,1,1), sc3.allocs));
+        int box_id = sc3.add(make_instance(new_box(point3(0,0,0), point3(1,1,1), m, sc3.allocs, sc3.mesh_dtors),
+                                           T_box, vec3(0, 45, 0), S));
+        int sph_id = sc3.add(make_instance(make_sphere(point3(1, 0, 0), 0.5, m, sc3.allocs),
+                                           T_sph, vec3(0, 90, 0), vec3(1,1,1)));
         phys_body bb = make_box_body(sc3, box_id, DYNAMIC);
         phys_body bs = make_sphere_body(sc3, sph_id, DYNAMIC);
-        transform* tb = static_cast<transform*>(sc3.get(box_id)->object);
-        transform* ts = static_cast<transform*>(sc3.get(sph_id)->object);
+        instance* ib = sc3.get(box_id);
+        instance* is = sc3.get(sph_id);
+        const transform* tb = &ib->xf;
+        const transform* ts = &is->xf;
 
         CHECK((bb.pos - (tb->apply_R(vec3(0.5, 0.5, 0.5) * S) + T_box)).length() < real(1e-6),
               "a box collider sits at the child's centre mapped through T·R·S");
@@ -277,9 +279,9 @@ int main() {
         // turn the box body as physics would, write it back the way the viewer
         // does, then re-derive the collider: physics and render must agree
         set_orientation(bb, quat_from_euler_zyx_degrees(vec3(30, -60, 10)));
-        new(tb) transform(tb->child, transform_translation_of(bb), quat_to_euler_zyx_degrees(bb.orient), bb.scale);
+        ib->set_transform(transform_translation_of(bb), quat_to_euler_zyx_degrees(bb.orient), bb.scale);
         vec3 pos, half, off; quat q;
-        box_collider_of(tb, pos, half, q, off);
+        box_collider_of(ib, pos, half, q, off);
         CHECK((pos - bb.pos).length() < real(1e-5),
               "after a turn, the re-derived collider is where physics left the body");
         CHECK((tb->translation - T_box).length() > real(0.1),
@@ -296,7 +298,7 @@ int main() {
         scene sc4; sc4.init();
         material* m = new_lambertian(color(0.5, 0.5, 0.5), sc4.allocs);
         const vec3 T(2, 3, -1), R(10, 40, -25), S(2, 1, real(0.5));
-        int id = sc4.add(new_transform(new_box(point3(0,0,0), point3(1,2,3), m, sc4.allocs, sc4.list_dtors), T, R, S, sc4.allocs));
+        int id = sc4.add(make_instance(new_box(point3(0,0,0), point3(1,2,3), m, sc4.allocs, sc4.mesh_dtors), T, R, S));
         phys_body hb = make_hull_body(sc4, id, DYNAMIC), bb = make_box_body(sc4, id, DYNAMIC);
         CHECK((hb.pos - bb.pos).length() < real(1e-5) && (hb.offset - bb.offset).length() < real(1e-5),
               "a hull body read from a box object sits at the box collider's centre with the same offset");
@@ -310,10 +312,10 @@ int main() {
         CHECK((delta_omega(hb, L) - delta_omega(bb, L)).length() < real(1e-3), "and it spins like the box body (to the bbox pad)");
 
         set_orientation(hb, quat_from_euler_zyx_degrees(vec3(30, -60, 10)));
-        transform* tr = static_cast<transform*>(sc4.get(id)->object);
-        new(tr) transform(tr->child, transform_translation_of(hb), quat_to_euler_zyx_degrees(hb.orient), hb.scale);
+        instance* in4 = sc4.get(id);
+        in4->set_transform(transform_translation_of(hb), quat_to_euler_zyx_degrees(hb.orient), hb.scale);
         vec3 pos, off; quat q; hull_shape rebuilt;
-        hull_collider_of(tr, rebuilt, pos, q, off);
+        hull_collider_of(in4, rebuilt, pos, q, off);
         CHECK((pos - hb.pos).length() < real(1e-5) && (off - hb.offset).length() < real(1e-5),
               "after a turn, the re-derived hull collider is where physics left the body");
         sc4.release();
